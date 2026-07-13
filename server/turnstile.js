@@ -236,11 +236,13 @@ export async function discoverTurnstileSiteKey(rootUrl, options = {}) {
   }
 
   const candidates = [
+    `${root}/api/status`,
     root,
     `${root}/`,
     `${root}/login`,
     `${root}/auth/login`,
     `${root}/signin`,
+    `${root}/sign-in`,
     `${root}/index.html`,
   ];
 
@@ -435,6 +437,7 @@ export async function obtainTurnstileToken({
   disableSandbox = false,
   maxBrowserConcurrency = 2,
   browserQueueLimit = 20,
+  verifyOnly = false,
 }) {
   const websiteURL = String(rootUrl || '').replace(/\/$/, '');
   const normalized = String(provider || 'none').toLowerCase();
@@ -457,6 +460,7 @@ export async function obtainTurnstileToken({
           verificationBalancePath,
           upstreamHeaders,
           disableSandbox,
+          verifyOnly,
         });
       }, maxBrowserConcurrency, browserQueueLimit);
       if (result.siteKey) {
@@ -474,6 +478,7 @@ export async function obtainTurnstileToken({
         cookies: result.cookies || '',
         userAgent: result.userAgent || '',
         profile: result.profile || null,
+        verificationFailed: result.verificationFailed === true,
         tokensPendingVerification: result.tokensPendingVerification === true,
         method: result.method,
         dom: result.dom,

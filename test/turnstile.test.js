@@ -1,8 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
+import { once } from 'node:events';
 import {
   consumeOneShotTurnstileToken,
   detectTurnstileChallenge,
+  discoverTurnstileSiteKey,
   extractSiteKeyFromText,
   getTurnstileSolverStatus,
   isTurnstileFailure,
@@ -40,6 +43,37 @@ test('extracts turnstile sitekey from HTML and JS snippets', () => {
   assert.equal(extractSiteKeyFromText(envStyle), '0x4AAAAAAAEnvStyleKey000001');
 
   assert.equal(extractSiteKeyFromText('no key here'), '');
+});
+
+test('discovers the New API sitekey from the public status endpoint', async () => {
+  const siteKey = '0x4AAAAAAAStatusEndpointKey001';
+  const server = http.createServer((req, res) => {
+    if (req.url === '/tenant/api/status') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        data: { turnstile_check: true, turnstile_site_key: siteKey },
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const address = server.address();
+    const discovered = await discoverTurnstileSiteKey(
+      `http://127.0.0.1:${address.port}/tenant`,
+      { skipCache: true, timeoutMs: 2000 },
+    );
+    assert.equal(discovered, siteKey);
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+    await once(server, 'close');
+  }
 });
 
 test('solver status: browser enabled without api key', () => {
@@ -143,6 +177,7 @@ test('browser login parser accepts only explicit access tokens and explicit succ
   });
   assert.equal(isSuccessfulLoginPayload(200, { data: { token: 'two-factor-challenge' } }), false);
   assert.equal(isSuccessfulLoginPayload(200, { success: true, data: {} }), true);
+  assert.equal(isSuccessfulLoginPayload(200, { success: true, data: { require_2fa: true } }), false);
   assert.equal(isSuccessfulLoginPayload(401, { success: true }), false);
   assert.equal(isSuccessfulLoginPayload(200, { success: false, access_token: 'not-valid' }), false);
   assert.equal(isSuccessfulLoginPayload(200, { code: 401, access_token: 'not-valid' }), false);
@@ -177,6 +212,11 @@ test('browser login parser accepts only explicit access tokens and explicit succ
 
 test('submitted token parser covers JSON, URL-encoded, and multipart login requests', () => {
   const token = 'turnstile-token-with-enough-entropy-123456';
+  assert.equal(extractSubmittedTurnstileToken(
+    '',
+    '',
+    `https://upstream.example.com/api/user/login?turnstile=${encodeURIComponent(token)}`,
+  ), token);
   assert.equal(extractSubmittedTurnstileToken(
     JSON.stringify({ cf_turnstile_response: token }),
     'application/json',

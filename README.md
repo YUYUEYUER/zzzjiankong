@@ -88,6 +88,13 @@ flowchart LR
 
 检测同时覆盖 Cloudflare 官方的 `cf-mitigated: challenge` 响应头、上游 JSON 错误以及 HTML 挑战页。普通 403/429 不会仅凭状态码被误判为 Turnstile。
 
+### New API 的两层防护位置
+
+- **New API 原生 Turnstile**：公开 `/api/status` 通过 `turnstile_check` 与 `turnstile_site_key` 暴露当前开关；官方中间件保护 `/api/user/login`、注册、邮箱验证、重置密码和签到等接口。登录 token 必须按官方协议放在 `?turnstile=...` 查询参数中，霜镜同时保留常见二改站点的请求体字段兼容。
+- **站点外层 Cloudflare WAF / Managed Challenge**：不属于 New API 固定路由，可按 IP、频率和规则动态出现在状态、登录、个人资料或令牌接口。霜镜因此在所有上游 JSON 请求上统一检测挑战响应，而不是只检查登录接口。
+
+正式监控仍优先使用 New API 的个人访问令牌与 User ID；原生 Turnstile 或外层 WAF 被触发时再进入浏览器状态机。
+
 ### 默认：真实 Chromium 页面流程
 
 ```bash

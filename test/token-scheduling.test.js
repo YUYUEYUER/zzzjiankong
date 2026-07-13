@@ -6,6 +6,7 @@ import {
   collectBalance,
   cloudflareAccessHeaders,
   effectiveTokenTiming,
+  newApiLoginUrl,
   normalizeApiTokenPool,
   normalizeTokenPool,
   scheduledTokenIndexes,
@@ -43,6 +44,10 @@ test('opaque token timing uses the stored expiry and login payload includes comp
     cf_turnstile_response: 'verified-token',
     'cf-turnstile-response': 'verified-token',
   });
+  assert.equal(
+    newApiLoginUrl('https://newapi.example.com/tenant', 'verified token'),
+    'https://newapi.example.com/tenant/api/user/login?turnstile=verified+token',
+  );
   assert.deepEqual(cloudflareAccessHeaders({
     cfAccessClientId: 'client-id.access',
     cfAccessClientSecret: 'client-secret',
@@ -89,6 +94,162 @@ test('New API password mode reuses a verified browser session before logging in 
     assert.equal(calls[0].options.headers['CF-Access-Client-Secret'], 'client-secret');
   } finally {
     global.fetch = originalFetch;
+  }
+});
+
+test('New API password login submits Turnstile using the official query parameter', async () => {
+  const originalFetch = global.fetch;
+  const token = 'official-newapi-turnstile-token-123456789';
+  let loginCalls = 0;
+  global.fetch = async (url, options = {}) => {
+    const target = new URL(String(url));
+    if (target.pathname === '/tenant/api/user/login') {
+      loginCalls += 1;
+      assert.equal(target.searchParams.get('turnstile'), token);
+      const body = JSON.parse(options.body);
+      assert.equal(body.username, 'owner@example.com');
+      assert.equal(body.password, 'valid-password');
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'set-cookie': 'session=verified; Path=/tenant; HttpOnly',
+        },
+      });
+    }
+    assert.equal(target.pathname, '/tenant/api/user/self');
+    assert.equal(options.headers.Cookie, 'session=verified');
+    return new Response(JSON.stringify({ success: true, data: { quota: 500000 } }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const result = await collectBalance({
+      type: 'newapi',
+      authMode: 'password',
+      baseUrl: 'https://newapi.example.com/tenant',
+      username: 'owner@example.com',
+      profilePath: '/api/user/self',
+      balancePath: 'data.quota',
+    }, { password: 'valid-password', turnstileToken: token });
+    assert.equal(result.rawBalance, 500000);
+    assert.equal(loginCalls, 1);
+    assert.equal(result.updatedSecret.turnstileToken, undefined);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('New API checks public status before password login when native Turnstile is enabled', async () => {
+  const originalFetch = global.fetch;
+  const originalSolver = config.turnstileSolver;
+  config.turnstileSolver = 'none';
+  const calls = [];
+  global.fetch = async (url) => {
+    calls.push(new URL(String(url)).pathname);
+    return new Response(JSON.stringify({
+      success: true,
+      data: {
+        turnstile_check: true,
+        turnstile_site_key: '0x4AAAAAAAStatusEndpointKey001',
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  try {
+    await assert.rejects(
+      collectBalance({
+        type: 'newapi',
+        authMode: 'password',
+        baseUrl: 'https://newapi.example.com',
+        username: 'owner@example.com',
+        profilePath: '/api/user/self',
+        balancePath: 'data.quota',
+      }, { password: 'valid-password' }),
+      /Turnstile/,
+    );
+    assert.deepEqual(calls, ['/api/status']);
+  } finally {
+    global.fetch = originalFetch;
+    config.turnstileSolver = originalSolver;
+  }
+});
+
+test('New API passes the status sitekey directly to the configured solver', async () => {
+  const originalFetch = global.fetch;
+  const originalSolver = config.turnstileSolver;
+  const originalSolverKey = config.turnstileSolverApiKey;
+  const siteKey = '0x4AAAAAAAStatusEndpointKey001';
+  const solvedToken = 'capsolver-turnstile-token-1234567890';
+  let statusCalls = 0;
+  let createCalls = 0;
+  config.turnstileSolver = 'capsolver';
+  config.turnstileSolverApiKey = 'test-solver-key';
+
+  global.fetch = async (url, options = {}) => {
+    const target = new URL(String(url));
+    if (target.origin === 'https://newapi.example.com' && target.pathname === '/api/status') {
+      statusCalls += 1;
+      return new Response(JSON.stringify({
+        success: true,
+        data: { turnstile_check: true, turnstile_site_key: siteKey },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (target.href === 'https://api.capsolver.com/createTask') {
+      createCalls += 1;
+      const body = JSON.parse(options.body);
+      assert.equal(body.task.websiteKey, siteKey);
+      assert.equal(body.task.websiteURL, 'https://newapi.example.com');
+      return new Response(JSON.stringify({ errorId: 0, taskId: 'task-1' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (target.href === 'https://api.capsolver.com/getTaskResult') {
+      return new Response(JSON.stringify({
+        errorId: 0,
+        status: 'ready',
+        solution: { token: solvedToken },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (target.origin === 'https://newapi.example.com' && target.pathname === '/api/user/login') {
+      assert.equal(target.searchParams.get('turnstile'), solvedToken);
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'set-cookie': 'session=solver-verified; Path=/; HttpOnly',
+        },
+      });
+    }
+    if (target.origin === 'https://newapi.example.com' && target.pathname === '/api/user/self') {
+      assert.equal(options.headers.Cookie, 'session=solver-verified');
+      return new Response(JSON.stringify({ success: true, data: { quota: 500000 } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    throw new Error(`unexpected URL: ${target.origin}${target.pathname}`);
+  };
+
+  try {
+    const result = await collectBalance({
+      type: 'newapi',
+      authMode: 'password',
+      baseUrl: 'https://newapi.example.com',
+      username: 'owner@example.com',
+      profilePath: '/api/user/self',
+      balancePath: 'data.quota',
+    }, { password: 'valid-password' });
+    assert.equal(result.rawBalance, 500000);
+    assert.equal(statusCalls, 1);
+    assert.equal(createCalls, 1);
+  } finally {
+    global.fetch = originalFetch;
+    config.turnstileSolver = originalSolver;
+    config.turnstileSolverApiKey = originalSolverKey;
   }
 });
 
@@ -268,6 +429,40 @@ test('New API user access token requires User ID, fails over, and remembers the 
   }
 });
 
+test('New API access token reuses a persisted Cloudflare clearance session', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    assert.equal(new URL(String(url)).pathname, '/api/user/self');
+    assert.equal(options.headers.Authorization, 'valid-access-token');
+    assert.equal(options.headers['New-Api-User'], '12');
+    assert.equal(options.headers.Cookie, 'cf_clearance=persisted');
+    assert.equal(options.headers['User-Agent'], 'Persisted Browser UA');
+    return new Response(JSON.stringify({ success: true, data: { quota: 750000 } }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const result = await collectBalance({
+      type: 'newapi',
+      baseUrl: 'https://newapi.example.com',
+      userId: '12',
+      profilePath: '/api/user/self',
+      balancePath: 'data.quota',
+    }, {
+      accessToken: 'valid-access-token',
+      cfClearanceCookie: 'cf_clearance=persisted',
+      cfClearanceUserAgent: 'Persisted Browser UA',
+      cfClearanceCapturedAt: new Date().toISOString(),
+    });
+    assert.equal(result.rawBalance, 750000);
+    assert.equal(result.metadata.authSource, 'access_token');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('New API preserves typed token-pool auth failure and falls back to password session', async () => {
   const originalFetch = global.fetch;
   const calls = [];
@@ -348,8 +543,14 @@ test('New API checkpoints tokens issued by password login when profile is unavai
 test('New API rejects failed login envelopes even when they contain tokens', async () => {
   const originalFetch = global.fetch;
   let calls = 0;
-  global.fetch = async () => {
+  global.fetch = async (url) => {
     calls += 1;
+    if (new URL(String(url)).pathname === '/api/status') {
+      return new Response(JSON.stringify({
+        success: true,
+        data: { turnstile_check: false },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
     return new Response(JSON.stringify({
       code: 401,
       message: 'invalid credentials',
@@ -369,7 +570,7 @@ test('New API rejects failed login envelopes even when they contain tokens', asy
       }, { password: 'invalid-password' }),
       (error) => takeCredentialCheckpoint(error) === undefined,
     );
-    assert.equal(calls, 1);
+    assert.equal(calls, 2);
   } finally {
     global.fetch = originalFetch;
   }
@@ -489,6 +690,8 @@ test('Sub2API checkpoints tokens issued by password login when profile is unavai
 
 test('New API stops token-pool failover when Cloudflare challenges the origin', async () => {
   const originalFetch = global.fetch;
+  const originalSolver = config.turnstileSolver;
+  config.turnstileSolver = 'none';
   let calls = 0;
   global.fetch = async () => {
     calls += 1;
@@ -511,6 +714,7 @@ test('New API stops token-pool failover when Cloudflare challenges the origin', 
     assert.equal(calls, 1);
   } finally {
     global.fetch = originalFetch;
+    config.turnstileSolver = originalSolver;
   }
 });
 

@@ -92,13 +92,19 @@ export function isUpstreamLoginEndpoint(candidateUrl, rootUrl, platform = '') {
   }
 }
 
-export function extractSubmittedTurnstileToken(postData = '', contentType = '') {
+export function extractSubmittedTurnstileToken(postData = '', contentType = '', requestUrl = '') {
   const body = String(postData || '');
-  if (!body) return '';
-  const names = ['turnstile_token', 'turnstileToken', 'cf-turnstile-response', 'cf_turnstile_response'];
+  const names = ['turnstile', 'turnstile_token', 'turnstileToken', 'cf-turnstile-response', 'cf_turnstile_response'];
   let candidate = '';
 
-  if (/application\/json/i.test(contentType)) {
+  try {
+    const url = new URL(String(requestUrl || ''));
+    candidate = names.map((name) => url.searchParams.get(name)).find(Boolean) || '';
+  } catch {
+    // Request URL is optional; continue with the submitted body.
+  }
+
+  if (!candidate && /application\/json/i.test(contentType)) {
     try {
       const parsed = JSON.parse(body);
       candidate = names.map((name) => parsed?.[name]).find(Boolean) || '';
@@ -581,6 +587,7 @@ export function extractLoginTokensFromPayload(payload = {}) {
 export function isSuccessfulLoginPayload(status, payload = {}, tokens = extractLoginTokensFromPayload(payload)) {
   if (Number(status) < 200 || Number(status) >= 300) return false;
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+  if (payload.require_2fa === true || payload.data?.require_2fa === true) return false;
   if (payload.success === false || payload.error || payload.reason) return false;
   if (Object.hasOwn(payload, 'code') && ![0, 200, true, '0', '200'].includes(payload.code)) return false;
   if (tokens.accessToken) return true;
@@ -801,6 +808,28 @@ async function openLoginPage(page, rootUrl, timeoutMs = 45000) {
   return `${root}/login`;
 }
 
+async function clearVerificationPathChallenge(page, rootUrl, paths, timeoutMs) {
+  const deadline = Date.now() + Math.min(45000, timeoutMs);
+  for (const path of paths) {
+    if (Date.now() >= deadline) break;
+    let target;
+    try {
+      target = resolveUpstreamUrl(rootUrl, path);
+    } catch {
+      continue;
+    }
+    const response = await page.goto(target.toString(), {
+      waitUntil: 'domcontentloaded',
+      timeout: Math.min(12000, Math.max(500, deadline - Date.now())),
+    }).catch(() => null);
+    if (!response) continue;
+    if (await isCloudflareInterstitialResponse(page, response)) {
+      await waitForInterstitialClear(page, target.toString(), deadline);
+      return;
+    }
+  }
+}
+
 /**
  * Solve Turnstile in a real browser and optionally complete password login.
  * @returns {Promise<{ token: string, siteKey: string, accessToken?: string, refreshToken?: string, method: string, dom?: object }>}
@@ -819,6 +848,7 @@ export async function browserSolveTurnstile({
   verificationBalancePath = '',
   upstreamHeaders = {},
   disableSandbox = false,
+  verifyOnly = false,
 }) {
   const playwright = await loadPlaywright();
   let browser = null;
@@ -871,6 +901,14 @@ export async function browserSolveTurnstile({
       if (!body) return;
       const tokens = extractLoginTokensFromPayload(body, platform);
       const status = response.status();
+      if (body.require_2fa === true || body.data?.require_2fa === true) {
+        lastLoginFailure = {
+          status,
+          reason: 'upstream_2fa_required',
+          code: 'UPSTREAM_2FA_REQUIRED',
+        };
+        return;
+      }
       if (tokens.accessToken && isSuccessfulLoginPayload(status, body, tokens)) capturedLoginTokens = tokens;
       if (isSuccessfulLoginPayload(status, body, tokens)) {
         capturedLoginTokens = capturedLoginTokens || { accessToken: '', refreshToken: '' };
@@ -891,10 +929,10 @@ export async function browserSolveTurnstile({
       if (!['POST', 'PUT'].includes(request.method())) return;
       if (!isUpstreamLoginEndpoint(request.url(), rootUrl, platform)) return;
       const post = request.postData() || '';
-      if (!post) return;
       const token = extractSubmittedTurnstileToken(
         post,
         request.headers()['content-type'] || '',
+        request.url(),
       );
       if (token) {
         const observedAt = Date.now();
@@ -925,6 +963,63 @@ export async function browserSolveTurnstile({
     }
 
     const domBefore = await discoverTurnstileDom(page);
+
+    if (verifyOnly) {
+      let profile = await verifySessionInBrowser(
+        page,
+        rootUrl,
+        verificationPaths,
+        verificationHeaders,
+        Math.min(12000, timeoutMs),
+        platform,
+        verificationBalancePath,
+      );
+      if (!profile) {
+        await clearVerificationPathChallenge(page, rootUrl, verificationPaths, timeoutMs);
+        profile = await verifySessionInBrowser(
+          page,
+          rootUrl,
+          verificationPaths,
+          verificationHeaders,
+          Math.min(12000, timeoutMs),
+          platform,
+          verificationBalancePath,
+        );
+      }
+      if (!profile) {
+        const session = await browserSessionSnapshot(context, page, rootUrl, verificationPaths);
+        const lifecycle = await tokenLifecycleMetadata(page, '', true, Date.now());
+        return {
+          token: '',
+          siteKey: resolvedSiteKey,
+          accessToken: '',
+          refreshToken: '',
+          cookies: session.cookieHeader,
+          userAgent: session.userAgent,
+          profile: null,
+          verificationFailed: true,
+          method: 'browser_access_profile_unverified',
+          dom: domBefore,
+          pageUrl: opened,
+          ...lifecycle,
+        };
+      }
+      const session = await browserSessionSnapshot(context, page, rootUrl, verificationPaths);
+      const lifecycle = await tokenLifecycleMetadata(page, '', true, Date.now());
+      return {
+        token: '',
+        siteKey: resolvedSiteKey,
+        accessToken: '',
+        refreshToken: '',
+        cookies: session.cookieHeader,
+        userAgent: session.userAgent,
+        profile,
+        method: 'browser_verified_access_profile',
+        dom: domBefore,
+        pageUrl: profile.path || opened,
+        ...lifecycle,
+      };
+    }
 
     if (attemptLogin && email && password) {
       const filled = await fillLoginForm(page, email, password);
@@ -1019,6 +1114,12 @@ export async function browserSolveTurnstile({
           await sleep(500);
         }
       }
+    }
+
+    if (lastLoginFailure?.code === 'UPSTREAM_2FA_REQUIRED') {
+      const error = new Error('上游 New API 账户要求完成两步验证，请先在上游完成登录授权');
+      error.code = 'UPSTREAM_2FA_REQUIRED';
+      throw error;
     }
 
     // An explicit successful login response may rotate RT before the profile

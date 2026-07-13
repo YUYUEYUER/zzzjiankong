@@ -245,6 +245,13 @@ export function turnstileRequestFields(token = '') {
   };
 }
 
+export function newApiLoginUrl(root, token = '') {
+  const url = new URL(`${String(root || '').replace(/\/$/, '')}/api/user/login`);
+  const value = String(token || '').trim();
+  if (value) url.searchParams.set('turnstile', value);
+  return url.toString();
+}
+
 function assertFreshTurnstileToken(solved) {
   const state = turnstileTokenState(solved);
   if (state.usable) return state;
@@ -285,7 +292,13 @@ function turnstileManualHint() {
  * When CF/Turnstile is hit: try browser (or API solver) first.
  * Returns turnstile token, optional AT/RT, optional session cookies.
  */
-async function solveCloudflareChallenge({ root, account, secret }) {
+async function solveCloudflareChallenge({
+  root,
+  account,
+  secret,
+  verificationAccessToken = '',
+  detectedSiteKey = '',
+}) {
   const solver = getTurnstileSolverStatus(config);
   if (!solver.enabled) {
     throw new Error(turnstileManualHint());
@@ -303,12 +316,17 @@ async function solveCloudflareChallenge({ root, account, secret }) {
   const verificationHeaders = account.type === 'newapi' && account.userId
     ? { 'New-Api-User': String(account.userId) }
     : {};
+  if (verificationAccessToken) {
+    verificationHeaders.Authorization = account.type === 'sub2api'
+      ? `Bearer ${verificationAccessToken}`
+      : verificationAccessToken;
+  }
   const accessHeaders = cloudflareAccessHeaders(secret);
 
   const solved = await obtainTurnstileToken({
     rootUrl: root,
     platform: account.type,
-    siteKey: account.turnstileSiteKey || '',
+    siteKey: detectedSiteKey || account.turnstileSiteKey || '',
     provider: config.turnstileSolver,
     apiKey: config.turnstileSolverApiKey,
     timeoutMs: config.turnstileSolveTimeoutMs,
@@ -322,6 +340,7 @@ async function solveCloudflareChallenge({ root, account, secret }) {
     disableSandbox: config.turnstileDisableBrowserSandbox,
     maxBrowserConcurrency: config.turnstileBrowserConcurrency,
     browserQueueLimit: config.turnstileBrowserQueueLimit,
+    verifyOnly: Boolean(verificationAccessToken),
   });
 
   return {
@@ -331,6 +350,7 @@ async function solveCloudflareChallenge({ root, account, secret }) {
     cookies: solved.cookies || '',
     userAgent: solved.userAgent || '',
     profile: solved.profile || null,
+    verificationFailed: solved.verificationFailed === true,
     tokensPendingVerification: solved.tokensPendingVerification === true,
     method: solved.method || config.turnstileSolver,
     tokenObtainedAt: solved.tokenObtainedAt || '',
@@ -366,6 +386,31 @@ async function fetchNewApiProfile(root, account, headers, source) {
   throw lastError;
 }
 
+async function fetchNewApiTurnstileStatus(root, secret) {
+  try {
+    const result = await requestJson(`${root}/api/status`, {
+      headers: {
+        Accept: 'application/json',
+        ...cloudflareAccessHeaders(secret),
+      },
+    });
+    assertSuccess(result.response, result.body);
+    const enabled = readPath(result.body, 'data.turnstile_check')
+      ?? readPath(result.body, 'turnstile_check');
+    return {
+      enabled: [true, 1, 'true', '1'].includes(enabled),
+      siteKey: String(
+        readPath(result.body, 'data.turnstile_site_key')
+        || readPath(result.body, 'turnstile_site_key')
+        || '',
+      ),
+    };
+  } catch (error) {
+    if (isCloudflareChallenge(error)) throw error;
+    return { enabled: false, siteKey: '' };
+  }
+}
+
 async function loginNewApiPassword(root, account, secret, turnstileToken = '') {
   const body = {
     username: account.username,
@@ -373,7 +418,7 @@ async function loginNewApiPassword(root, account, secret, turnstileToken = '') {
     ...turnstileRequestFields(turnstileToken),
   };
 
-  const login = await requestJson(`${root}/api/user/login`, {
+  const login = await requestJson(newApiLoginUrl(root, turnstileToken), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -488,6 +533,7 @@ async function collectNewApi(account, secret = {}) {
   );
   let updatedSecret;
   let pendingCredentialSecret;
+  let detectedTurnstileSiteKey = '';
   const errors = [];
   const accessHeaders = cloudflareAccessHeaders(secret);
 
@@ -528,6 +574,35 @@ async function collectNewApi(account, secret = {}) {
 
   const rememberSession = (cookieHeader, userAgent = '') => rememberCredentials({ cookieHeader, userAgent });
 
+  const rememberCloudflareClearance = (cookieHeader, userAgent = '') => {
+    if (!cookieHeader) return undefined;
+    const next = {
+      ...(updatedSecret || pendingCredentialSecret || secret),
+      cfClearanceCookie: cookieHeader,
+      cfClearanceUserAgent: userAgent || '',
+      cfClearanceCapturedAt: new Date().toISOString(),
+    };
+    delete next.turnstileToken;
+    updatedSecret = next;
+    pendingCredentialSecret = next;
+    return next;
+  };
+
+  const cloudflareClearanceHeaders = () => {
+    const current = updatedSecret || pendingCredentialSecret || secret;
+    if (!current.cfClearanceCookie) return {};
+    const capturedAt = new Date(current.cfClearanceCapturedAt || 0).getTime();
+    if (Number.isFinite(capturedAt)
+      && capturedAt > 0
+      && Date.now() - capturedAt >= config.upstreamBrowserSessionTtlMs) {
+      return {};
+    }
+    return {
+      Cookie: current.cfClearanceCookie,
+      ...(current.cfClearanceUserAgent ? { 'User-Agent': current.cfClearanceUserAgent } : {}),
+    };
+  };
+
   const viaToken = async (source = 'access_token') => {
     if (!hasToken) throw new Error('未配置用户访问令牌与 User ID');
     const tokenErrors = [];
@@ -535,6 +610,7 @@ async function collectNewApi(account, secret = {}) {
     for (const index of indexes) {
       const headers = {
         ...accessHeaders,
+        ...cloudflareClearanceHeaders(),
         Accept: 'application/json',
         Authorization: tokenPool[index],
         'New-Api-User': String(account.userId),
@@ -542,7 +618,7 @@ async function collectNewApi(account, secret = {}) {
       try {
         const result = await fetchNewApiProfile(root, account, headers, source);
         const nextSecret = {
-          ...secret,
+          ...(updatedSecret || pendingCredentialSecret || secret),
           accessToken: tokenPool[index],
           accessTokens: tokenPool,
           tokenCursor: index,
@@ -552,7 +628,7 @@ async function collectNewApi(account, secret = {}) {
         const cursorUpdate = poolChanged || secret.accessToken !== tokenPool[index] || Number(secret.tokenCursor || 0) !== index
           ? nextSecret
           : undefined;
-        updatedSecret = pendingCredentialSecret || cursorUpdate;
+        updatedSecret = cursorUpdate || pendingCredentialSecret || updatedSecret;
         return {
           ...result,
           metadata: {
@@ -595,6 +671,16 @@ async function collectNewApi(account, secret = {}) {
 
   const viaPasswordApi = async (turnstileToken = '') => {
     if (!hasPassword) throw new Error('未配置用户名与密码');
+    if (!turnstileToken) {
+      const nativeTurnstile = await fetchNewApiTurnstileStatus(root, secret);
+      if (nativeTurnstile.enabled) {
+        detectedTurnstileSiteKey = nativeTurnstile.siteKey;
+        const error = new Error('New API 已启用原生 Turnstile，需先完成验证再登录');
+        error.code = 'TURNSTILE_REQUIRED';
+        error.siteKey = nativeTurnstile.siteKey;
+        throw error;
+      }
+    }
     const login = await loginNewApiPassword(root, account, secret, turnstileToken);
     if (login.tokens.accessToken) {
       const next = rememberCredentials({
@@ -639,8 +725,21 @@ async function collectNewApi(account, secret = {}) {
   /**
    * CF 出现时：先浏览器过盾；成功则用会话/token；失败再抛出让上层回退令牌
    */
-  const viaBrowserOnCf = async () => {
-    const solved = await solveCloudflareChallenge({ root, account, secret });
+  const viaBrowserOnCf = async (verificationAccessToken = '') => {
+    const solved = await solveCloudflareChallenge({
+      root,
+      account,
+      secret,
+      verificationAccessToken,
+      detectedSiteKey: detectedTurnstileSiteKey,
+    });
+
+    if (verificationAccessToken && solved.verificationFailed) {
+      rememberCloudflareClearance(solved.cookies, solved.userAgent);
+      const error = new Error('Cloudflare 已放行，但当前访问令牌未通过资料接口鉴权');
+      error.code = 'UPSTREAM_AUTH_FAILED';
+      throw error;
+    }
 
     // Strongest browser result: the profile endpoint succeeded in the same context
     // that completed the challenge and login.
@@ -648,7 +747,9 @@ async function collectNewApi(account, secret = {}) {
       const result = {
         rawBalance: numericBalance(solved.profile.body, account.balancePath || 'data.quota'),
         metadata: {
-          authSource: 'password_with_turnstile_browser',
+          authSource: solved.method === 'browser_verified_access_profile'
+            ? 'access_token_with_cloudflare_browser'
+            : 'password_with_turnstile_browser',
           profilePath: solved.profile.path || account.profilePath || '/api/user/self',
           status: readPath(solved.profile.body, 'data.status'),
           usedQuota: readPath(solved.profile.body, 'data.used_quota'),
@@ -657,12 +758,14 @@ async function collectNewApi(account, secret = {}) {
           challengeMethod: solved.method,
         },
       };
-      const next = rememberCredentials({
-        accessToken: solved.accessToken,
-        refreshToken: solved.refreshToken,
-        cookieHeader: solved.cookies,
-        userAgent: solved.userAgent,
-      });
+      const next = solved.method === 'browser_verified_access_profile'
+        ? rememberCloudflareClearance(solved.cookies, solved.userAgent)
+        : rememberCredentials({
+            accessToken: solved.accessToken,
+            refreshToken: solved.refreshToken,
+            cookieHeader: solved.cookies,
+            userAgent: solved.userAgent,
+          });
       return next ? { ...result, updatedSecret: next } : result;
     }
 
@@ -782,12 +885,30 @@ async function collectNewApi(account, secret = {}) {
 
       // CF on API → browser (if password), then token already failed
       if (isCloudflareChallenge(error) || error.code === 'CF_CHALLENGE_PAGE') {
+        const firstIndex = scheduledTokenIndexes(
+          tokenPool.length,
+          account.tokenStrategy,
+          secret.tokenCursor,
+        )[0];
+        try {
+          const result = await viaBrowserOnCf(tokenPool[firstIndex]);
+          return updatedSecret ? { ...result, updatedSecret } : result;
+        } catch (browserError) {
+          errors.push(`浏览器令牌过盾：${browserError.message}`);
+        }
+        if (Object.keys(cloudflareClearanceHeaders()).length) {
+          try {
+            return await viaToken('access_token_after_cloudflare');
+          } catch (tokenError) {
+            errors.push(`clearance 后令牌池：${tokenError.message}`);
+          }
+        }
         if (hasPassword) {
           try {
             const result = await viaBrowserOnCf();
             return updatedSecret ? { ...result, updatedSecret } : result;
           } catch (browserError) {
-            errors.push(`浏览器过盾：${browserError.message}`);
+            errors.push(`浏览器密码过盾：${browserError.message}`);
           }
         }
         throw failure(

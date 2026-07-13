@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
+import { collectBalance } from '../server/collectors.js';
+import { config } from '../server/config.js';
 import { browserSolveTurnstile } from '../server/turnstile-browser.js';
 
 const challengeToken = 'mock-turnstile-token-with-enough-entropy-123456789';
@@ -38,13 +40,19 @@ function loginPage(observerUrl, loginPath) {
   </html>`;
 }
 
-test('browser solver verifies sessions and preserves explicit tokens across profile failure', { timeout: 120000 }, async () => {
+test('browser solver verifies sessions and preserves explicit tokens across profile failure', { timeout: 180000 }, async () => {
   let loginCalls = 0;
   let profileCalls = 0;
   let returnExplicitTokens = false;
   let profileFailure = false;
+  let protectProfileWithCf = false;
   let interstitialResponses = 0;
+  let profileInterstitialResponses = 0;
   let crossOriginHeaders = null;
+  const originalSolveTimeout = config.turnstileSolveTimeoutMs;
+  const originalHeadless = config.turnstileHeadless;
+  config.turnstileSolveTimeoutMs = 20000;
+  config.turnstileHeadless = true;
   const observer = http.createServer((req, res) => {
     crossOriginHeaders = req.headers;
     res.writeHead(204);
@@ -106,12 +114,29 @@ test('browser solver verifies sessions and preserves explicit tokens across prof
     }
     if (req.method === 'GET' && req.url === `${upstreamPrefix}/api/user/self`) {
       profileCalls += 1;
+      if (protectProfileWithCf && !/(?:^|;\s*)cf_profile_clearance=verified(?:;|$)/.test(req.headers.cookie || '')) {
+        profileInterstitialResponses += 1;
+        const isNavigation = req.headers['sec-fetch-mode'] === 'navigate'
+          || String(req.headers.accept || '').includes('text/html');
+        res.writeHead(403, {
+          'content-type': 'text/html; charset=utf-8',
+          'cf-mitigated': 'challenge',
+          ...(isNavigation ? {
+            'set-cookie': `cf_profile_clearance=verified; HttpOnly; Path=${upstreamPrefix}; SameSite=Lax`,
+          } : {}),
+        });
+        res.end('<!doctype html><title>Just a moment...</title><script>setTimeout(() => location.reload(), 200)</script><div id="challenge-stage">Checking protected API</div>');
+        return;
+      }
       if (profileFailure) {
         res.writeHead(500, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ success: false, message: 'profile unavailable' }));
         return;
       }
-      const ok = /(?:^|;\s*)session=verified(?:;|$)/.test(req.headers.cookie || '')
+      const sessionOk = /(?:^|;\s*)session=verified(?:;|$)/.test(req.headers.cookie || '');
+      const accessTokenOk = req.headers.authorization === 'existing-access-token'
+        && req.headers['new-api-user'] === '12';
+      const ok = (sessionOk || accessTokenOk)
         && req.headers['cf-access-client-id'] === 'service-client-id'
         && req.headers['cf-access-client-secret'] === 'service-client-secret';
       res.writeHead(ok ? 200 : 401, { 'content-type': 'application/json' });
@@ -180,7 +205,35 @@ test('browser solver verifies sessions and preserves explicit tokens across prof
     assert.equal(pending.tokenConsumed, true);
     assert.equal(loginCalls, 2);
     assert.equal(interstitialResponses, 2);
+
+    profileFailure = false;
+    protectProfileWithCf = true;
+    const accessProfile = await collectBalance({
+      type: 'newapi',
+      authMode: 'access_token',
+      baseUrl: rootUrl,
+      userId: '12',
+      profilePath: '/api/user/self',
+      balancePath: 'data.quota',
+      tokenStrategy: 'sticky',
+    }, {
+      accessToken: 'bad-access-token',
+      accessTokens: ['bad-access-token', 'existing-access-token'],
+      tokenCursor: 0,
+      cfAccessClientId: 'service-client-id',
+      cfAccessClientSecret: 'service-client-secret',
+    });
+    assert.equal(accessProfile.rawBalance, 500000);
+    assert.equal(accessProfile.metadata.authSource, 'access_token_after_cloudflare');
+    assert.equal(accessProfile.metadata.tokenSlot, 2);
+    assert.equal(accessProfile.updatedSecret.tokenCursor, 1);
+    assert.match(accessProfile.updatedSecret.cfClearanceCookie, /cf_profile_clearance=verified/);
+    assert.ok(profileInterstitialResponses >= 2);
+    assert.equal(loginCalls, 2);
+    assert.equal(interstitialResponses, 3);
   } finally {
+    config.turnstileSolveTimeoutMs = originalSolveTimeout;
+    config.turnstileHeadless = originalHeadless;
     server.closeAllConnections?.();
     server.close();
     await once(server, 'close');
