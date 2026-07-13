@@ -1,0 +1,24 @@
+services:
+  frosted-console:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      MASTER_KEY: ${MASTER_KEY:?MASTER_KEY must be set in .env}
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be set in .env}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      AUTH_DISABLED: ${AUTH_DISABLED:-false}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      DASHBOARD_TURNSTILE_SITE_KEY: ${DASHBOARD_TURNSTILE_SITE_KEY:-}
+      DASHBOARD_TURNSTILE_SECRET_KEY: ${DASHBOARD_TURNSTILE_SECRET_KEY:-}
+      SEED_DEMO: ${SEED_DEMO:-true}
+    volumes:
+      - frosted-data:/app/data
+
+volumes:
+  frosted-data:
