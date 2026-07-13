@@ -1,7 +1,9 @@
 import crypto from 'node:crypto';
+import { withAccountCredentialLock } from './account-lock.js';
 import { config } from './config.js';
 import { collectBalance } from './collectors.js';
 import { evaluateFormula } from './converter.js';
+import { attachCredentialCheckpoint, takeCredentialCheckpoint } from './credential-checkpoint.js';
 import { decryptSecret, encryptSecret } from './security.js';
 import { notify } from './notifications.js';
 
@@ -19,8 +21,9 @@ function simulate(account, recharge = false) {
 }
 
 export class Monitor {
-  constructor(store) {
+  constructor(store, { collector = collectBalance } = {}) {
     this.store = store;
+    this.collector = collector;
     this.timer = null;
     this.running = new Set();
   }
@@ -51,19 +54,42 @@ export class Monitor {
     if (this.running.has(accountId)) throw new Error('该账号正在同步');
     this.running.add(accountId);
     try {
+      return await withAccountCredentialLock(accountId, () => this.pollUnlocked(accountId, options));
+    } finally {
+      this.running.delete(accountId);
+    }
+  }
+
+  async pollUnlocked(accountId, options = {}) {
+    let result;
+    try {
       const data = this.store.snapshot();
       const account = data.accounts.find((item) => item.id === accountId);
       if (!account) throw new Error('账号不存在');
       const secret = decryptSecret(account.encryptedSecret);
-      const result = account.demo ? simulate(account, options.recharge) : await collectBalance(account, secret);
+      result = account.demo ? simulate(account, options.recharge) : await this.collector(account, secret);
       const convertedCny = evaluateFormula(account.formula, result.rawBalance);
       const transition = await this.applySuccess(accountId, result, convertedCny);
       if (transition) await this.sendTransition(transition);
       return this.store.snapshot().accounts.find((item) => item.id === accountId);
     } catch (error) {
+      if (result?.updatedSecret) attachCredentialCheckpoint(error, result.updatedSecret);
+      const credentialCheckpoint = takeCredentialCheckpoint(error);
       await this.store.mutate((data) => {
         const account = data.accounts.find((item) => item.id === accountId);
         if (account) {
+          if (credentialCheckpoint) {
+            account.encryptedSecret = encryptSecret(credentialCheckpoint);
+            data.audit.unshift({
+              id: crypto.randomUUID(),
+              type: 'account.credentials.checkpointed',
+              accountId,
+              upstreamId: account.upstreamId,
+              at: now(),
+              details: { reason: 'token_rotated_before_balance_failure' },
+            });
+            data.audit = data.audit.slice(0, 500);
+          }
           account.status = 'error';
           account.lastError = error.message;
           account.lastSyncAt = now();
@@ -71,8 +97,6 @@ export class Monitor {
         }
       });
       throw error;
-    } finally {
-      this.running.delete(accountId);
     }
   }
 

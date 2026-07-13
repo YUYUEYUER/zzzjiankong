@@ -33,14 +33,16 @@ npm start
 ## Docker 部署
 
 1. 将 `.env.example` 复制为 `.env`。
-2. 至少更换 `MASTER_KEY` 和 `SESSION_SECRET`。`ADMIN_PASSWORD` 留空时首次打开面板完成管理员初始化。
+2. 至少更换 `MASTER_KEY` 和 `SESSION_SECRET`，并保持 `SEED_DEMO=false`。`ADMIN_PASSWORD` 留空时首次打开面板完成管理员初始化。
 3. 启动服务：
 
 ```bash
 docker compose up -d --build
 ```
 
-数据保存在 Docker 卷 `frosted-data` 中。生产环境建议通过 Caddy、Nginx 或 Tailscale 提供 HTTPS 和访问限制。
+运行镜像与项目的 Playwright `1.61.1` 版本严格匹配，内置 Chromium 及系统依赖；入口只以 root 修正旧数据卷权限，随后立即降权到 `pwuser`。Compose 同时加载 Playwright 官方同版本的 seccomp profile，以支持非 root Chromium sandbox。Compose 模式适合无头验证，不提供 VNC；需要人工接管时请在有 GUI/X11/VNC 的受控主机运行并设置 `TURNSTILE_HEADLESS=false`。
+
+数据保存在 Docker 卷 `frosted-data` 中。服务器需允许访问上游域名、`challenges.cloudflare.com`，以及你启用的 Resend/飞书/第三方解题服务。生产环境建议通过 Caddy、Nginx 或 Tailscale 提供 HTTPS 和访问限制。账号凭据锁目前是单进程锁，不要为同一数据卷同时启动多个应用副本。
 
 ## 面板登录安全
 
@@ -68,33 +70,61 @@ x / 500000 * 7.2          # New API 内部 quota 折算
 - 不要在多个上游站点复用同一个密码。
 - `MASTER_KEY` 丢失后无法解密已有凭据，部署时必须妥善备份。
 
-## Sub2API Turnstile 自动过盾
+## 上游 Cloudflare / Turnstile 处理
 
-部分 Sub2API 站点在 `/api/v1/auth/login` 上启用了 Cloudflare Turnstile。霜镜会在密码登录时：
+Cloudflare Turnstile token 只有 5 分钟有效期、只能验证一次，并且必须由目标站点服务端校验。霜镜因此采用分层认证状态机，不缓存或重放挑战 token：
 
-1. 先尝试直接登录（无盾站点可立即拿到 AT/RT）。
-2. 若上游返回 Turnstile 相关错误，启动自动过盾。
-3. 成功后持久化新的 Access / Refresh Token。
+```mermaid
+flowchart LR
+  A[正式 API / Access Token] -->|不可用| B[已验证浏览器会话]
+  B -->|失效| C[直接密码登录]
+  C -->|检测到挑战| D[真实 Chromium 页面流程]
+  D --> E{同一浏览器内验真}
+  E -->|明确返回 AT/RT| F[加密保存 AT/RT]
+  E -->|资料接口成功| G[加密保存会话]
+  E -->|交互挑战| H[可见浏览器人工接管]
+  E -->|失败| I[保留旧凭据并报告原因]
+```
 
-### 默认：浏览器 DOM 识别 + 模拟真实操作（推荐）
+检测同时覆盖 Cloudflare 官方的 `cf-mitigated: challenge` 响应头、上游 JSON 错误以及 HTML 挑战页。普通 403/429 不会仅凭状态码被误判为 Turnstile。
+
+### 默认：真实 Chromium 页面流程
 
 ```bash
 TURNSTILE_SOLVER=browser
 TURNSTILE_HEADLESS=true   # 调试时可改为 false 观察页面
+TURNSTILE_DISABLE_BROWSER_SANDBOX=false
 ```
 
-首次使用需安装 Chromium：
+Docker 镜像已内置 Chromium。裸机首次使用时安装浏览器与系统依赖：
 
 ```bash
 npm install
-npx playwright install chromium
+npx playwright install --with-deps chromium
 ```
 
 浏览器模式会：
 
 - 打开上游登录页，识别 `.cf-turnstile`、Cloudflare iframe、隐藏 token 输入框等 DOM
-- 模拟鼠标移动、滚动、点击复选框、填入邮箱密码并提交
-- 优先拦截登录接口响应拿到 AT/RT；否则提取 `cf-turnstile-response` 后再走 API 登录
+- 填入账号密码并完成页面原有的验证与登录流程
+- 只接受明确的 `access_token` / `refresh_token`；不会把 2FA 或会话用的通用 `data.token` 当成 AT
+- 登录请求一旦提交便把挑战 token 标记为已消费，禁止后端再次重放
+- New API 会在同一个浏览器上下文调用资料接口验真，再加密保存会话 Cookie 与对应 User-Agent
+- Sub2API 在拿到新 AT/RT 后立即建立凭据检查点，即使随后余额接口故障也不会丢失轮换后的 RT
+- 浏览器任务进入有界 worker 队列，面板状态包含 worker、active、queued、成功/失败和平均耗时；队列满时快速失败而不是拖垮服务器
+- Docker 启动时会以 `pwuser` 实际启动并关闭一次 Chromium，提前暴露浏览器或 sandbox 配置错误
+
+服务器上的交互式挑战可能无法在无头模式完成。此时错误会明确标记为“需要人工交互”；将 `TURNSTILE_HEADLESS=false` 后，可在有桌面环境的受控机器上完成一次验证，后续轮询优先复用已验证会话。Chromium sandbox 默认开启；只有在隔离、低权限容器确实无法启用时才设置 `TURNSTILE_DISABLE_BROWSER_SANDBOX=true`。
+
+### 长期稳定路径
+
+1. **New API 正式令牌**：优先使用“个人资料 → 安全 → 访问令牌”与 User ID。这类令牌不同于左侧“API 密钥”。密码登录通常只建立会话；除非上游明确返回 `access_token`，霜镜不会声称自动生成了个人访问令牌。
+2. **Sub2API AT/RT**：保存 Access Token + Refresh Token，系统会按 JWT 或上游返回的过期时间提前续期并保存轮换结果。
+3. **浏览器会话复用**：适合登录受 Turnstile 保护、资料接口本身允许会话访问的 New API 二改站点。
+4. **人工接管**：交互挑战、设备确认或站点额外 2FA 出现时，使用可见浏览器完成一次授权，而不是无限重试。
+5. **自管上游 Cloudflare**：为监控服务器使用固定出口 IP，并通过窄范围 WAF Skip 规则只放行指定主机、路径和来源；或在账号“高级设置”填写 Cloudflare Access Service Token。两个 Access 请求头只会发送到当前上游同源地址，不会发送给挑战 iframe。不要全站关闭防护，也不要放行动态公网 IP。
+
+Cloudflare 官方参考：[服务端验证与 token 生命周期](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/)、[识别挑战页响应](https://developers.cloudflare.com/cloudflare-challenges/challenge-types/challenge-pages/detect-response/)、[WAF Skip 规则](https://developers.cloudflare.com/waf/custom-rules/skip/)、[Access Service Token](https://developers.cloudflare.com/cloudflare-one/access-controls/service-credentials/service-tokens/)。
 
 ### 备选：第三方打码
 
@@ -107,7 +137,7 @@ CAPSOLVER_API_KEY=your-capsolver-key
 # TWOCAPTCHA_API_KEY=your-2captcha-key
 ```
 
-关闭自动过盾：`TURNSTILE_SOLVER=none`，改为人工粘贴 AT/RT 或一次性 Turnstile Token。
+第三方服务会接触目标站点 URL、sitekey 和解题任务元数据，使用前应确认上游条款与数据边界。关闭自动处理：`TURNSTILE_SOLVER=none`，改为正式令牌、人工完成浏览器验证或粘贴一次性 Turnstile Token。
 
 ## 验证
 

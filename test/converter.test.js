@@ -8,8 +8,12 @@ test('converts New API quota to CNY', () => {
 });
 test('supports arithmetic and parentheses only', () => {
   assert.equal(evaluateFormula('(x - 5) * 7.2', 10), 36);
+  assert.equal(evaluateFormula('-.5 + +x', 2), 1.5);
   assert.throws(() => evaluateFormula('sqrt(x)', 9), /仅支持/);
   assert.throws(() => evaluateFormula('x / 0', 9), /转换结果无效/);
+  assert.throws(() => evaluateFormula('2x', 9), /语法无效/);
+  assert.throws(() => evaluateFormula('(x + 1', 9), /括号不匹配/);
+  assert.throws(() => evaluateFormula('1..2 + x', 9), /语法无效/);
 });
 
 test('reads nested balance fields', () => {

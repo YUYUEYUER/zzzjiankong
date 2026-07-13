@@ -10,6 +10,7 @@ import { config } from './config.js';
 import { JsonStore } from './store.js';
 import { Monitor } from './monitor.js';
 import { collectBalance, mergeSecrets } from './collectors.js';
+import { takeCredentialCheckpoint } from './credential-checkpoint.js';
 import { evaluateFormula, normalizeFormula } from './converter.js';
 import {
   consumeRecoveryCode,
@@ -33,8 +34,18 @@ import {
 import { notify } from './notifications.js';
 import { getTurnstileSolverStatus } from './turnstile.js';
 import { aggregateUpstreams } from './upstreams.js';
+import { withAccountCredentialLock } from './account-lock.js';
 
 const app = express();
+
+function sameOrigin(left, right) {
+  try {
+    return new URL(left).origin === new URL(right).origin;
+  } catch {
+    return false;
+  }
+}
+
 const store = await new JsonStore().init();
 if (!store.snapshot().auth.passwordHash && config.adminPassword) {
   const issues = passwordIssues(config.adminPassword);
@@ -117,6 +128,8 @@ const accountSchema = z.object({
     apiTokens: z.array(z.string().trim().min(1).max(4096)).max(20).optional(),
     refreshToken: z.string().optional(),
     password: z.string().optional(),
+    cfAccessClientId: z.string().trim().max(512).optional(),
+    cfAccessClientSecret: z.string().trim().max(4096).optional(),
     /** One-shot token after manual browser verification; also used as fallback when auto-solve is off */
     turnstileToken: z.string().optional(),
   }).optional(),
@@ -170,6 +183,7 @@ function sanitizeAccount(account) {
   let accessTokenCount = 0;
   let hasApiToken = false;
   let apiTokenCount = 0;
+  let hasCfAccess = false;
   try {
     const secret = decryptSecret(encryptedSecret);
     hasAccessToken = Boolean(secret.accessToken);
@@ -180,6 +194,7 @@ function sanitizeAccount(account) {
     hasApiToken = Boolean(secret.apiToken);
     apiTokenCount = Math.max(Number(hasApiToken), Array.isArray(secret.apiTokens) ? secret.apiTokens.filter(Boolean).length : 0);
     hasApiToken = apiTokenCount > 0;
+    hasCfAccess = Boolean(secret.cfAccessClientId && secret.cfAccessClientSecret);
   } catch {
     // 密钥不匹配时仍返回账号，但不暴露凭据细节
   }
@@ -192,6 +207,7 @@ function sanitizeAccount(account) {
     accessTokenCount,
     hasApiToken,
     apiTokenCount,
+    hasCfAccess,
   };
 }
 
@@ -564,33 +580,64 @@ app.post('/api/formulas/test', (req, res) => {
 app.post('/api/accounts/test', asyncRoute(async (req, res) => {
   const input = accountSchema.parse(req.body);
   evaluateFormula(input.formula, 1);
-  let secret = input.credentials || {};
-  // 编辑已有账号时，测试连接可与已加密凭据合并（请求体可只带部分字段）
-  if (req.body?.id) {
-    const existing = store.snapshot().accounts.find((item) => item.id === req.body.id);
-    if (existing?.encryptedSecret) {
-      try {
-        secret = mergeSecrets(decryptSecret(existing.encryptedSecret), secret);
-      } catch {
-        // 忽略解密失败，仅用请求体凭据
+  const accountId = String(req.body?.id || '');
+  const runTest = async () => {
+    let secret = input.credentials || {};
+    let mayPersistToExistingAccount = false;
+    // 编辑已有账号时，在账号锁内读取最新密文，避免与后台续期互相覆盖。
+    if (accountId) {
+      const existing = store.snapshot().accounts.find((item) => item.id === accountId);
+      mayPersistToExistingAccount = Boolean(existing && sameOrigin(existing.baseUrl, input.baseUrl));
+      if (existing?.encryptedSecret && mayPersistToExistingAccount) {
+        try {
+          secret = mergeSecrets(decryptSecret(existing.encryptedSecret), secret);
+        } catch {
+          // 忽略解密失败，仅用请求体凭据。
+        }
       }
     }
-  }
-  const result = await collectBalance(input, secret);
-  // 对已有账号：测试成功且拿到/续期了 token 时写回加密存储，实现长久登录
-  if (req.body?.id && result.updatedSecret) {
-    const existing = store.snapshot().accounts.find((item) => item.id === req.body.id);
-    if (existing) {
+
+    let collected;
+    try {
+      collected = await collectBalance(input, secret);
+    } catch (error) {
+      const credentialCheckpoint = takeCredentialCheckpoint(error);
+      if (accountId && mayPersistToExistingAccount && credentialCheckpoint) {
+        await store.mutate((data) => {
+          const account = data.accounts.find((item) => item.id === accountId);
+          if (!account) return;
+          const timestamp = new Date().toISOString();
+          account.encryptedSecret = encryptSecret(credentialCheckpoint);
+          account.updatedAt = timestamp;
+          data.audit.unshift({
+            id: crypto.randomUUID(),
+            type: 'account.credentials.checkpointed',
+            accountId: account.id,
+            upstreamId: account.upstreamId,
+            at: timestamp,
+            details: { reason: 'connection_test_after_token_rotation' },
+          });
+          data.audit = data.audit.slice(0, 500);
+        });
+      }
+      throw error;
+    }
+
+    // 测试成功且拿到/续期凭据时写回加密存储。
+    if (accountId && mayPersistToExistingAccount && collected.updatedSecret) {
       await store.mutate((data) => {
-        const account = data.accounts.find((item) => item.id === req.body.id);
-        if (account) {
-          account.encryptedSecret = encryptSecret(result.updatedSecret);
-          account.updatedAt = new Date().toISOString();
-          account.metadata = { ...(account.metadata || {}), ...(result.metadata || {}) };
-        }
+        const account = data.accounts.find((item) => item.id === accountId);
+        if (!account) return;
+        account.encryptedSecret = encryptSecret(collected.updatedSecret);
+        account.updatedAt = new Date().toISOString();
+        account.metadata = { ...(account.metadata || {}), ...(collected.metadata || {}) };
       });
     }
-  }
+    return collected;
+  };
+  const result = accountId
+    ? await withAccountCredentialLock(accountId, runTest)
+    : await runTest();
   res.json({
     rawBalance: result.rawBalance,
     convertedCny: evaluateFormula(input.formula, result.rawBalance),
@@ -646,30 +693,42 @@ app.post('/api/accounts', asyncRoute(async (req, res) => {
 }));
 
 app.patch('/api/accounts/:id', asyncRoute(async (req, res) => {
-  const current = store.snapshot().accounts.find((item) => item.id === req.params.id);
-  if (!current) return res.status(404).json({ message: '账号不存在' });
-  const merged = accountSchema.parse({ ...current, ...req.body, credentials: req.body.credentials || undefined });
-  if (!store.snapshot().upstreams.some((upstream) => upstream.id === merged.upstreamId)) return res.status(400).json({ message: '所选上游不存在' });
-  evaluateFormula(merged.formula, Number(current.rawBalance || 1));
-  const changedFields = Object.keys(req.body || {}).filter((key) => key !== 'credentials' && key !== 'encryptedSecret');
-  await store.mutate((data) => {
-    const account = data.accounts.find((item) => item.id === req.params.id);
-    let nextSecret = account.encryptedSecret;
-    if (req.body.credentials) {
-      let existing = {};
-      try {
-        existing = decryptSecret(account.encryptedSecret);
-      } catch {
-        existing = {};
-      }
-      nextSecret = encryptSecret(mergeSecrets(existing, req.body.credentials));
+  const outcome = await withAccountCredentialLock(req.params.id, async () => {
+    const current = store.snapshot().accounts.find((item) => item.id === req.params.id);
+    if (!current) return { status: 404, message: '账号不存在' };
+    const merged = accountSchema.parse({ ...current, ...req.body, credentials: req.body.credentials || undefined });
+    if (!store.snapshot().upstreams.some((upstream) => upstream.id === merged.upstreamId)) {
+      return { status: 400, message: '所选上游不存在' };
     }
-    Object.assign(account, merged, { updatedAt: new Date().toISOString() });
-    account.encryptedSecret = nextSecret;
-    delete account.credentials;
-    data.audit.unshift({ id: crypto.randomUUID(), type: 'account.updated', accountId: account.id, upstreamId: account.upstreamId, at: account.updatedAt, details: { changedFields, credentialsUpdated: Boolean(req.body.credentials) } });
+    evaluateFormula(merged.formula, Number(current.rawBalance || 1));
+    const originChanged = !sameOrigin(current.baseUrl, merged.baseUrl);
+    if (originChanged && !req.body.credentials) {
+      return { status: 400, message: '更换站点域名时必须重新输入凭据，旧凭据不会发送到新站点' };
+    }
+    const changedFields = Object.keys(req.body || {}).filter((key) => key !== 'credentials' && key !== 'encryptedSecret');
+    await store.mutate((data) => {
+      const account = data.accounts.find((item) => item.id === req.params.id);
+      let nextSecret = account.encryptedSecret;
+      if (req.body.credentials) {
+        let existing = {};
+        if (!originChanged) {
+          try {
+            existing = decryptSecret(account.encryptedSecret);
+          } catch {
+            existing = {};
+          }
+        }
+        nextSecret = encryptSecret(mergeSecrets(existing, req.body.credentials));
+      }
+      Object.assign(account, merged, { updatedAt: new Date().toISOString() });
+      account.encryptedSecret = nextSecret;
+      delete account.credentials;
+      data.audit.unshift({ id: crypto.randomUUID(), type: 'account.updated', accountId: account.id, upstreamId: account.upstreamId, at: account.updatedAt, details: { changedFields, credentialsUpdated: Boolean(req.body.credentials) } });
+    });
+    return { account: sanitizeAccount(store.snapshot().accounts.find((item) => item.id === req.params.id)) };
   });
-  res.json({ account: sanitizeAccount(store.snapshot().accounts.find((item) => item.id === req.params.id)) });
+  if (outcome.status) return res.status(outcome.status).json({ message: outcome.message });
+  return res.json({ account: outcome.account });
 }));
 
 app.patch('/api/accounts/:id/upstream', asyncRoute(async (req, res) => {
@@ -771,7 +830,15 @@ if (fs.existsSync(dist)) {
 }
 
 app.use((error, req, res, next) => {
-  console.error(error);
+  console.error('[request-error]', {
+    method: req.method,
+    path: req.path,
+    name: error?.name,
+    message: error?.message,
+    code: error?.code,
+    statusCode: error?.statusCode,
+    ...(!config.production && error?.stack ? { stack: error.stack } : {}),
+  });
   if (res.headersSent) return next(error);
   if (error instanceof z.ZodError) return res.status(400).json({ message: error.issues[0]?.message || '参数错误', issues: error.issues });
   if (error.statusCode) {

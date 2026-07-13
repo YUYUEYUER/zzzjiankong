@@ -14,7 +14,10 @@ function defaults(type = 'newapi', upstreamId = '') {
     turnstileSiteKey: '',
     thresholdLow: 50, thresholdRecover: 60, pollIntervalMinutes: 5, enabled: true,
     notifications: { resend: true, feishu: true },
-    credentials: { apiToken: '', accessToken: '', refreshToken: '', password: '', turnstileToken: '' },
+    credentials: {
+      apiToken: '', accessToken: '', refreshToken: '', password: '', turnstileToken: '',
+      cfAccessClientId: '', cfAccessClientSecret: '',
+    },
   };
 }
 
@@ -31,7 +34,10 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
       setForm({
         ...defaults(editingAccount.type),
         ...editingAccount,
-        credentials: { apiToken: '', accessToken: '', refreshToken: '', password: '', turnstileToken: '' },
+        credentials: {
+          apiToken: '', accessToken: '', refreshToken: '', password: '', turnstileToken: '',
+          cfAccessClientId: '', cfAccessClientSecret: '',
+        },
       });
     } else {
       setForm(defaults('newapi', defaultUpstreamId || upstreams[0]?.id || ''));
@@ -91,6 +97,7 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
   };
 
   const testConnection = async () => {
+    const submittedOneShotToken = Boolean(form.credentials.turnstileToken);
     setBusy('connection');
     try {
       const result = await api.testAccount(payload);
@@ -107,6 +114,7 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
     } catch (error) {
       pushToast(error.message, 'error');
     } finally {
+      if (submittedOneShotToken) setCredential('turnstileToken', '');
       setBusy('');
     }
   };
@@ -134,6 +142,7 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
         editingAccount.hasAccessToken ? '用户访问令牌' : null,
         editingAccount.hasRefreshToken ? 'RT' : null,
         editingAccount.hasPassword ? '密码' : null,
+        editingAccount.hasCfAccess ? 'CF Access' : null,
       ].filter(Boolean).join(' + ') || '无'
     : null;
 
@@ -170,7 +179,7 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
                     ? '使用左侧“API 密钥”页面创建的调用密钥，请求 /api/usage/token。它监控的是该密钥额度，不是整个用户钱包。'
                     : form.authMode === 'access_token'
                       ? '使用“个人资料 → 安全 → 访问令牌”生成的字符串，原样放入 Authorization；NewAPI 同时要求 User ID 请求头，不需要用户名或密码。'
-                      : `密码模式遇到 CF 时会${turnstileSolver?.enabled ? '自动过盾并回写用户访问令牌' : '尝试登录，建议同时保存用户访问令牌作为回退'}。`}</p>
+                      : `密码模式遇到挑战时会${turnstileSolver?.enabled ? '进入浏览器验证并保存可用会话；仅在上游明确返回 AT/RT 时才回写令牌' : '尝试登录，建议同时保存用户访问令牌作为回退'}。`}</p>
                   {tokenHint && <p className="auth-hint-status">已保存凭据：{tokenHint}（字段留空表示不修改）</p>}
                 </div>
               </div>
@@ -265,7 +274,7 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
                     两者都失效时，
                     使用邮箱密码重新登录并自动保存新的 AT/RT。
                     {turnstileSolver?.enabled && turnstileSolver.provider === 'browser'
-                      ? ' 遇 CF 盾时先浏览器识别 DOM 并模拟操作过盾；失败再回退已有 AT/RT。'
+                      ? ' 遇 Cloudflare 挑战时进入真实浏览器流程并在同一会话验真；需要交互时会明确提示人工接管。'
                       : turnstileSolver?.enabled
                         ? ' 遇 CF 盾时自动过盾；失败再回退 AT/RT。'
                         : ' 遇 CF 可配置 TURNSTILE_SOLVER=browser；失败仍可回退 AT/RT。'}
@@ -387,6 +396,25 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
                 <small>浏览器过盾自动发现失败时再填；可在上游登录页源码中搜索 data-sitekey</small>
               </label>
             )}
+            <label>
+              <span>CF Access Client ID（可选）</span>
+              <input
+                type={showSecret ? 'text' : 'password'}
+                value={form.credentials.cfAccessClientId || ''}
+                onChange={(event) => setCredential('cfAccessClientId', event.target.value)}
+                placeholder={editingAccount?.hasCfAccess ? '已加密保存，留空不修改' : '仅自管上游使用'}
+              />
+            </label>
+            <label>
+              <span>CF Access Client Secret（可选）</span>
+              <input
+                type={showSecret ? 'text' : 'password'}
+                value={form.credentials.cfAccessClientSecret || ''}
+                onChange={(event) => setCredential('cfAccessClientSecret', event.target.value)}
+                placeholder={editingAccount?.hasCfAccess ? '已加密保存，留空不修改' : 'Service Token Secret'}
+              />
+              <small>只发送到当前上游同源请求，不会发送给挑战 iframe 或第三方域名。</small>
+            </label>
           </div>
         )}
 

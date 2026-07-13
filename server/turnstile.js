@@ -2,9 +2,11 @@
  * Cloudflare Turnstile helpers for Sub2API password login.
  * - Detects turnstile-related login failures
  * - Discovers sitekey from upstream HTML/JS
- * - Solves via browser automation (DOM + human-like interaction)
+ * - Completes the authorized browser login flow and verifies the result
  *   or optional CapSolver / 2Captcha
  */
+
+import crypto from 'node:crypto';
 
 const SITEKEY_PATTERNS = [
   /data-sitekey=["'](0x[0-9A-Za-z_-]{20,})["']/i,
@@ -18,6 +20,28 @@ const SITEKEY_PATTERNS = [
 ];
 
 const siteKeyCache = new Map();
+const originSolveQueues = new Map();
+const browserSolveWaiters = [];
+const oneShotTokenUses = new Map();
+let activeBrowserSolves = 0;
+const browserSolveMetrics = { completed: 0, failed: 0, totalDurationMs: 0 };
+const SITE_KEY_CACHE_TTL_MS = 60 * 60 * 1000;
+
+export const TURNSTILE_TOKEN_TTL_MS = 300000;
+export const TURNSTILE_TOKEN_MAX_LENGTH = 2048;
+
+/** Reject manual token replay without retaining the raw token in memory. */
+export function consumeOneShotTurnstileToken(token, current = Date.now()) {
+  for (const [fingerprint, expiresAt] of oneShotTokenUses) {
+    if (expiresAt <= current) oneShotTokenUses.delete(fingerprint);
+  }
+  const value = String(token || '');
+  if (value.length < 20 || value.length > TURNSTILE_TOKEN_MAX_LENGTH) return false;
+  const fingerprint = crypto.createHash('sha256').update(value).digest('hex');
+  if (oneShotTokenUses.has(fingerprint)) return false;
+  oneShotTokenUses.set(fingerprint, current + TURNSTILE_TOKEN_TTL_MS);
+  return true;
+}
 
 export function isTurnstileFailure(body = {}, reason = '') {
   const text = [
@@ -34,6 +58,121 @@ export function isTurnstileFailure(body = {}, reason = '') {
   if (body?.reason === 'TURNSTILE_VERIFICATION_FAILED') return true;
   if (body?.code === 'TURNSTILE_VERIFICATION_FAILED') return true;
   return /turnstile|captcha|人机|cloudflare|cf.?challenge|challenge.?required/i.test(text);
+}
+
+function responseHeader(response, name) {
+  try {
+    return String(response?.headers?.get?.(name) || '');
+  } catch {
+    return '';
+  }
+}
+
+/** Classify Cloudflare/Turnstile responses without relying on a single vendor payload shape. */
+export function detectTurnstileChallenge({ response, body = {}, text = '', reason = '' } = {}) {
+  const status = Number(response?.status || 0);
+  const mitigated = responseHeader(response, 'cf-mitigated').toLowerCase();
+  const contentType = responseHeader(response, 'content-type').toLowerCase();
+  const server = responseHeader(response, 'server').toLowerCase();
+
+  if (mitigated === 'challenge') {
+    return { detected: true, source: 'cf-mitigated', status, contentType };
+  }
+  const explicitTurnstileFailure = [body?.reason, body?.code, reason]
+    .filter(Boolean)
+    .some((value) => /^(?:TURNSTILE_VERIFICATION_FAILED|TURNSTILE_REQUIRED|CF_CHALLENGE_PAGE)$/i.test(String(value)));
+  const failedEnvelope = status >= 400
+    || body?.success === false
+    || Boolean(body?.reason)
+    || Boolean(body?.error)
+    || (Object.hasOwn(body || {}, 'code') && ![0, 200, true, '0', '200'].includes(body.code));
+  if (explicitTurnstileFailure || (failedEnvelope && isTurnstileFailure(body, reason))) {
+    return { detected: true, source: 'json', status, contentType };
+  }
+
+  const sample = String(text || '').slice(0, 200000);
+  const hasChallengeMarkup = /cf-turnstile|challenges\.cloudflare\.com|cf-browser-verification|challenge-platform|cdn-cgi\/challenge|just a moment|turnstile/i.test(sample);
+  const looksLikeChallengePage = contentType.includes('text/html')
+    || [403, 429, 503].includes(status)
+    || server.includes('cloudflare');
+  if (hasChallengeMarkup && looksLikeChallengePage) {
+    return { detected: true, source: 'html', status, contentType };
+  }
+  return { detected: false, source: 'none', status, contentType };
+}
+
+export function turnstileTokenState(result = {}, current = Date.now()) {
+  const token = String(result.token || '');
+  if (token.length < 20 || token.length > TURNSTILE_TOKEN_MAX_LENGTH) {
+    return { usable: false, reason: 'missing_or_malformed' };
+  }
+  if (result.tokenConsumed === true) return { usable: false, reason: 'already_consumed' };
+
+  const obtainedAt = new Date(result.tokenObtainedAt || 0).getTime();
+  if (!Number.isFinite(obtainedAt) || obtainedAt <= 0) {
+    return { usable: false, reason: 'missing_obtained_at' };
+  }
+  if (current - obtainedAt >= TURNSTILE_TOKEN_TTL_MS) {
+    return { usable: false, reason: 'expired' };
+  }
+  return {
+    usable: true,
+    reason: 'ready',
+    ageMs: Math.max(0, current - obtainedAt),
+    expiresAt: new Date(obtainedAt + TURNSTILE_TOKEN_TTL_MS).toISOString(),
+  };
+}
+
+/** Turnstile tokens are single-use; serialize solves per upstream origin instead of sharing results. */
+export async function withTurnstileOriginLock(rootUrl, task) {
+  const key = new URL(String(rootUrl)).origin;
+  const previous = originSolveQueues.get(key) || Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const tail = previous.catch(() => {}).then(() => gate);
+  originSolveQueues.set(key, tail);
+
+  await previous.catch(() => {});
+  try {
+    return await task();
+  } finally {
+    release();
+    if (originSolveQueues.get(key) === tail) originSolveQueues.delete(key);
+  }
+}
+
+/** Bound Chromium processes across different origins to protect server memory. */
+export async function withTurnstileBrowserSlot(task, maxConcurrency = 2, queueLimit = 20) {
+  const limit = Math.min(4, Math.max(1, Number(maxConcurrency) || 2));
+  const maxQueue = Math.min(200, Math.max(1, Number(queueLimit) || 20));
+  if (activeBrowserSolves >= limit && browserSolveWaiters.length >= maxQueue) {
+    const error = new Error('Turnstile 浏览器队列已满，请稍后重试');
+    error.code = 'TURNSTILE_SOLVER_BUSY';
+    throw error;
+  }
+  await new Promise((resolve) => {
+    browserSolveWaiters.push({ limit, resolve });
+    while (browserSolveWaiters.length && activeBrowserSolves < browserSolveWaiters[0].limit) {
+      activeBrowserSolves += 1;
+      browserSolveWaiters.shift().resolve();
+    }
+  });
+  const startedAt = Date.now();
+  try {
+    const result = await task();
+    browserSolveMetrics.completed += 1;
+    return result;
+  } catch (error) {
+    browserSolveMetrics.failed += 1;
+    throw error;
+  } finally {
+    browserSolveMetrics.totalDurationMs += Date.now() - startedAt;
+    activeBrowserSolves -= 1;
+    while (browserSolveWaiters.length && activeBrowserSolves < browserSolveWaiters[0].limit) {
+      activeBrowserSolves += 1;
+      browserSolveWaiters.shift().resolve();
+    }
+  }
 }
 
 export function extractSiteKeyFromText(text = '') {
@@ -91,7 +230,9 @@ export async function discoverTurnstileSiteKey(rootUrl, options = {}) {
   if (!root) throw new Error('缺少站点地址，无法发现 Turnstile sitekey');
 
   if (!options.skipCache && siteKeyCache.has(root)) {
-    return siteKeyCache.get(root);
+    const cached = siteKeyCache.get(root);
+    if (cached?.expiresAt > Date.now()) return cached.siteKey;
+    siteKeyCache.delete(root);
   }
 
   const candidates = [
@@ -109,11 +250,18 @@ export async function discoverTurnstileSiteKey(rootUrl, options = {}) {
 
     const fromHtml = extractSiteKeyFromText(html);
     if (fromHtml) {
-      siteKeyCache.set(root, fromHtml);
+      siteKeyCache.set(root, { siteKey: fromHtml, expiresAt: Date.now() + SITE_KEY_CACHE_TTL_MS });
       return fromHtml;
     }
 
     const scripts = extractScriptSrcs(html, url)
+      .filter((src) => {
+        try {
+          return new URL(src).origin === new URL(root).origin;
+        } catch {
+          return false;
+        }
+      })
       .filter((src) => /\.(js|mjs)(\?|$)/i.test(src) || /assets|static|chunk|index/i.test(src))
       .slice(0, 8);
 
@@ -121,7 +269,7 @@ export async function discoverTurnstileSiteKey(rootUrl, options = {}) {
       const js = await fetchText(scriptUrl, options.timeoutMs);
       const fromJs = extractSiteKeyFromText(js);
       if (fromJs) {
-        siteKeyCache.set(root, fromJs);
+        siteKeyCache.set(root, { siteKey: fromJs, expiresAt: Date.now() + SITE_KEY_CACHE_TTL_MS });
         return fromJs;
       }
     }
@@ -272,6 +420,7 @@ export async function solveTurnstileToken({
  */
 export async function obtainTurnstileToken({
   rootUrl,
+  platform = '',
   siteKey,
   provider,
   apiKey,
@@ -279,45 +428,82 @@ export async function obtainTurnstileToken({
   email = '',
   password = '',
   headless = true,
+  verificationPaths = [],
+  verificationHeaders = {},
+  verificationBalancePath = '',
+  upstreamHeaders = {},
+  disableSandbox = false,
+  maxBrowserConcurrency = 2,
+  browserQueueLimit = 20,
 }) {
   const websiteURL = String(rootUrl || '').replace(/\/$/, '');
   const normalized = String(provider || 'none').toLowerCase();
 
-  if (normalized === 'browser') {
-    const { browserSolveTurnstile } = await import('./turnstile-browser.js');
-    const result = await browserSolveTurnstile({
-      rootUrl: websiteURL,
-      email,
-      password,
-      siteKey: String(siteKey || '').trim(),
-      timeoutMs: timeoutMs || 120000,
-      headless,
-      attemptLogin: Boolean(email && password),
-    });
-    if (result.siteKey) siteKeyCache.set(websiteURL, result.siteKey);
-    return {
-      token: result.token,
-      siteKey: result.siteKey || siteKey || '',
-      accessToken: result.accessToken || '',
-      refreshToken: result.refreshToken || '',
-      cookies: result.cookies || '',
-      method: result.method,
-      dom: result.dom,
-    };
-  }
+  return withTurnstileOriginLock(websiteURL, async () => {
+    if (normalized === 'browser') {
+      const result = await withTurnstileBrowserSlot(async () => {
+        const { browserSolveTurnstile } = await import('./turnstile-browser.js');
+        return browserSolveTurnstile({
+          rootUrl: websiteURL,
+          platform,
+          email,
+          password,
+          siteKey: String(siteKey || '').trim(),
+          timeoutMs: timeoutMs || 120000,
+          headless,
+          attemptLogin: Boolean(email && password),
+          verificationPaths,
+          verificationHeaders,
+          verificationBalancePath,
+          upstreamHeaders,
+          disableSandbox,
+        });
+      }, maxBrowserConcurrency, browserQueueLimit);
+      if (result.siteKey) {
+        siteKeyCache.set(websiteURL, { siteKey: result.siteKey, expiresAt: Date.now() + SITE_KEY_CACHE_TTL_MS });
+      }
+      const tokenObtainedAt = result.tokenObtainedAt || new Date().toISOString();
+      return {
+        token: result.token,
+        tokenObtainedAt,
+        tokenExpiresAt: result.tokenExpiresAt || new Date(new Date(tokenObtainedAt).getTime() + TURNSTILE_TOKEN_TTL_MS).toISOString(),
+        tokenConsumed: result.tokenConsumed === true,
+        siteKey: result.siteKey || siteKey || '',
+        accessToken: result.accessToken || '',
+        refreshToken: result.refreshToken || '',
+        cookies: result.cookies || '',
+        userAgent: result.userAgent || '',
+        profile: result.profile || null,
+        tokensPendingVerification: result.tokensPendingVerification === true,
+        method: result.method,
+        dom: result.dom,
+        pageUrl: result.pageUrl || websiteURL,
+        challengeState: result.challengeState || null,
+      };
+    }
 
-  let websiteKey = String(siteKey || '').trim();
-  if (!websiteKey) {
-    websiteKey = await discoverTurnstileSiteKey(websiteURL);
-  }
-  const token = await solveTurnstileToken({
-    provider,
-    apiKey,
-    websiteURL,
-    websiteKey,
-    timeoutMs,
+    let websiteKey = String(siteKey || '').trim();
+    if (!websiteKey) {
+      websiteKey = await discoverTurnstileSiteKey(websiteURL);
+    }
+    const token = await solveTurnstileToken({
+      provider,
+      apiKey,
+      websiteURL,
+      websiteKey,
+      timeoutMs,
+    });
+    const tokenObtainedAt = new Date().toISOString();
+    return {
+      token,
+      tokenObtainedAt,
+      tokenExpiresAt: new Date(Date.now() + TURNSTILE_TOKEN_TTL_MS).toISOString(),
+      tokenConsumed: false,
+      siteKey: websiteKey,
+      method: normalized,
+      pageUrl: websiteURL,
+    };
   });
-  return { token, siteKey: websiteKey, method: normalized };
 }
 
 export function clearSiteKeyCache() {
@@ -335,6 +521,14 @@ export function getTurnstileSolverStatus(config) {
       provider: 'browser',
       mode: 'dom_human',
       headless: config?.turnstileHeadless !== false,
+      workers: Number(config?.turnstileBrowserConcurrency || 2),
+      active: activeBrowserSolves,
+      queued: browserSolveWaiters.length,
+      completed: browserSolveMetrics.completed,
+      failed: browserSolveMetrics.failed,
+      averageDurationMs: browserSolveMetrics.completed + browserSolveMetrics.failed
+        ? Math.round(browserSolveMetrics.totalDurationMs / (browserSolveMetrics.completed + browserSolveMetrics.failed))
+        : 0,
     };
   }
   const enabled = Boolean(config?.turnstileSolverApiKey);

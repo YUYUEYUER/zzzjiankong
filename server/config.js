@@ -28,7 +28,9 @@ export const config = {
   trustProxy: process.env.TRUST_PROXY === "true",
   dashboardTurnstileSiteKey: process.env.DASHBOARD_TURNSTILE_SITE_KEY || "",
   dashboardTurnstileSecretKey: process.env.DASHBOARD_TURNSTILE_SECRET_KEY || "",
-  seedDemo: process.env.SEED_DEMO !== "false",
+  seedDemo: process.env.SEED_DEMO
+    ? process.env.SEED_DEMO !== "false"
+    : process.env.NODE_ENV !== "production",
   monitorTickMs: Math.max(5000, Number(process.env.MONITOR_TICK_MS || 15000)),
   production: process.env.NODE_ENV === "production",
   /** none | browser | capsolver | 2captcha — default browser (DOM + human-like) */
@@ -37,12 +39,31 @@ export const config = {
   turnstileSolveTimeoutMs: Math.max(30000, Number(process.env.TURNSTILE_SOLVE_TIMEOUT_MS || 120000)),
   /** Run Chromium headless; set TURNSTILE_HEADLESS=false to watch the browser */
   turnstileHeadless: process.env.TURNSTILE_HEADLESS !== "false",
+  /** Only for isolated containers that cannot enable the Chromium sandbox. */
+  turnstileDisableBrowserSandbox: process.env.TURNSTILE_DISABLE_BROWSER_SANDBOX === "true",
+  /** Global Chromium process cap across different upstream origins. */
+  turnstileBrowserConcurrency: Math.min(4, Math.max(1, Number(process.env.TURNSTILE_BROWSER_CONCURRENCY || 2))),
+  turnstileBrowserQueueLimit: Math.min(200, Math.max(1, Number(process.env.TURNSTILE_BROWSER_QUEUE_LIMIT || 20))),
+  upstreamBrowserSessionTtlMs: Math.max(1, Number(process.env.UPSTREAM_BROWSER_SESSION_TTL_HOURS || 168)) * 3600000,
 };
 
 config.dashboardTurnstileEnabled = Boolean(config.dashboardTurnstileSiteKey && config.dashboardTurnstileSecretKey);
 
 if (config.production && config.authDisabled) {
   console.warn("[security] AUTH_DISABLED=true; dashboard authentication is disabled.");
+}
+
+if (config.production && (
+  config.masterKey === "frosted-console-development-master-key"
+  || config.sessionSecret === "frosted-console-development-session-secret"
+  || config.masterKey.startsWith("replace-with-")
+  || config.sessionSecret.startsWith("replace-with-")
+)) {
+  throw new Error("生产环境必须显式配置 MASTER_KEY 与 SESSION_SECRET，禁止使用开发默认值");
+}
+
+if (config.production && config.turnstileDisableBrowserSandbox) {
+  console.warn("[security] Chromium sandbox is disabled; run the solver in a dedicated low-privilege container.");
 }
 
 if (config.turnstileSolver === "browser") {

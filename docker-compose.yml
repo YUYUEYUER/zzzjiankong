@@ -1,6 +1,10 @@
 services:
   frosted-console:
     build: .
+    init: true
+    ipc: host
+    security_opt:
+      - seccomp=./docker/seccomp_profile.json
     restart: unless-stopped
     ports:
       - "8787:8787"
@@ -16,7 +20,14 @@ services:
       TRUST_PROXY: ${TRUST_PROXY:-false}
       DASHBOARD_TURNSTILE_SITE_KEY: ${DASHBOARD_TURNSTILE_SITE_KEY:-}
       DASHBOARD_TURNSTILE_SECRET_KEY: ${DASHBOARD_TURNSTILE_SECRET_KEY:-}
-      SEED_DEMO: ${SEED_DEMO:-true}
+      TURNSTILE_SOLVER: ${TURNSTILE_SOLVER:-browser}
+      TURNSTILE_HEADLESS: ${TURNSTILE_HEADLESS:-true}
+      TURNSTILE_DISABLE_BROWSER_SANDBOX: ${TURNSTILE_DISABLE_BROWSER_SANDBOX:-false}
+      TURNSTILE_BROWSER_CONCURRENCY: ${TURNSTILE_BROWSER_CONCURRENCY:-2}
+      TURNSTILE_BROWSER_QUEUE_LIMIT: ${TURNSTILE_BROWSER_QUEUE_LIMIT:-20}
+      TURNSTILE_BROWSER_SMOKE_ON_START: ${TURNSTILE_BROWSER_SMOKE_ON_START:-true}
+      UPSTREAM_BROWSER_SESSION_TTL_HOURS: ${UPSTREAM_BROWSER_SESSION_TTL_HOURS:-168}
+      SEED_DEMO: ${SEED_DEMO:-false}
     volumes:
       - frosted-data:/app/data
 
