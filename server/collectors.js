@@ -8,6 +8,7 @@ import {
   obtainTurnstileToken,
   turnstileTokenState,
 } from './turnstile.js';
+import { currentUpstreamProxyContext, withUpstreamProxyContext } from './proxy-pool.js';
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -87,7 +88,12 @@ async function requestJson(url, options = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs || 12000);
   try {
-    const response = await fetchWithSameOriginRedirects(url, { ...options, signal: controller.signal });
+    const proxy = currentUpstreamProxyContext();
+    const response = await fetchWithSameOriginRedirects(url, {
+      ...options,
+      ...(proxy?.dispatcher && !options.dispatcher ? { dispatcher: proxy.dispatcher } : {}),
+      signal: controller.signal,
+    });
     const text = await response.text();
     let body = {};
     let parsed = true;
@@ -1294,30 +1300,32 @@ async function collectGeneric(account, secret) {
 }
 
 export async function collectBalance(account, secret) {
-  const hasOneShotTurnstileToken = Boolean(secret?.turnstileToken);
-  try {
-    if (hasOneShotTurnstileToken && !consumeOneShotTurnstileToken(secret.turnstileToken)) {
-      const error = new Error('一次性 Turnstile token 已使用、已过期或格式无效，请重新完成验证');
-      error.code = 'TURNSTILE_TOKEN_REPLAYED';
+  return withUpstreamProxyContext(account, async () => {
+    const hasOneShotTurnstileToken = Boolean(secret?.turnstileToken);
+    try {
+      if (hasOneShotTurnstileToken && !consumeOneShotTurnstileToken(secret.turnstileToken)) {
+        const error = new Error('一次性 Turnstile token 已使用、已过期或格式无效，请重新完成验证');
+        error.code = 'TURNSTILE_TOKEN_REPLAYED';
+        throw error;
+      }
+      let result;
+      if (account.type === 'newapi') result = await collectNewApi(account, secret);
+      else if (account.type === 'sub2api') result = await collectSub2Api(account, secret);
+      else result = await collectGeneric(account, secret);
+
+      if (!hasOneShotTurnstileToken) return result;
+      const nextSecret = { ...(result.updatedSecret || secret) };
+      delete nextSecret.turnstileToken;
+      return { ...result, updatedSecret: nextSecret };
+    } catch (error) {
+      if (hasOneShotTurnstileToken) {
+        const nextSecret = { ...(getCredentialCheckpoint(error) || secret) };
+        delete nextSecret.turnstileToken;
+        attachCredentialCheckpoint(error, nextSecret);
+      }
       throw error;
     }
-    let result;
-    if (account.type === 'newapi') result = await collectNewApi(account, secret);
-    else if (account.type === 'sub2api') result = await collectSub2Api(account, secret);
-    else result = await collectGeneric(account, secret);
-
-    if (!hasOneShotTurnstileToken) return result;
-    const nextSecret = { ...(result.updatedSecret || secret) };
-    delete nextSecret.turnstileToken;
-    return { ...result, updatedSecret: nextSecret };
-  } catch (error) {
-    if (hasOneShotTurnstileToken) {
-      const nextSecret = { ...(getCredentialCheckpoint(error) || secret) };
-      delete nextSecret.turnstileToken;
-      attachCredentialCheckpoint(error, nextSecret);
-    }
-    throw error;
-  }
+  });
 }
 
 /** 合并凭据：新字段覆盖旧字段，空字符串表示不改动（除明确清空场景外由调用方处理） */

@@ -5,6 +5,7 @@
  * - Completes the authorized browser login flow and verifies the result
  *   or optional CapSolver / 2Captcha
  */
+import { currentUpstreamProxyContext } from './proxy-pool.js';
 
 import crypto from 'node:crypto';
 
@@ -204,6 +205,7 @@ async function fetchText(url, timeoutMs = 10000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
+    const proxy = currentUpstreamProxyContext();
     const response = await fetch(url, {
       signal: controller.signal,
       headers: {
@@ -211,6 +213,7 @@ async function fetchText(url, timeoutMs = 10000) {
         'User-Agent': 'FrostedConsole/1.0 (+turnstile-sitekey-discovery)',
       },
       redirect: 'follow',
+      ...(proxy?.dispatcher ? { dispatcher: proxy.dispatcher } : {}),
     });
     if (!response.ok) return '';
     return await response.text();

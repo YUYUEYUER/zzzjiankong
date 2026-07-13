@@ -266,8 +266,8 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
                 <div>
                   <strong>
                     {turnstileSolver?.enabled
-                      ? `长久登录策略（已启用 ${turnstileSolver.provider} 自动过盾）`
-                      : '长久登录策略（可选自动过盾）'}
+                      ? `长久登录策略（已启用 ${turnstileSolver.provider} 浏览器验证）`
+                      : '长久登录策略（可选浏览器验证）'}
                   </strong>
                   <p>
                     优先使用 Access Token 拉余额；JWT 临近过期会提前用 Refresh Token 续期；上游返回旋转 RT 时立即加密回写。
@@ -276,7 +276,7 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
                     {turnstileSolver?.enabled && turnstileSolver.provider === 'browser'
                       ? ' 遇 Cloudflare 挑战时进入真实浏览器流程并在同一会话验真；需要交互时会明确提示人工接管。'
                       : turnstileSolver?.enabled
-                        ? ' 遇 CF 盾时自动过盾；失败再回退 AT/RT。'
+                        ? ' 遇到验证页面时保持浏览器打开并等待完成；失败再回退 AT/RT。'
                         : ' 遇 CF 可配置 TURNSTILE_SOLVER=browser；失败仍可回退 AT/RT。'}
                   </p>
                   {tokenHint && <p className="auth-hint-status">已保存凭据：{tokenHint}（字段留空表示不修改）</p>}
@@ -318,7 +318,7 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
                     type={showSecret ? 'text' : 'password'}
                     value={form.credentials.password}
                     onChange={(event) => setCredential('password', event.target.value)}
-                    placeholder={editingAccount?.hasPassword ? '已保存，留空不修改' : turnstileSolver?.enabled ? '有盾站点将自动过盾换取 AT/RT' : '无盾可直登；有盾需配置解算器或 Token'}
+                    placeholder={editingAccount?.hasPassword ? '已保存，留空不修改' : turnstileSolver?.enabled ? '验证页面会在固定出口中等待完成' : '可直登站点使用；验证站点建议保存 AT/RT'}
                   />
                 </label>
                 <label>
@@ -327,7 +327,7 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
                     type={showSecret ? 'text' : 'password'}
                     value={form.credentials.turnstileToken}
                     onChange={(event) => setCredential('turnstileToken', event.target.value)}
-                    placeholder="人工验证后粘贴一次；自动过盾开启时可留空"
+                    placeholder="人工验证后粘贴一次；浏览器验证开启时可留空"
                   />
                 </label>
               </div>
@@ -393,7 +393,7 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
                   onChange={(event) => set('turnstileSiteKey', event.target.value)}
                   placeholder="0x4AAAAA... 留空则自动从站点 HTML/JS 发现"
                 />
-                <small>浏览器过盾自动发现失败时再填；可在上游登录页源码中搜索 data-sitekey</small>
+                <small>浏览器自动发现失败时再填；可在上游登录页源码中搜索 data-sitekey</small>
               </label>
             )}
             <label>

@@ -50,6 +50,7 @@ export function App() {
   const [editingAccount, setEditingAccount] = useState(null);
   const [defaultUpstreamId, setDefaultUpstreamId] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsInitialTab, setSettingsInitialTab] = useState('notifications');
   const [busyAccount, setBusyAccount] = useState('');
   const [busyUpstream, setBusyUpstream] = useState('');
   const [loginBusy, setLoginBusy] = useState(false);
@@ -242,7 +243,7 @@ export function App() {
   const accountSaved = async (account) => { setSelectedUpstreamId(account.upstreamId); setSelectedId(account.id); await loadDashboard(); setActiveNav('accounts'); };
 
   const navigate = (target) => {
-    if (target === 'settings') { setSettingsOpen(true); return; }
+    if (target === 'settings') { setSettingsInitialTab('notifications'); setSettingsOpen(true); return; }
     setActiveNav(target);
   };
 
@@ -315,9 +316,9 @@ export function App() {
           />
         </div>
       )}
-      <UpstreamModal open={upstreamModal} editingUpstream={editingUpstream} onClose={closeUpstreamModal} onSaved={upstreamSaved} onDeleted={upstreamDeleted} pushToast={pushToast} />
+      <UpstreamModal open={upstreamModal} editingUpstream={editingUpstream} proxyPool={dashboard.proxyPool} onClose={closeUpstreamModal} onSaved={upstreamSaved} onDeleted={upstreamDeleted} onOpenProxySettings={() => { closeUpstreamModal(); setSettingsInitialTab('proxy'); setSettingsOpen(true); }} pushToast={pushToast} />
       <AccountModal open={accountModal} editingAccount={editingAccount} upstreams={dashboard.upstreams} defaultUpstreamId={defaultUpstreamId || selectedUpstream?.id} onClose={closeAccountModal} onSaved={accountSaved} pushToast={pushToast} turnstileSolver={dashboard.turnstileSolver} />
-      <SettingsModal open={settingsOpen} settings={dashboard.settings} session={session} onSessionChanged={async () => setSession(await api.session())} onClose={() => setSettingsOpen(false)} onSaved={(settings) => setDashboard((current) => ({ ...current, settings }))} pushToast={pushToast} />
+      <SettingsModal open={settingsOpen} settings={dashboard.settings} proxyPool={dashboard.proxyPool} initialTab={settingsInitialTab} session={session} onSessionChanged={async () => setSession(await api.session())} onClose={() => setSettingsOpen(false)} onSaved={(settings) => setDashboard((current) => ({ ...current, settings }))} onProxyPoolChanged={async (proxyPool) => { setDashboard((current) => ({ ...current, proxyPool })); await loadDashboard(true); }} pushToast={pushToast} />
       <Toasts toasts={toasts} dismiss={(id) => setToasts((current) => current.filter((toast) => toast.id !== id))} />
     </div>
   );

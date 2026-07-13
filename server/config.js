@@ -45,6 +45,15 @@ export const config = {
   turnstileBrowserConcurrency: Math.min(4, Math.max(1, Number(process.env.TURNSTILE_BROWSER_CONCURRENCY || 2))),
   turnstileBrowserQueueLimit: Math.min(200, Math.max(1, Number(process.env.TURNSTILE_BROWSER_QUEUE_LIMIT || 20))),
   upstreamBrowserSessionTtlMs: Math.max(1, Number(process.env.UPSTREAM_BROWSER_SESSION_TTL_HOURS || 168)) * 3600000,
+  mihomoControllerUrl: String(process.env.MIHOMO_CONTROLLER_URL || 'http://127.0.0.1:9090').replace(/\/$/, ''),
+  mihomoSecret: process.env.MIHOMO_SECRET || '',
+  mihomoSharedDir: path.resolve(process.env.MIHOMO_SHARED_DIR || path.join(root, 'data', 'mihomo')),
+  mihomoRuntimePath: process.env.MIHOMO_RUNTIME_PATH || path.resolve(process.env.MIHOMO_SHARED_DIR || path.join(root, 'data', 'mihomo'), 'config.yaml'),
+  mihomoBindAddress: process.env.MIHOMO_BIND_ADDRESS || '127.0.0.1',
+  mihomoControllerBindAddress: process.env.MIHOMO_CONTROLLER_BIND_ADDRESS || '127.0.0.1',
+  upstreamProxyHost: process.env.UPSTREAM_PROXY_HOST || '127.0.0.1',
+  proxyBasePort: Math.min(60000, Math.max(1024, Number(process.env.PROXY_BASE_PORT || 17890))),
+  proxyImportMaxBytes: Math.min(10 * 1024 * 1024, Math.max(64 * 1024, Number(process.env.PROXY_IMPORT_MAX_BYTES || 2 * 1024 * 1024))),
 };
 
 config.dashboardTurnstileEnabled = Boolean(config.dashboardTurnstileSiteKey && config.dashboardTurnstileSecretKey);

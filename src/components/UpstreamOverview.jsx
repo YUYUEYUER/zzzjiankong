@@ -66,6 +66,7 @@ export function UpstreamOverview({
             <tr>
               <th>上游名称</th>
               <th>平台与站点</th>
+              <th>代理出口</th>
               <th>账号</th>
               <th>人民币余额</th>
               <th>状态</th>
@@ -90,6 +91,11 @@ export function UpstreamOverview({
                     <span className="platform-list">{upstream.platforms.length ? upstream.platforms.map(platformLabel).join(' / ') : '未配置'}</span>
                     <small>{primaryUrl ? hostname(primaryUrl) : '尚未添加站点'}</small>
                   </td>
+                  <td data-label="代理出口">
+                    {upstream.proxyMode === 'auto_sticky' ? (
+                      <span className={`proxy-exit-cell ${upstream.proxyStatus || 'unchecked'}`}><i /><strong>{upstream.proxyNodeName || '等待分配'}</strong><small>{upstream.proxyLatencyMs == null ? '未检测' : `${upstream.proxyLatencyMs} ms · 固定`}</small></span>
+                    ) : <span className="proxy-exit-cell direct"><i /><strong>直连</strong><small>服务器出口</small></span>}
+                  </td>
                   <td data-label="账号"><strong className="tabular">{upstream.accountCount}</strong><small>{members.length ? members.map((account) => account.name).slice(0, 2).join('、') : '等待添加账号'}</small></td>
                   <td data-label="人民币余额" className="balance-cell">{money(upstream.totalCny)}</td>
                   <td data-label="状态"><span className={`state-badge upstream-state ${upstream.status}`}>{statusLabels[upstream.status] || upstream.status}</span></td>
@@ -98,7 +104,7 @@ export function UpstreamOverview({
                   <td data-label="操作">
                     <div className="row-actions">
                       {upstream.accountCount > 0 && <button className="icon-button" onClick={() => onRefresh(upstream.id)} disabled={busyUpstream === upstream.id} title="同步该上游"><ArrowClockwise size={17} className={busyUpstream === upstream.id ? 'spin' : ''} /></button>}
-                      <button className="icon-button" onClick={() => onEdit(upstream)} title="重命名上游"><PencilSimple size={17} /></button>
+                      <button className="icon-button" onClick={() => onEdit(upstream)} title="编辑上游"><PencilSimple size={17} /></button>
                       <button className="secondary-button compact" onClick={() => upstream.accountCount ? onOpen(upstream.id) : onAddAccount(upstream.id)}>
                         {upstream.accountCount ? <>进入 <ArrowRight size={15} /></> : <><Plus size={15} /> 添加账号</>}
                       </button>

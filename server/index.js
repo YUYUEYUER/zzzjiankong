@@ -35,6 +35,7 @@ import { notify } from './notifications.js';
 import { getTurnstileSolverStatus } from './turnstile.js';
 import { aggregateUpstreams } from './upstreams.js';
 import { withAccountCredentialLock } from './account-lock.js';
+import { ProxyPoolManager } from './proxy-pool.js';
 
 const app = express();
 
@@ -65,6 +66,13 @@ if (!store.snapshot().auth.passwordHash && config.adminPassword) {
       };
     });
   }
+}
+const proxyPool = new ProxyPoolManager(store);
+try {
+  await proxyPool.sync();
+} catch (error) {
+  console.warn(`[proxy] Mihomo 尚未就绪，将自动重试：${error.message}`);
+  proxyPool.startSyncRetry();
 }
 const monitor = new Monitor(store);
 monitor.start();
@@ -140,6 +148,11 @@ const accountSchema = z.object({
 
 const upstreamSchema = z.object({
   name: z.string().trim().min(1, '请填写上游名称').max(60),
+  proxyMode: z.enum(['direct', 'auto_sticky']).optional(),
+});
+
+const proxySubscriptionSchema = z.object({
+  url: z.string().trim().url('请填写有效的 Clash 订阅地址').max(4096),
 });
 
 const settingsSchema = z.object({
@@ -239,6 +252,7 @@ function dashboard() {
     incidents,
     audit: data.audit.slice(0, 200),
     settings: publicSettings(data.settings),
+    proxyPool: proxyPool.publicState(),
     turnstileSolver: getTurnstileSolverStatus(config),
     summary: {
       totalCny: accounts.reduce((sum, account) => sum + Number(account.convertedCny || 0), 0),
@@ -538,37 +552,146 @@ app.get('/api/dashboard', (req, res) => res.json(dashboard()));
 app.post('/api/upstreams', asyncRoute(async (req, res) => {
   const input = upstreamSchema.parse(req.body);
   const timestamp = new Date().toISOString();
-  const upstream = { id: crypto.randomUUID(), name: input.name, createdAt: timestamp, updatedAt: timestamp };
-  await store.mutate((data) => {
+  const upstream = {
+    id: crypto.randomUUID(),
+    name: input.name,
+    proxyMode: input.proxyMode || 'direct',
+    proxyNodeName: '',
+    proxyPort: null,
+    proxyAssignedAt: null,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  if (upstream.proxyMode === 'auto_sticky' && !store.snapshot().proxyPool.subscriptionUrlEncrypted) {
+    return res.status(409).json({ message: '请先在系统设置中导入 Clash 订阅' });
+  }
+  const auditId = crypto.randomUUID();
+  const create = () => store.mutate((data) => {
     data.upstreams.push(upstream);
-    data.audit.unshift({ id: crypto.randomUUID(), type: 'upstream.created', upstreamId: upstream.id, at: timestamp, details: { name: upstream.name } });
+    data.audit.unshift({ id: auditId, type: 'upstream.created', upstreamId: upstream.id, at: timestamp, details: { name: upstream.name } });
   });
+  if (upstream.proxyMode === 'auto_sticky') {
+    await proxyPool.withConfigurationChange(async () => {
+      await create();
+      try {
+        await proxyPool.syncUnlocked();
+      } catch (error) {
+        await store.mutate((data) => {
+          data.upstreams = data.upstreams.filter((item) => item.id !== upstream.id);
+          data.audit = data.audit.filter((item) => item.id !== auditId);
+        });
+        await proxyPool.syncUnlocked().catch(() => { proxyPool.startSyncRetry(); });
+        throw error;
+      }
+    });
+  } else {
+    await create();
+  }
   res.status(201).json({ upstream: aggregateUpstreams(store.snapshot().upstreams, store.snapshot().accounts.map(sanitizeAccount), store.snapshot().incidents).find((item) => item.id === upstream.id) });
 }));
 
 app.patch('/api/upstreams/:id', asyncRoute(async (req, res) => {
   const input = upstreamSchema.parse(req.body);
   const timestamp = new Date().toISOString();
-  await store.mutate((data) => {
+  const previous = store.snapshot().upstreams.find((item) => item.id === req.params.id);
+  if (!previous) return res.status(404).json({ message: '上游不存在' });
+  if (input.proxyMode === 'auto_sticky' && !store.snapshot().proxyPool.subscriptionUrlEncrypted) {
+    return res.status(409).json({ message: '请先在系统设置中导入 Clash 订阅' });
+  }
+  const auditId = crypto.randomUUID();
+  const update = () => store.mutate((data) => {
     const upstream = data.upstreams.find((item) => item.id === req.params.id);
     if (!upstream) throw Object.assign(new Error('上游不存在'), { statusCode: 404 });
     const previousName = upstream.name;
     upstream.name = input.name;
+    if (input.proxyMode) {
+      upstream.proxyMode = input.proxyMode;
+      if (input.proxyMode === 'direct') {
+        upstream.proxyNodeName = '';
+        upstream.proxyAssignedAt = null;
+        upstream.proxyStatus = 'direct';
+        upstream.proxyLatencyMs = null;
+      }
+    }
     upstream.updatedAt = timestamp;
-    data.audit.unshift({ id: crypto.randomUUID(), type: 'upstream.renamed', upstreamId: upstream.id, at: timestamp, details: { previousName, name: upstream.name } });
+    data.audit.unshift({ id: auditId, type: 'upstream.updated', upstreamId: upstream.id, at: timestamp, details: { previousName, name: upstream.name, proxyMode: upstream.proxyMode } });
   });
+  const proxyChanged = Boolean(input.proxyMode && input.proxyMode !== previous.proxyMode);
+  if (proxyChanged) {
+    await proxyPool.withConfigurationChange(async () => {
+      await update();
+      try {
+        await proxyPool.syncUnlocked();
+      } catch (error) {
+        await store.mutate((data) => {
+          const index = data.upstreams.findIndex((item) => item.id === previous.id);
+          if (index >= 0) data.upstreams[index] = previous;
+          data.audit = data.audit.filter((item) => item.id !== auditId);
+        });
+        await proxyPool.syncUnlocked().catch(() => { proxyPool.startSyncRetry(); });
+        throw error;
+      }
+    });
+  } else {
+    await update();
+  }
   res.json({ upstream: dashboard().upstreams.find((item) => item.id === req.params.id) });
 }));
 
 app.delete('/api/upstreams/:id', asyncRoute(async (req, res) => {
   const data = store.snapshot();
-  if (!data.upstreams.some((item) => item.id === req.params.id)) return res.status(404).json({ message: '上游不存在' });
+  const previousIndex = data.upstreams.findIndex((item) => item.id === req.params.id);
+  if (previousIndex < 0) return res.status(404).json({ message: '上游不存在' });
+  const previous = data.upstreams[previousIndex];
   if (data.accounts.some((account) => account.upstreamId === req.params.id)) return res.status(409).json({ message: '该上游仍有关联账号，请先移动或删除账号' });
-  await store.mutate((state) => {
+  const auditId = crypto.randomUUID();
+  const remove = () => store.mutate((state) => {
     state.upstreams = state.upstreams.filter((item) => item.id !== req.params.id);
-    state.audit.unshift({ id: crypto.randomUUID(), type: 'upstream.deleted', upstreamId: req.params.id, at: new Date().toISOString() });
+    state.audit.unshift({ id: auditId, type: 'upstream.deleted', upstreamId: req.params.id, at: new Date().toISOString() });
   });
+  if (previous.proxyMode === 'auto_sticky') {
+    await proxyPool.withConfigurationChange(async () => {
+      await remove();
+      try {
+        await proxyPool.syncUnlocked();
+      } catch (error) {
+        await store.mutate((state) => {
+          state.upstreams.splice(previousIndex, 0, previous);
+          state.audit = state.audit.filter((item) => item.id !== auditId);
+        });
+        await proxyPool.syncUnlocked().catch(() => { proxyPool.startSyncRetry(); });
+        throw error;
+      }
+    });
+  } else {
+    await remove();
+  }
   res.status(204).end();
+}));
+
+app.post('/api/upstreams/:id/proxy/reassign', asyncRoute(async (req, res) => {
+  await proxyPool.reassign(req.params.id);
+  res.json({ upstream: dashboard().upstreams.find((item) => item.id === req.params.id), proxyPool: proxyPool.publicState() });
+}));
+
+app.get('/api/proxy-pool', (req, res) => res.json(proxyPool.publicState()));
+
+app.put('/api/proxy-pool/subscription', asyncRoute(async (req, res) => {
+  const input = proxySubscriptionSchema.parse(req.body);
+  const result = await proxyPool.importSubscription(input.url);
+  await store.mutate((data) => {
+    data.audit.unshift({ id: crypto.randomUUID(), type: 'proxy.subscription_imported', at: new Date().toISOString(), details: { nodeCount: result.summary.total } });
+    data.audit = data.audit.slice(0, 500);
+  });
+  res.json(result);
+}));
+
+app.post('/api/proxy-pool/refresh', asyncRoute(async (req, res) => {
+  res.json(await proxyPool.refreshSubscription());
+}));
+
+app.post('/api/proxy-pool/check', asyncRoute(async (req, res) => {
+  res.json(await proxyPool.check());
 }));
 
 app.post('/api/formulas/test', (req, res) => {
@@ -655,7 +778,16 @@ app.post('/api/accounts', asyncRoute(async (req, res) => {
   const currentData = store.snapshot();
   if (upstreamId && !currentData.upstreams.some((upstream) => upstream.id === upstreamId)) return res.status(400).json({ message: '所选上游不存在' });
   if (!upstreamId) {
-    implicitUpstream = { id: crypto.randomUUID(), name: input.name, createdAt: timestamp, updatedAt: timestamp };
+    implicitUpstream = {
+      id: crypto.randomUUID(),
+      name: input.name,
+      proxyMode: 'direct',
+      proxyNodeName: '',
+      proxyPort: null,
+      proxyAssignedAt: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
     upstreamId = implicitUpstream.id;
   }
   const account = {

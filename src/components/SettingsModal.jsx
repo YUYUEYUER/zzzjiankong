@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from 'react';
-import { CheckCircle, EnvelopeSimple, Flask, PaperPlaneTilt, ShieldCheck, SpinnerGap, WarningCircle } from '@phosphor-icons/react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { CheckCircle, EnvelopeSimple, Flask, GlobeHemisphereWest, PaperPlaneTilt, ShieldCheck, SpinnerGap, WarningCircle } from '@phosphor-icons/react';
 import { api } from '../api.js';
 import { notificationText, notificationTone } from '../notification-state.js';
 import { Modal } from './Modal.jsx';
 import { SecurityPanel } from './SecurityPanel.jsx';
+import { ProxyPoolPanel } from './ProxyPoolPanel.jsx';
 
 function readiness(channel, form) {
   if (channel === 'resend') {
@@ -36,19 +37,24 @@ function TestResult({ result, channel }) {
   );
 }
 
-export function SettingsModal({ open, settings, session, onSessionChanged, onClose, onSaved, pushToast }) {
+export function SettingsModal({ open, settings, proxyPool, initialTab = 'notifications', session, onSessionChanged, onClose, onSaved, onProxyPoolChanged, pushToast }) {
   const [form, setForm] = useState({});
   const [busy, setBusy] = useState('');
   const [tests, setTests] = useState({});
   const [tab, setTab] = useState('notifications');
+  const wasOpen = useRef(false);
 
   useEffect(() => {
-    if (open) {
+    if (open && !wasOpen.current) {
       setForm({ ...settings, resendApiKey: '', feishuWebhook: '' });
       setTests({});
-      setTab('notifications');
     }
+    wasOpen.current = open;
   }, [open, settings]);
+
+  useEffect(() => {
+    if (open) setTab(initialTab);
+  }, [open, initialTab]);
 
   const resendState = useMemo(() => readiness('resend', form), [form]);
   const feishuState = useMemo(() => readiness('feishu', form), [form]);
@@ -80,8 +86,8 @@ export function SettingsModal({ open, settings, session, onSessionChanged, onClo
   };
 
   return (
-    <Modal open={open} onClose={onClose} title="系统设置" subtitle="通知闭环与控制台账户安全。" width={720}>
-      <div className="settings-tabs"><button className={tab === 'notifications' ? 'active' : ''} onClick={() => setTab('notifications')}><EnvelopeSimple size={16} /> 通知与结单</button><button className={tab === 'security' ? 'active' : ''} onClick={() => setTab('security')}><ShieldCheck size={16} /> 账户安全{session?.twoFactorEnabled && <i />}</button></div>
+    <Modal open={open} onClose={onClose} title="系统设置" subtitle="通知、安全与代理出口。" width={820}>
+      <div className="settings-tabs"><button className={tab === 'notifications' ? 'active' : ''} onClick={() => setTab('notifications')}><EnvelopeSimple size={16} /> 通知与结单</button><button className={tab === 'proxy' ? 'active' : ''} onClick={() => setTab('proxy')}><GlobeHemisphereWest size={16} /> 代理池{proxyPool?.summary?.available > 0 && <i />}</button><button className={tab === 'security' ? 'active' : ''} onClick={() => setTab('security')}><ShieldCheck size={16} /> 账户安全{session?.twoFactorEnabled && <i />}</button></div>
       {tab === 'notifications' ? (
       <form className="settings-form" onSubmit={save}>
         <section className="notification-section">
@@ -114,7 +120,7 @@ export function SettingsModal({ open, settings, session, onSessionChanged, onClo
         </section>
         <footer className="modal-actions"><span className="settings-save-note">启用渠道前建议先完成单独测试。</span><div><button type="button" className="ghost-button" onClick={onClose}>取消</button><button className="primary-button" disabled={Boolean(busy)}>{busy === 'save' && <SpinnerGap className="spin" />} 保存设置</button></div></footer>
       </form>
-      ) : <SecurityPanel onClose={onClose} onSessionChanged={onSessionChanged} pushToast={pushToast} />}
+      ) : tab === 'proxy' ? <ProxyPoolPanel initialPool={proxyPool} onChanged={onProxyPoolChanged} pushToast={pushToast} /> : <SecurityPanel onClose={onClose} onSessionChanged={onSessionChanged} pushToast={pushToast} />}
     </Modal>
   );
 }

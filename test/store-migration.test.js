@@ -25,13 +25,15 @@ test('v1 migration adds one upstream per account without touching credentials or
   const result = migrateData(source, () => ids.shift());
 
   assert.equal(result.changed, true);
-  assert.equal(result.data.version, 2);
+  assert.equal(result.data.version, 3);
   assert.deepEqual(result.data.upstreams.map((upstream) => upstream.id), ['upstream-real', 'upstream-demo']);
   assert.deepEqual(result.data.accounts.map((account) => account.upstreamId), ['upstream-real', 'upstream-demo']);
   assert.equal(result.data.accounts[0].encryptedSecret, source.accounts[0].encryptedSecret);
   assert.deepEqual(result.data.snapshots, source.snapshots);
   assert.deepEqual(result.data.incidents, source.incidents);
   assert.deepEqual(result.data.audit, source.audit);
+  assert.deepEqual(result.data.proxyPool.nodes, []);
+  assert.equal(result.data.upstreams[0].proxyMode, 'direct');
 
   const second = migrateData(result.data);
   assert.equal(second.changed, false);
@@ -47,10 +49,26 @@ test('JsonStore writes an exact v1 backup before persisting migration', async ()
   const store = await new JsonStore(file).init();
   const backup = await fs.readFile(`${file}.v1.bak`, 'utf8');
   assert.equal(backup, raw);
-  assert.equal(store.snapshot().version, 2);
+  assert.equal(store.snapshot().version, 3);
   assert.equal(store.snapshot().accounts[0].encryptedSecret, 'ciphertext.must.stay.identical');
 
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+test('v2 migration adds proxy state without changing encrypted account credentials', () => {
+  const source = {
+    ...v1Data(),
+    version: 2,
+    upstreams: [{ id: 'upstream-existing', name: 'Existing' }],
+    accounts: [{ id: 'acct-real', upstreamId: 'upstream-existing', encryptedSecret: 'ciphertext.must.stay.identical' }],
+  };
+  const result = migrateData(source);
+  assert.equal(result.changed, true);
+  assert.equal(result.data.version, 3);
+  assert.equal(result.data.accounts[0].encryptedSecret, source.accounts[0].encryptedSecret);
+  assert.equal(result.data.upstreams[0].proxyMode, 'direct');
+  assert.equal(result.data.upstreams[0].proxyPort, null);
+  assert.deepEqual(result.data.proxyPool.nodes, []);
 });
 
 test('migration rejects unknown future versions', () => {

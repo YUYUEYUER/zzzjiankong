@@ -70,6 +70,19 @@ x / 500000 * 7.2          # New API 内部 quota 折算
 - 不要在多个上游站点复用同一个密码。
 - `MASTER_KEY` 丢失后无法解密已有凭据，部署时必须妥善备份。
 
+## Clash 代理出口
+
+Docker Compose 会启动一个仅在内部网络可见的 Mihomo 服务。先在 `.env` 设置强随机 `MIHOMO_SECRET`，再到“系统设置 → 代理池”导入 HTTPS Clash 订阅。订阅地址使用 AES-256-GCM 加密保存，界面和日志不会回显完整地址。
+
+- 节点只按可用性与延迟排序，不把登录、Turnstile、401 或 403 结果计入质量评分。
+- 代理在“上游”层启用；同一上游的所有账号共用一个固定节点和独立 HTTP listener。
+- 余额 API、站点探测和 Chromium 验证复用同一出口；采集或登录进行中禁止重新分配节点。
+- 订阅更新先在临时配置中完成加载与健康检查，失败会恢复旧订阅、节点分配和运行配置。
+- 更新订阅不会主动切换仍然可用的固定节点；可在上游编辑弹窗手动“重新分配”。
+- Mihomo 控制端口和代理端口不映射到宿主公网；Compose 会等待其健康检查通过，应用也会自动退避重试同步。
+
+本地非 Docker 运行时，需要自行启动 Mihomo，并配置 `MIHOMO_CONTROLLER_URL`、`MIHOMO_SECRET`、`MIHOMO_SHARED_DIR`、`MIHOMO_RUNTIME_PATH` 和 `UPSTREAM_PROXY_HOST`。动态代理 listener 与控制器默认只绑定 `127.0.0.1`；不要在没有防火墙和访问控制时改为公网地址。
+
 ## 上游 Cloudflare / Turnstile 处理
 
 Cloudflare Turnstile token 只有 5 分钟有效期、只能验证一次，并且必须由目标站点服务端校验。霜镜因此采用分层认证状态机，不缓存或重放挑战 token：

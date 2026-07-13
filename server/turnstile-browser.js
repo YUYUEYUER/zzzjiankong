@@ -6,6 +6,7 @@
  */
 
 import { extractSiteKeyFromText, TURNSTILE_TOKEN_TTL_MS } from './turnstile.js';
+import { currentUpstreamProxyContext } from './proxy-pool.js';
 
 const LOGIN_PATHS = ['/login', '/auth/login', '/signin', '/sign-in', '/user/login', '/'];
 
@@ -854,10 +855,12 @@ export async function browserSolveTurnstile({
   let browser = null;
   let context = null;
   try {
+    const upstreamProxy = currentUpstreamProxyContext();
     browser = await playwright.chromium.launch({
       headless,
       chromiumSandbox: !disableSandbox,
       args: ['--disable-dev-shm-usage'],
+      ...(upstreamProxy?.browserProxy ? { proxy: upstreamProxy.browserProxy } : {}),
     });
 
     context = await browser.newContext({

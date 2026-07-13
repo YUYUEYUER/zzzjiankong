@@ -4,7 +4,27 @@ import crypto from "node:crypto";
 import { config } from "./config.js";
 
 const iso = (offsetMinutes = 0) => new Date(Date.now() + offsetMinutes * 60000).toISOString();
-const STORE_VERSION = 2;
+const STORE_VERSION = 3;
+
+function defaultProxyPool() {
+  return {
+    subscriptionUrlEncrypted: '',
+    subscriptionUpdatedAt: null,
+    lastCheckedAt: null,
+    lastError: '',
+    nodes: [],
+  };
+}
+
+function withProxyDefaults(upstream) {
+  return {
+    proxyMode: 'direct',
+    proxyNodeName: '',
+    proxyPort: null,
+    proxyAssignedAt: null,
+    ...upstream,
+  };
+}
 
 function defaultSettings() {
   return {
@@ -79,22 +99,22 @@ function demoAccount(input) {
 }
 
 function demoUpstream(id, name) {
-  return {
+  return withProxyDefaults({
     id,
     name,
     createdAt: iso(-10080),
     updatedAt: iso(-2),
-  };
+  });
 }
 
 export function deriveInitialUpstream(account, idFactory = () => crypto.randomUUID()) {
   const timestamp = account.createdAt || new Date().toISOString();
-  return {
+  return withProxyDefaults({
     id: idFactory(),
     name: String(account.name || '未命名上游').trim() || '未命名上游',
     createdAt: timestamp,
     updatedAt: account.updatedAt || timestamp,
-  };
+  });
 }
 
 function assertDataShape(data) {
@@ -105,6 +125,9 @@ function assertDataShape(data) {
   }
   if (!data.settings || typeof data.settings !== 'object') data.settings = defaultSettings();
   if (!data.auth || typeof data.auth !== 'object') data.auth = defaultAuth();
+  if (!data.proxyPool || typeof data.proxyPool !== 'object') data.proxyPool = defaultProxyPool();
+  data.proxyPool = { ...defaultProxyPool(), ...data.proxyPool };
+  if (!Array.isArray(data.proxyPool.nodes)) data.proxyPool.nodes = [];
   data.auth = { ...defaultAuth(), ...data.auth };
   if (!Array.isArray(data.auth.recoveryCodeHashes)) data.auth.recoveryCodeHashes = [];
 }
@@ -112,26 +135,34 @@ function assertDataShape(data) {
 export function migrateData(source, idFactory = () => crypto.randomUUID()) {
   const data = structuredClone(source);
   assertDataShape(data);
-  const version = Number(data.version || 1);
-  if (!Number.isInteger(version) || version < 1) throw new Error(`不支持的数据版本 ${data.version}`);
-  if (version > STORE_VERSION) throw new Error(`数据版本 ${version} 高于当前支持版本 ${STORE_VERSION}`);
+  const fromVersion = Number(data.version || 1);
+  if (!Number.isInteger(fromVersion) || fromVersion < 1) throw new Error(`不支持的数据版本 ${data.version}`);
+  if (fromVersion > STORE_VERSION) throw new Error(`数据版本 ${fromVersion} 高于当前支持版本 ${STORE_VERSION}`);
 
-  if (version === STORE_VERSION) {
-    if (!Array.isArray(data.upstreams)) throw new Error('版本 2 数据缺少 upstreams 数组');
+  if (fromVersion === STORE_VERSION) {
+    if (!Array.isArray(data.upstreams)) throw new Error('版本 3 数据缺少 upstreams 数组');
     const upstreamIds = new Set(data.upstreams.map((upstream) => upstream.id));
     const invalid = data.accounts.find((account) => !account.upstreamId || !upstreamIds.has(account.upstreamId));
     if (invalid) throw new Error(`账号 ${invalid.id || invalid.name || 'unknown'} 未关联有效上游`);
-    return { data, changed: false, fromVersion: version };
+    data.upstreams = data.upstreams.map(withProxyDefaults);
+    return { data, changed: false, fromVersion };
   }
 
-  data.upstreams = [];
-  for (const account of data.accounts) {
-    const upstream = deriveInitialUpstream(account, idFactory);
-    data.upstreams.push(upstream);
-    account.upstreamId = upstream.id;
+  if (fromVersion === 1) {
+    data.upstreams = [];
+    for (const account of data.accounts) {
+      const upstream = deriveInitialUpstream(account, idFactory);
+      data.upstreams.push(upstream);
+      account.upstreamId = upstream.id;
+    }
   }
+
+  if (!Array.isArray(data.upstreams)) throw new Error('数据缺少 upstreams 数组');
+  data.upstreams = data.upstreams.map(withProxyDefaults);
+  data.proxyPool = { ...defaultProxyPool(), ...(data.proxyPool || {}) };
+  if (!Array.isArray(data.proxyPool.nodes)) data.proxyPool.nodes = [];
   data.version = STORE_VERSION;
-  return { data, changed: true, fromVersion: version };
+  return { data, changed: true, fromVersion };
 }
 
 function seedData() {
@@ -166,13 +197,14 @@ function seedData() {
       { id: "inc-jp", accountId: "acct-jp-prod", state: "resolved", openedAt: iso(-2960), resolvedAt: iso(-1573), acknowledgedAt: iso(-2900), triggerBalance: 18.8, currentBalance: 165.48, channelResults: { resend: "sent", feishu: "sent" }, recoveryChecks: 2 },
     ],
     settings: defaultSettings(),
+    proxyPool: defaultProxyPool(),
     auth: defaultAuth(),
     audit: [],
   };
 }
 
 function blankData() {
-  return { version: STORE_VERSION, upstreams: [], accounts: [], snapshots: [], incidents: [], settings: defaultSettings(), auth: defaultAuth(), audit: [] };
+  return { version: STORE_VERSION, upstreams: [], accounts: [], snapshots: [], incidents: [], settings: defaultSettings(), proxyPool: defaultProxyPool(), auth: defaultAuth(), audit: [] };
 }
 
 export class JsonStore {

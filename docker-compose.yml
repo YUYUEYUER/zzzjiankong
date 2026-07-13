@@ -1,4 +1,26 @@
 services:
+  mihomo:
+    image: docker.io/metacubex/mihomo:v1.19.28
+    init: true
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/bootstrap/mihomo-entrypoint.sh"]
+    environment:
+      MIHOMO_SECRET: ${MIHOMO_SECRET:?MIHOMO_SECRET must be set in .env}
+      MIHOMO_SHARED_DIR: /shared-proxy
+      MIHOMO_BIND_ADDRESS: 0.0.0.0
+      MIHOMO_CONTROLLER_BIND_ADDRESS: 0.0.0.0
+    volumes:
+      - ./docker/mihomo-entrypoint.sh:/bootstrap/mihomo-entrypoint.sh:ro
+      - frosted-proxy:/shared-proxy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --header=\"Authorization: Bearer $${MIHOMO_SECRET}\" http://127.0.0.1:9090/version >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+      start_period: 3s
+    networks:
+      - proxy-internal
+
   frosted-console:
     build: .
     init: true
@@ -6,6 +28,9 @@ services:
     security_opt:
       - seccomp=./docker/seccomp_profile.json
     restart: unless-stopped
+    depends_on:
+      mihomo:
+        condition: service_healthy
     ports:
       - "8787:8787"
     env_file:
@@ -27,9 +52,25 @@ services:
       TURNSTILE_BROWSER_QUEUE_LIMIT: ${TURNSTILE_BROWSER_QUEUE_LIMIT:-20}
       TURNSTILE_BROWSER_SMOKE_ON_START: ${TURNSTILE_BROWSER_SMOKE_ON_START:-true}
       UPSTREAM_BROWSER_SESSION_TTL_HOURS: ${UPSTREAM_BROWSER_SESSION_TTL_HOURS:-168}
+      MIHOMO_CONTROLLER_URL: http://mihomo:9090
+      MIHOMO_SECRET: ${MIHOMO_SECRET:?MIHOMO_SECRET must be set in .env}
+      MIHOMO_SHARED_DIR: /shared-proxy
+      MIHOMO_RUNTIME_PATH: /shared-proxy/config.yaml
+      MIHOMO_BIND_ADDRESS: 0.0.0.0
+      MIHOMO_CONTROLLER_BIND_ADDRESS: 0.0.0.0
+      UPSTREAM_PROXY_HOST: mihomo
+      PROXY_BASE_PORT: ${PROXY_BASE_PORT:-17890}
       SEED_DEMO: ${SEED_DEMO:-false}
     volumes:
       - frosted-data:/app/data
+      - frosted-proxy:/shared-proxy
+    networks:
+      - proxy-internal
 
 volumes:
   frosted-data:
+  frosted-proxy:
+
+networks:
+  proxy-internal:
+    driver: bridge
