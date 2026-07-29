@@ -4,9 +4,9 @@ import { api } from '../api.js';
 import { money } from '../lib.js';
 import { Modal } from './Modal.jsx';
 
-function defaults(upstreamId = '') {
+function defaults(upstreamName = '') {
   return {
-    upstreamId,
+    upstreamName,
     name: '',
     type: 'newapi',
     baseUrl: '',
@@ -21,7 +21,8 @@ function buildPayload(form) {
     ? { apiToken: form.token.trim(), apiTokens: [form.token.trim()] }
     : { accessToken: form.token.trim() };
   return {
-    upstreamId: form.upstreamId,
+    upstreamId: '',
+    upstreamName: form.upstreamName.trim(),
     name: form.name.trim(),
     type: form.type,
     baseUrl: form.baseUrl.trim().replace(/\/$/, ''),
@@ -50,7 +51,8 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, onClose,
 
   useEffect(() => {
     if (!open) return;
-    setForm(defaults(defaultUpstreamId || upstreams[0]?.id || ''));
+    const defaultUpstream = upstreams.find((upstream) => upstream.id === defaultUpstreamId) || upstreams[0];
+    setForm(defaults(defaultUpstream?.name || ''));
     setPreview(null);
     setBusy('');
   }, [open, defaultUpstreamId]);
@@ -104,7 +106,7 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, onClose,
         </div>
 
         <div className="form-grid two">
-          <label><span>所属上游</span><select required value={form.upstreamId} onChange={(event) => set('upstreamId', event.target.value)}>{upstreams.map((upstream) => <option key={upstream.id} value={upstream.id}>{upstream.name}</option>)}</select></label>
+          <label><span>所属上游</span><input required value={form.upstreamName} onChange={(event) => set('upstreamName', event.target.value)} placeholder="例如：86 或 NewCLI" /></label>
           <label><span>账号名称</span><input required value={form.name} onChange={(event) => set('name', event.target.value)} placeholder="例如：主账号" /></label>
         </div>
         <label><span>上游地址</span><input required type="url" value={form.baseUrl} onChange={(event) => set('baseUrl', event.target.value)} placeholder={form.type === 'newapi' ? 'https://newapi.example.com' : 'https://sub2.example.com'} /></label>

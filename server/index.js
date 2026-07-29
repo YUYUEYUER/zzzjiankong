@@ -146,10 +146,39 @@ const accountSchema = z.object({
   path: ['thresholdRecover'],
 });
 
+const upstreamNameSchema = z.string().trim().min(1, '请填写上游名称').max(60);
+
 const upstreamSchema = z.object({
-  name: z.string().trim().min(1, '请填写上游名称').max(60),
+  name: upstreamNameSchema,
   proxyMode: z.enum(['direct', 'auto_sticky']).optional(),
 });
+
+function canonicalUpstreamName(value) {
+  return String(value || '').trim().normalize('NFKC').toLocaleLowerCase('zh-CN');
+}
+
+function findUpstreamByName(data, name) {
+  const canonical = canonicalUpstreamName(name);
+  return data.upstreams.find((upstream) => canonicalUpstreamName(upstream.name) === canonical);
+}
+
+function requestedUpstreamName(body) {
+  if (body?.upstreamName === undefined) return '';
+  return upstreamNameSchema.parse(body.upstreamName);
+}
+
+function createDirectUpstream(name, timestamp) {
+  return {
+    id: crypto.randomUUID(),
+    name,
+    proxyMode: 'direct',
+    proxyNodeName: '',
+    proxyPort: null,
+    proxyAssignedAt: null,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+}
 
 const proxySubscriptionSchema = z.object({
   url: z.string().trim().url('请填写有效的 Clash 订阅地址').max(4096),
@@ -771,23 +800,18 @@ app.post('/api/accounts/test', asyncRoute(async (req, res) => {
 
 app.post('/api/accounts', asyncRoute(async (req, res) => {
   const input = accountSchema.parse(req.body);
+  const upstreamName = requestedUpstreamName(req.body);
   evaluateFormula(input.formula, 1);
   const timestamp = new Date().toISOString();
   let upstreamId = input.upstreamId;
   let implicitUpstream = null;
   const currentData = store.snapshot();
+  if (upstreamName) {
+    upstreamId = findUpstreamByName(currentData, upstreamName)?.id || '';
+  }
   if (upstreamId && !currentData.upstreams.some((upstream) => upstream.id === upstreamId)) return res.status(400).json({ message: '所选上游不存在' });
   if (!upstreamId) {
-    implicitUpstream = {
-      id: crypto.randomUUID(),
-      name: input.name,
-      proxyMode: 'direct',
-      proxyNodeName: '',
-      proxyPort: null,
-      proxyAssignedAt: null,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    };
+    implicitUpstream = createDirectUpstream(upstreamName || input.name, timestamp);
     upstreamId = implicitUpstream.id;
   }
   const account = {
@@ -809,8 +833,14 @@ app.post('/api/accounts', asyncRoute(async (req, res) => {
   delete account.credentials;
   await store.mutate((data) => {
     if (implicitUpstream) {
-      data.upstreams.push(implicitUpstream);
-      data.audit.unshift({ id: crypto.randomUUID(), type: 'upstream.created', upstreamId: implicitUpstream.id, at: timestamp, details: { name: implicitUpstream.name } });
+      const existing = findUpstreamByName(data, implicitUpstream.name);
+      if (existing) {
+        upstreamId = existing.id;
+        account.upstreamId = existing.id;
+      } else {
+        data.upstreams.push(implicitUpstream);
+        data.audit.unshift({ id: crypto.randomUUID(), type: 'upstream.created', upstreamId: implicitUpstream.id, at: timestamp, details: { name: implicitUpstream.name } });
+      }
     }
     data.accounts.push(account);
     data.audit.unshift({ id: crypto.randomUUID(), type: 'account.created', accountId: account.id, upstreamId, at: timestamp });
@@ -826,10 +856,23 @@ app.post('/api/accounts', asyncRoute(async (req, res) => {
 
 app.patch('/api/accounts/:id', asyncRoute(async (req, res) => {
   const outcome = await withAccountCredentialLock(req.params.id, async () => {
-    const current = store.snapshot().accounts.find((item) => item.id === req.params.id);
+    const currentData = store.snapshot();
+    const current = currentData.accounts.find((item) => item.id === req.params.id);
     if (!current) return { status: 404, message: '账号不存在' };
-    const merged = accountSchema.parse({ ...current, ...req.body, credentials: req.body.credentials || undefined });
-    if (!store.snapshot().upstreams.some((upstream) => upstream.id === merged.upstreamId)) {
+    const upstreamName = requestedUpstreamName(req.body);
+    const timestamp = new Date().toISOString();
+    let targetUpstreamId = req.body.upstreamId || current.upstreamId;
+    let implicitUpstream = null;
+    if (upstreamName) {
+      const existing = findUpstreamByName(currentData, upstreamName);
+      if (existing) targetUpstreamId = existing.id;
+      else {
+        implicitUpstream = createDirectUpstream(upstreamName, timestamp);
+        targetUpstreamId = implicitUpstream.id;
+      }
+    }
+    const merged = accountSchema.parse({ ...current, ...req.body, upstreamId: targetUpstreamId, credentials: req.body.credentials || undefined });
+    if (!implicitUpstream && !currentData.upstreams.some((upstream) => upstream.id === merged.upstreamId)) {
       return { status: 400, message: '所选上游不存在' };
     }
     evaluateFormula(merged.formula, Number(current.rawBalance || 1));
@@ -840,6 +883,14 @@ app.patch('/api/accounts/:id', asyncRoute(async (req, res) => {
     const changedFields = Object.keys(req.body || {}).filter((key) => key !== 'credentials' && key !== 'encryptedSecret');
     await store.mutate((data) => {
       const account = data.accounts.find((item) => item.id === req.params.id);
+      if (implicitUpstream) {
+        const existing = findUpstreamByName(data, implicitUpstream.name);
+        if (existing) merged.upstreamId = existing.id;
+        else {
+          data.upstreams.push(implicitUpstream);
+          data.audit.unshift({ id: crypto.randomUUID(), type: 'upstream.created', upstreamId: implicitUpstream.id, at: timestamp, details: { name: implicitUpstream.name } });
+        }
+      }
       let nextSecret = account.encryptedSecret;
       if (req.body.credentials) {
         let existing = {};
@@ -852,7 +903,7 @@ app.patch('/api/accounts/:id', asyncRoute(async (req, res) => {
         }
         nextSecret = encryptSecret(mergeSecrets(existing, req.body.credentials));
       }
-      Object.assign(account, merged, { updatedAt: new Date().toISOString() });
+      Object.assign(account, merged, { updatedAt: timestamp });
       account.encryptedSecret = nextSecret;
       delete account.credentials;
       data.audit.unshift({ id: crypto.randomUUID(), type: 'account.updated', accountId: account.id, upstreamId: account.upstreamId, at: account.updatedAt, details: { changedFields, credentialsUpdated: Boolean(req.body.credentials) } });

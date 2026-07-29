@@ -132,6 +132,7 @@ test('API key detail endpoint is authenticated, converts balances, and never ret
     result = await request('/api/accounts', {
       method: 'POST',
       body: JSON.stringify({
+        upstreamName: 'Shared Provider',
         name: 'Integration New API',
         type: 'newapi',
         baseUrl: `http://127.0.0.1:${upstreamAddress.port}`,
@@ -153,6 +154,7 @@ test('API key detail endpoint is authenticated, converts balances, and never ret
     });
     assert.equal(result.response.status, 201);
     const accountId = result.body.account.id;
+    const sharedUpstreamId = result.body.account.upstreamId;
 
     result = await request(`/api/accounts/${accountId}/api-keys`);
     assert.equal(result.response.status, 200);
@@ -169,6 +171,7 @@ test('API key detail endpoint is authenticated, converts balances, and never ret
     result = await request('/api/accounts', {
       method: 'POST',
       body: JSON.stringify({
+        upstreamName: 'shared provider',
         name: 'Official account token',
         type: 'newapi',
         baseUrl: `http://127.0.0.1:${upstreamAddress.port}`,
@@ -188,6 +191,7 @@ test('API key detail endpoint is authenticated, converts balances, and never ret
     });
     assert.equal(result.response.status, 201);
     const accessAccountId = result.body.account.id;
+    assert.equal(result.body.account.upstreamId, sharedUpstreamId);
 
     result = await request(`/api/accounts/${accessAccountId}/api-keys`);
     assert.equal(result.response.status, 200);
@@ -197,6 +201,19 @@ test('API key detail endpoint is authenticated, converts balances, and never ret
     assert.equal(result.body.keys[1].convertedCny, 2);
     assert.equal(result.body.keys[1].rateMultiplier, 0.72);
     assert.doesNotMatch(JSON.stringify(result.body), /private-account-access-token/);
+
+    result = await request('/api/dashboard');
+    assert.equal(result.body.upstreams.filter((upstream) => upstream.id === sharedUpstreamId).length, 1);
+    assert.equal(result.body.upstreams.find((upstream) => upstream.id === sharedUpstreamId).accountCount, 2);
+
+    result = await request(`/api/accounts/${accessAccountId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ upstreamName: 'Moved Provider' }),
+    });
+    assert.equal(result.response.status, 200);
+    assert.notEqual(result.body.account.upstreamId, sharedUpstreamId);
+    result = await request('/api/dashboard');
+    assert.equal(result.body.upstreams.filter((upstream) => upstream.name === 'Moved Provider').length, 1);
   } finally {
     child.kill();
     if (child.exitCode == null) await once(child, 'exit');

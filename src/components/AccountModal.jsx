@@ -10,10 +10,10 @@ const SUB2_AUTH_DEFAULTS = {
   password: { profilePath: '/api/v1/users/me', balancePath: 'data.balance', rawUnit: 'CNY', formula: 'x' },
 };
 
-function defaults(type = 'newapi', upstreamId = '') {
+function defaults(type = 'newapi', upstreamId = '', upstreamName = '') {
   const sub2Defaults = SUB2_AUTH_DEFAULTS.api_token;
   return {
-    upstreamId, name: '', type, baseUrl: '', region: '未分组', subgroup: '', authMode: type === 'sub2api' ? 'api_token' : 'access_token', username: '', userId: '',
+    upstreamId, upstreamName, name: '', type, baseUrl: '', region: '未分组', subgroup: '', authMode: type === 'sub2api' ? 'api_token' : 'access_token', username: '', userId: '',
     tokenStrategy: 'sticky', apiTokenPoolText: '',
     profilePath: type === 'sub2api' ? sub2Defaults.profilePath : '/api/user/self',
     balancePath: type === 'sub2api' ? sub2Defaults.balancePath : 'data.quota',
@@ -46,6 +46,7 @@ export function AccountModal({ open, editingAccount, initialDraft, upstreams, de
       setForm({
         ...editingDefaults,
         ...editingAccount,
+        upstreamName: upstreams.find((upstream) => upstream.id === editingAccount.upstreamId)?.name || '',
         authMode,
         credentials: {
           apiToken: '', accessToken: '', refreshToken: '', password: '', turnstileToken: '',
@@ -53,14 +54,19 @@ export function AccountModal({ open, editingAccount, initialDraft, upstreams, de
         },
       });
     } else if (initialDraft) {
-      const base = defaults(initialDraft.type || 'newapi', initialDraft.upstreamId || defaultUpstreamId || upstreams[0]?.id || '');
+      const initialUpstreamId = initialDraft.upstreamId || defaultUpstreamId || upstreams[0]?.id || '';
+      const initialUpstreamName = initialDraft.upstreamName
+        || upstreams.find((upstream) => upstream.id === initialUpstreamId)?.name
+        || '';
+      const base = defaults(initialDraft.type || 'newapi', initialUpstreamId, initialUpstreamName);
       setForm({
         ...base,
         ...initialDraft,
         credentials: { ...base.credentials, ...(initialDraft.credentials || {}) },
       });
     } else {
-      setForm(defaults('newapi', defaultUpstreamId || upstreams[0]?.id || ''));
+      const initialUpstreamId = defaultUpstreamId || upstreams[0]?.id || '';
+      setForm(defaults('newapi', initialUpstreamId, upstreams.find((upstream) => upstream.id === initialUpstreamId)?.name || ''));
     }
     setPreview(null);
     setAdvanced(false);
@@ -192,10 +198,7 @@ export function AccountModal({ open, editingAccount, initialDraft, upstreams, de
           <div className="form-section-title"><span>1</span><div><h3>账号归属与站点</h3></div></div>
           <label>
             <span>所属上游</span>
-            <select required value={form.upstreamId} onChange={(event) => set('upstreamId', event.target.value)}>
-              <option value="" disabled>请选择上游</option>
-              {upstreams.map((upstream) => <option value={upstream.id} key={upstream.id}>{upstream.name}</option>)}
-            </select>
+            <input required value={form.upstreamName || ''} onChange={(event) => set('upstreamName', event.target.value)} placeholder="例如：86 或 NewCLI" />
           </label>
           <div className="type-segmented">
             {[['newapi', 'New API'], ['sub2api', 'Sub2API'], ['generic', '自定义']].map(([id, label]) => (

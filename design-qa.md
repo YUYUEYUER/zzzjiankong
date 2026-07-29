@@ -30,6 +30,7 @@
 - Stacked per-Key metrics and compact account details on narrow screens.
 - Verified the quick-token modal remains fully scrollable inside a 375 x 812 viewport.
 - Prevented 30-second dashboard refreshes from clearing an open account form.
+- Replaced the account form's upstream dropdown with an editable name field; existing names are reused and new names are created atomically with the account.
 - Prevented missing balances and multipliers from being rendered as zero.
 - Added official New API account-token inventory so the default setup can expand into per-Key usage and group multipliers.
 - Invalidated expanded Key data after account sync/edit and allowed collapse/reopen retries.
