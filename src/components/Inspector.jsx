@@ -24,6 +24,19 @@ function channelReadiness(account, settings, channel) {
   return { label: '链路已就绪', tone: 'on' };
 }
 
+function rateMultiplierLabel(metadata = {}) {
+  const raw = metadata.rateMultiplier;
+  const value = raw === null || raw === undefined || raw === '' ? Number.NaN : Number(raw);
+  if (Number.isFinite(value) && value >= 0) return `× ${value.toLocaleString('zh-CN', { maximumFractionDigits: 4 })}`;
+  return {
+    needs_user_access: '待补倍率凭据',
+    dynamic: '自动分组，动态倍率',
+    unsupported: '当前版本未提供',
+    challenge: '倍率接口遇到验证',
+    unavailable: '暂未读取到',
+  }[metadata.rateMultiplierStatus] || '等待首次采集';
+}
+
 export function Inspector({ account, incidents, settings, onOpenIncidents }) {
   const [tab, setTab] = useState('connection');
   const incident = useMemo(() => {
@@ -42,15 +55,23 @@ export function Inspector({ account, incidents, settings, onOpenIncidents }) {
   };
 
   const credentialSummary = account ? [
-    account.hasApiToken ? `API 密钥${account.apiTokenCount > 1 ? ` × ${account.apiTokenCount}` : ''}` : null,
+    account.hasApiToken ? `${account.type === 'sub2api' ? 'API 令牌' : 'API 密钥'}${account.apiTokenCount > 1 ? ` × ${account.apiTokenCount}` : ''}` : null,
     account.hasAccessToken ? `用户访问令牌${account.accessTokenCount > 1 ? ` × ${account.accessTokenCount}` : ''}` : null,
     account.hasRefreshToken ? 'RT' : null,
     account.hasPassword ? '密码' : null,
   ].filter(Boolean).join(' · ') || '未配置' : '';
 
-  const balanceScope = account?.metadata?.balanceScope === 'api_key' || account?.authMode === 'api_token'
-    ? 'API 密钥额度'
-    : '用户账户余额';
+  const isSub2ApiToken = account?.type === 'sub2api' && account?.authMode === 'api_token';
+  const sub2Scope = {
+    wallet: '钱包剩余额度',
+    api_key: 'API Key 剩余额度',
+    subscription: '订阅剩余额度',
+  }[account?.metadata?.balanceScope];
+  const balanceScope = isSub2ApiToken
+    ? sub2Scope || 'Sub2API remaining'
+    : account?.metadata?.balanceScope === 'api_key' || account?.authMode === 'api_token'
+      ? 'API 密钥额度'
+      : '用户账户余额';
 
   return (
     <aside className="inspector glass-surface">
@@ -66,12 +87,18 @@ export function Inspector({ account, incidents, settings, onOpenIncidents }) {
             <div className="token-status-row"><span>读取范围</span><strong>{balanceScope}</strong></div>
             <div className="token-status-row"><span>鉴权来源</span><strong>{account.metadata?.authSource || (account.hasApiToken ? 'api_key' : account.hasAccessToken ? 'user_access_token' : account.hasPassword ? 'password' : '—')}</strong></div>
             <div className="token-status-row"><span>凭据</span><strong>{credentialSummary}</strong></div>
+            {account.authMode === 'api_token' && <div className="token-status-row"><span>当前倍率</span><strong>{rateMultiplierLabel(account.metadata)}</strong></div>}
+            {account.authMode === 'api_token' && account.metadata?.tokenGroup && <div className="token-status-row"><span>API Key 分组</span><strong>{account.metadata.tokenGroup}</strong></div>}
             {account.type === 'newapi' && account.authMode === 'api_token' && <>
               <div className="token-status-row"><span>API 密钥调度</span><strong>{account.tokenStrategy === 'round_robin' ? '轮询' : '故障切换'} · 槽位 {account.metadata?.apiTokenSlot || 1}/{account.apiTokenCount || 1}</strong></div>
-              <p className="token-status-note">免登录读取该 API 密钥的剩余额度，不代表整个用户钱包。无限额度密钥没有可监控的有限余额。</p>
+              <p className="token-status-note">免登录读取该 API 密钥的剩余额度，不代表整个用户钱包。官方 New API 需用户访问令牌 + User ID 才能定位该 Key 的分组倍率。</p>
             </>}
             {account.type === 'newapi' && account.authMode !== 'api_token' && account.accessTokenCount > 1 && <div className="token-status-row"><span>用户令牌调度</span><strong>{account.tokenStrategy === 'round_robin' ? '轮询' : '故障切换'} · 槽位 {account.metadata?.tokenSlot || 1}/{account.accessTokenCount}</strong></div>}
-            {account.type === 'sub2api' && <><div className="token-status-row"><span>AT 状态</span><strong>{account.metadata?.refreshReason ? '已主动续期' : account.metadata?.accessTokenExpiresAt ? `到期 ${relativeTime(account.metadata.accessTokenExpiresAt)}` : '等待上游信息'}</strong></div><p className="token-status-note">Sub2API：AT 临期会用 RT 提前续期，旋转后的 RT 会自动加密回写。</p></>}
+            {isSub2ApiToken && <>
+              <div className="token-status-row"><span>API 令牌调度</span><strong>{account.tokenStrategy === 'round_robin' ? '轮询' : '故障切换'} · 槽位 {account.metadata?.apiTokenSlot || 1}/{account.apiTokenCount || 1}</strong></div>
+              <p className="token-status-note">通过 /v1/usage 读取 remaining，并通过 /v1/sub2api/billing 读取当前 Key 的最终有效倍率{account.metadata?.peakRateEnabled ? `（含时段倍率 × ${account.metadata.appliedPeakMultiplier ?? 1}）` : ''}。</p>
+            </>}
+            {account.type === 'sub2api' && (account.authMode || 'access_token') !== 'api_token' && <><div className="token-status-row"><span>AT 状态</span><strong>{account.metadata?.refreshReason ? '已主动续期' : account.metadata?.accessTokenExpiresAt ? `到期 ${relativeTime(account.metadata.accessTokenExpiresAt)}` : '等待上游信息'}</strong></div><p className="token-status-note">Sub2API：AT 临期会用 RT 提前续期，旋转后的 RT 会自动加密回写。</p></>}
           </div>}
           {account && !incident && <div className="all-clear"><ShieldCheck size={30} /><h3>运行正常</h3><p>当前没有需要处理的余额事件。</p></div>}
           {account && incident && <div className="timeline">{steps.map((step) => {

@@ -25,6 +25,7 @@ test('New API token pool keeps order and schedules from the expected slot', () =
   assert.deepEqual(normalizeTokenPool({ accessTokens: ['a', 'b', 'a'], accessToken: 'b' }), ['a', 'b']);
   assert.deepEqual(normalizeApiTokenPool({ apiTokens: ['first', 'sk-second', 'first'] }), ['first', 'sk-second']);
   assert.deepEqual(scheduledTokenIndexes(3, 'sticky', 1), [1, 2, 0]);
+  assert.deepEqual(scheduledTokenIndexes(3, 'round_robin'), [0, 1, 2]);
   assert.deepEqual(scheduledTokenIndexes(3, 'round_robin', 1), [2, 0, 1]);
 });
 
@@ -329,6 +330,90 @@ test('New API raw API key reads key quota without login or User ID', async () =>
   }
 });
 
+test('New API reads a multiplier exposed directly by a compatible token usage endpoint', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    assert.equal(String(url), 'https://newapi.example.com/api/usage/token');
+    assert.equal(options.headers.Authorization, 'Bearer sk-rated');
+    return new Response(JSON.stringify({
+      code: true,
+      data: {
+        total_available: 300000,
+        unlimited_quota: false,
+        group: 'vip',
+        group_ratio: 0.65,
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  try {
+    const result = await collectBalance({
+      type: 'newapi', authMode: 'api_token', baseUrl: 'https://newapi.example.com',
+    }, { apiToken: 'sk-rated' });
+    assert.equal(result.rawBalance, 300000);
+    assert.equal(result.metadata.rateMultiplier, 0.65);
+    assert.equal(result.metadata.rateMultiplierStatus, 'available');
+    assert.equal(result.metadata.rateMultiplierSource, 'newapi_usage_token');
+    assert.equal(result.metadata.tokenGroup, 'vip');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('New API resolves an official API key group multiplier with the user access token', async () => {
+  const originalFetch = global.fetch;
+  const auxiliaryCalls = [];
+  global.fetch = async (url, options) => {
+    const target = String(url);
+    if (target.endsWith('/api/usage/token')) {
+      assert.equal(options.headers.Authorization, 'Bearer sk-abcd1234wxyz');
+      return new Response(JSON.stringify({
+        code: true,
+        data: { name: 'monitor-key', total_available: 450000, unlimited_quota: false },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+
+    auxiliaryCalls.push(target);
+    assert.equal(options.headers.Authorization, 'personal-access-token');
+    assert.equal(options.headers['New-Api-User'], '42');
+    if (target.includes('/api/token/')) {
+      return new Response(JSON.stringify({
+        success: true,
+        data: {
+          items: [{ name: 'monitor-key', key: 'abcd**********wxyz', group: 'vip' }],
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (target.endsWith('/api/user/self/groups')) {
+      return new Response(JSON.stringify({
+        success: true,
+        data: { vip: { desc: 'VIP', ratio: 0.72 } },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    throw new Error(`unexpected URL ${target}`);
+  };
+
+  try {
+    const result = await collectBalance({
+      type: 'newapi',
+      authMode: 'api_token',
+      baseUrl: 'https://newapi.example.com',
+      userId: '42',
+    }, {
+      apiToken: 'sk-abcd1234wxyz',
+      accessToken: 'personal-access-token',
+    });
+    assert.equal(result.rawBalance, 450000);
+    assert.equal(result.metadata.rateMultiplier, 0.72);
+    assert.equal(result.metadata.rateMultiplierStatus, 'available');
+    assert.equal(result.metadata.rateMultiplierSource, 'newapi_user_groups');
+    assert.equal(result.metadata.tokenGroup, 'vip');
+    assert.equal(auxiliaryCalls.length, 2);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('New API raw API key retries with sk prefix only after auth failure', async () => {
   const originalFetch = global.fetch;
   const calls = [];
@@ -347,7 +432,14 @@ test('New API raw API key retries with sk prefix only after auth failure', async
     assert.equal(result.rawBalance, 250000);
     assert.deepEqual(calls, ['Bearer raw-token', 'Bearer sk-raw-token']);
     assert.equal(result.metadata.tokenPrefixMode, 'sk_compat');
-    assert.equal(result.updatedSecret, undefined);
+    assert.equal(result.updatedSecret.apiToken, 'sk-raw-token');
+    assert.deepEqual(result.updatedSecret.apiTokens, ['sk-raw-token']);
+
+    calls.length = 0;
+    await collectBalance({
+      type: 'newapi', authMode: 'api_token', baseUrl: 'https://newapi.example.com',
+    }, result.updatedSecret);
+    assert.deepEqual(calls, ['Bearer sk-raw-token']);
   } finally {
     global.fetch = originalFetch;
   }
@@ -391,6 +483,330 @@ test('New API rejects an unlimited API key as an unmonitorable balance', async (
     );
   } finally {
     global.fetch = originalFetch;
+  }
+});
+
+test('Sub2API API Key reads its finite quota from the official usage endpoint', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    if (String(url) === 'https://sub2.example.com/v1/sub2api/billing') {
+      assert.equal(options.headers.Authorization, 'Bearer sk-monitor');
+      return new Response(JSON.stringify({
+        object: 'sub2api.key_billing',
+        schema_version: 1,
+        billing_scope: 'token',
+        group_rate_multiplier: 0.8,
+        resolved_rate_multiplier: 0.75,
+        peak_rate_enabled: true,
+        peak_rate_multiplier: 1.2,
+        applied_peak_multiplier: 1.2,
+        effective_rate_multiplier: 0.9,
+        timezone: 'Asia/Shanghai',
+        observed_at: '2026-07-29T00:00:00Z',
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    assert.equal(String(url), 'https://sub2.example.com/v1/usage');
+    assert.equal(options.headers.Authorization, 'Bearer sk-monitor');
+    return new Response(JSON.stringify({
+      mode: 'quota_limited',
+      isValid: true,
+      status: 'active',
+      remaining: 8.75,
+      unit: 'USD',
+      quota: { limit: 20, used: 11.25, remaining: 8.75, unit: 'USD' },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  try {
+    const result = await collectBalance({
+      type: 'sub2api', authMode: 'api_token', baseUrl: 'https://sub2.example.com', tokenStrategy: 'sticky',
+    }, { apiToken: 'sk-monitor' });
+    assert.equal(result.rawBalance, 8.75);
+    assert.equal(result.metadata.authSource, 'api_key');
+    assert.equal(result.metadata.credentialScope, 'api_key');
+    assert.equal(result.metadata.balanceScope, 'api_key');
+    assert.equal(result.metadata.unit, 'USD');
+    assert.equal(result.metadata.apiTokenSlot, 1);
+    assert.equal(result.metadata.quota.limit, 20);
+    assert.equal(result.metadata.rateMultiplier, 0.9);
+    assert.equal(result.metadata.groupRateMultiplier, 0.8);
+    assert.equal(result.metadata.resolvedRateMultiplier, 0.75);
+    assert.equal(result.metadata.appliedPeakMultiplier, 1.2);
+    assert.equal(result.metadata.rateMultiplierStatus, 'available');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Sub2API API Key honors a customized usage path and balance field', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    if (String(url).endsWith('/v1/sub2api/billing')) {
+      return new Response(JSON.stringify({ error: 'not supported' }), {
+        status: 404, headers: { 'content-type': 'application/json' },
+      });
+    }
+    assert.equal(String(url), 'https://sub2.example.com/custom/usage');
+    assert.equal(options.headers.Authorization, 'Bearer sk-custom');
+    return new Response(JSON.stringify({
+      mode: 'quota_limited',
+      isValid: true,
+      data: { remaining: 6.5 },
+      unit: 'USD',
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  try {
+    const result = await collectBalance({
+      type: 'sub2api',
+      authMode: 'api_token',
+      baseUrl: 'https://sub2.example.com',
+      profilePath: '/custom/usage',
+      balancePath: 'data.remaining',
+    }, { apiToken: 'sk-custom' });
+    assert.equal(result.rawBalance, 6.5);
+    assert.equal(result.metadata.profilePath, '/custom/usage');
+    assert.equal(result.metadata.balancePath, 'data.remaining');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Sub2API round-robin starts at the first token and advances after success', async () => {
+  const originalFetch = global.fetch;
+  const calls = [];
+  global.fetch = async (url, options) => {
+    if (String(url).endsWith('/v1/sub2api/billing')) {
+      return new Response(JSON.stringify({ error: 'not supported' }), {
+        status: 404, headers: { 'content-type': 'application/json' },
+      });
+    }
+    calls.push(options.headers.Authorization);
+    const remaining = options.headers.Authorization === 'Bearer sk-first' ? 11 : 22;
+    return new Response(JSON.stringify({
+      mode: 'quota_limited', isValid: true, status: 'active', remaining, unit: 'USD',
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  try {
+    const account = {
+      type: 'sub2api', authMode: 'api_token', baseUrl: 'https://sub2.example.com', tokenStrategy: 'round_robin',
+    };
+    const first = await collectBalance(account, { apiTokens: ['sk-first', 'sk-second'] });
+    assert.equal(first.rawBalance, 11);
+    assert.equal(first.updatedSecret.apiTokenCursor, 0);
+    assert.deepEqual(calls, ['Bearer sk-first']);
+
+    calls.length = 0;
+    const second = await collectBalance(account, first.updatedSecret);
+    assert.equal(second.rawBalance, 22);
+    assert.equal(second.updatedSecret.apiTokenCursor, 1);
+    assert.deepEqual(calls, ['Bearer sk-second']);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Sub2API API Key adds the sk prefix after auth failure and identifies wallet scope', async () => {
+  const originalFetch = global.fetch;
+  const calls = [];
+  global.fetch = async (url, options) => {
+    if (String(url).endsWith('/v1/sub2api/billing')) {
+      return new Response(JSON.stringify({ error: 'not supported' }), {
+        status: 404, headers: { 'content-type': 'application/json' },
+      });
+    }
+    calls.push(options.headers.Authorization);
+    if (options.headers.Authorization === 'Bearer monitor') {
+      return new Response(JSON.stringify({ error: { message: 'Invalid API key' } }), {
+        status: 401, headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({
+      mode: 'unrestricted', isValid: true, planName: '钱包余额', remaining: 19.5, unit: 'USD', balance: 19.5,
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  try {
+    const result = await collectBalance({
+      type: 'sub2api', authMode: 'api_token', baseUrl: 'https://sub2.example.com',
+    }, { apiToken: 'monitor' });
+    assert.deepEqual(calls, ['Bearer monitor', 'Bearer sk-monitor']);
+    assert.equal(result.rawBalance, 19.5);
+    assert.equal(result.metadata.balanceScope, 'wallet');
+    assert.equal(result.metadata.tokenPrefixMode, 'sk_compat');
+    assert.equal(result.updatedSecret.apiToken, 'sk-monitor');
+    assert.deepEqual(result.updatedSecret.apiTokens, ['sk-monitor']);
+
+    calls.length = 0;
+    await collectBalance({
+      type: 'sub2api', authMode: 'api_token', baseUrl: 'https://sub2.example.com',
+    }, result.updatedSecret);
+    assert.deepEqual(calls, ['Bearer sk-monitor']);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Sub2API API Key pool fails over only on auth failure and remembers subscription slot', async () => {
+  const originalFetch = global.fetch;
+  const calls = [];
+  global.fetch = async (url, options) => {
+    if (String(url).endsWith('/v1/sub2api/billing')) {
+      return new Response(JSON.stringify({ error: 'not supported' }), {
+        status: 404, headers: { 'content-type': 'application/json' },
+      });
+    }
+    calls.push(options.headers.Authorization);
+    if (options.headers.Authorization === 'Bearer sk-expired') {
+      return new Response(JSON.stringify({ error: { message: 'Invalid API key' } }), {
+        status: 401, headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({
+      mode: 'unrestricted',
+      isValid: true,
+      planName: 'Claude Team',
+      remaining: 42,
+      unit: 'USD',
+      subscription: { daily_usage_usd: 8, daily_limit_usd: 50 },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  try {
+    const result = await collectBalance({
+      type: 'sub2api', authMode: 'api_token', baseUrl: 'https://sub2.example.com', tokenStrategy: 'sticky',
+    }, { apiTokens: ['sk-expired', 'sk-subscription'], apiTokenCursor: 0 });
+    assert.deepEqual(calls, ['Bearer sk-expired', 'Bearer sk-subscription']);
+    assert.equal(result.rawBalance, 42);
+    assert.equal(result.metadata.balanceScope, 'subscription');
+    assert.equal(result.metadata.apiTokenSlot, 2);
+    assert.equal(result.metadata.tokenFailovers, 1);
+    assert.equal(result.metadata.planName, 'Claude Team');
+    assert.equal(result.updatedSecret.apiTokenCursor, 1);
+    assert.equal(result.updatedSecret.apiToken, 'sk-subscription');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Sub2API API Key pool fails over when usage marks a key invalid', async () => {
+  const originalFetch = global.fetch;
+  const calls = [];
+  global.fetch = async (url, options) => {
+    if (String(url).endsWith('/v1/sub2api/billing')) {
+      return new Response(JSON.stringify({ error: 'not supported' }), {
+        status: 404, headers: { 'content-type': 'application/json' },
+      });
+    }
+    calls.push(options.headers.Authorization);
+    if (options.headers.Authorization === 'Bearer sk-disabled') {
+      return new Response(JSON.stringify({
+        mode: 'quota_limited', isValid: false, status: 'inactive', remaining: 5, unit: 'USD',
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({
+      mode: 'quota_limited', isValid: true, status: 'active', remaining: 15, unit: 'USD',
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  try {
+    const result = await collectBalance({
+      type: 'sub2api', authMode: 'api_token', baseUrl: 'https://sub2.example.com',
+    }, { apiTokens: ['sk-disabled', 'sk-active'] });
+    assert.deepEqual(calls, ['Bearer sk-disabled', 'Bearer sk-active']);
+    assert.equal(result.rawBalance, 15);
+    assert.equal(result.metadata.apiTokenSlot, 2);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Sub2API API Key skips unmonitorable slots when a finite token remains', async () => {
+  const originalFetch = global.fetch;
+  try {
+    for (const responseBody of [
+      { mode: 'unrestricted', isValid: true, remaining: -1, unit: 'USD', subscription: {} },
+      { mode: 'quota_limited', isValid: true, unit: 'USD' },
+    ]) {
+      let calls = 0;
+      global.fetch = async (url) => {
+        if (String(url).endsWith('/v1/sub2api/billing')) {
+          return new Response(JSON.stringify({ error: 'not supported' }), {
+            status: 404, headers: { 'content-type': 'application/json' },
+          });
+        }
+        calls += 1;
+        return new Response(JSON.stringify(calls === 1 ? responseBody : {
+          mode: 'quota_limited', isValid: true, status: 'active', remaining: 7.5, unit: 'USD',
+        }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        });
+      };
+      const result = await collectBalance({
+        type: 'sub2api', authMode: 'api_token', baseUrl: 'https://sub2.example.com',
+      }, { apiTokens: ['sk-first', 'sk-second'] });
+      assert.equal(result.rawBalance, 7.5);
+      assert.equal(result.metadata.apiTokenSlot, 2);
+      assert.equal(result.metadata.tokenFailovers, 1);
+      assert.equal(calls, 2);
+    }
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Sub2API API Key rejects a pool when every slot is unmonitorable', async () => {
+  const originalFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({
+      mode: 'quota_limited', isValid: true, unit: 'USD',
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  try {
+    await assert.rejects(
+      collectBalance({
+        type: 'sub2api', authMode: 'api_token', baseUrl: 'https://sub2.example.com',
+      }, { apiTokens: ['sk-first', 'sk-second'] }),
+      /池没有可监控的有限余额/,
+    );
+    assert.equal(calls, 2);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Sub2API API Key does not fan Cloudflare or server failures across its pool', async () => {
+  const originalFetch = global.fetch;
+  const originalSolver = config.turnstileSolver;
+  config.turnstileSolver = 'none';
+  try {
+    for (const upstreamResponse of [
+      new Response('<html><title>Just a moment...</title></html>', {
+        status: 403, headers: { 'content-type': 'text/html', 'cf-mitigated': 'challenge' },
+      }),
+      new Response(JSON.stringify({ error: 'token accounting temporarily unavailable' }), {
+        status: 500, headers: { 'content-type': 'application/json' },
+      }),
+    ]) {
+      let calls = 0;
+      global.fetch = async () => {
+        calls += 1;
+        return upstreamResponse.clone();
+      };
+      await assert.rejects(
+        collectBalance({
+          type: 'sub2api', authMode: 'api_token', baseUrl: 'https://sub2.example.com',
+        }, { apiTokens: ['sk-first', 'sk-second'] }),
+      );
+      assert.equal(calls, 1);
+    }
+  } finally {
+    global.fetch = originalFetch;
+    config.turnstileSolver = originalSolver;
   }
 });
 

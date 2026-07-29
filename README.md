@@ -4,8 +4,8 @@
 
 ## 核心能力
 
-- New API：默认使用“个人资料 → 安全 → 访问令牌”生成的用户访问令牌，配合 User ID 免登录读取整个账户余额。左侧“API 密钥”属于另一类凭据，只用于读取某一枚调用密钥的剩余额度；系统兼容带或不带 `sk-`。也保留密码登录回退。
-- Sub2API：支持 Access Token、Refresh Token 和密码登录；遇 CF 同样先过盾，失败回退 AT/RT。
+- New API：默认使用“个人资料 → 安全 → 访问令牌”生成的用户访问令牌，配合 User ID 免登录读取整个账户余额。左侧“API 密钥”用于读取单枚调用密钥的余额；配合用户访问令牌还能自动定位该 Key 的分组倍率。系统兼容带或不带 `sk-`，也保留密码登录回退。
+- Sub2API：优先支持用户生成的 `sk-` API Key，通过 `/v1/usage` 免登录读取钱包、订阅或密钥剩余额度，并通过 `/v1/sub2api/billing` 读取该 Key 的当前有效倍率；同时保留 Access Token、Refresh Token 和密码登录链路。
 - 自定义站点：可以配置用户接口路径和余额 JSON 字段。
 - 转换器：只允许变量 `x`、数字、括号和 `+ - * /`。
 - 告警闭环：低余额建单、通知去重、手动充值、连续恢复确认、自动结单。
@@ -65,8 +65,9 @@ x / 500000 * 7.2          # New API 内部 quota 折算
 ## 站点接入建议
 
 - 需要监控整个 New API 用户账户余额时，使用“个人资料 → 安全 → 访问令牌”生成的用户访问令牌，并填写账户 User ID；令牌按页面显示的原始值提交，不加 `Bearer` 或 `sk-`。
-- 只监控某一枚调用密钥额度时，使用左侧“API 密钥”创建的有限额度密钥；无限额度密钥无法返回可监控的有限余额。两类凭据用途不同，不应混填。
-- Sub2API 推荐保存 Access Token + Refresh Token；密码用于 token 全部失效时的回退登录。
+- 只监控某一枚 New API 调用密钥额度时，使用左侧“API 密钥”创建的有限额度密钥；无限额度密钥无法返回可监控的有限余额。若还要读取该 Key 创建时选择的分组倍率，需要额外填写用户访问令牌与 User ID；辅助令牌只访问 Key 列表和用户分组接口，不参与 Key 余额鉴权。
+- Sub2API 新版优先使用“API 密钥”页面生成的 `sk-` 调用令牌；官方 `/v1/usage` 返回 USD `remaining`，默认用 `x * 7.2` 折算人民币。有限密钥读取密钥额度，钱包模式读取账户余额，订阅模式读取当前周期最小剩余额度；`/v1/sub2api/billing` 同时返回分组倍率、用户覆盖倍率、峰值倍率和最终有效倍率。无限订阅无法形成有限余额告警。
+- 旧版 Sub2API 或需要监控用户资料接口时，继续保存 Access Token + Refresh Token；密码用于 AT/RT 全部失效后的回退登录。
 - 不要在多个上游站点复用同一个密码。
 - `MASTER_KEY` 丢失后无法解密已有凭据，部署时必须妥善备份。
 
@@ -139,10 +140,11 @@ npx playwright install --with-deps chromium
 ### 长期稳定路径
 
 1. **New API 正式令牌**：优先使用“个人资料 → 安全 → 访问令牌”与 User ID。这类令牌不同于左侧“API 密钥”。密码登录通常只建立会话；除非上游明确返回 `access_token`，霜镜不会声称自动生成了个人访问令牌。
-2. **Sub2API AT/RT**：保存 Access Token + Refresh Token，系统会按 JWT 或上游返回的过期时间提前续期并保存轮换结果。
-3. **浏览器会话复用**：适合登录受 Turnstile 保护、资料接口本身允许会话访问的 New API 二改站点。
-4. **人工接管**：交互挑战、设备确认或站点额外 2FA 出现时，使用可见浏览器完成一次授权，而不是无限重试。
-5. **自管上游 Cloudflare**：为监控服务器使用固定出口 IP，并通过窄范围 WAF Skip 规则只放行指定主机、路径和来源；或在账号“高级设置”填写 Cloudflare Access Service Token。两个 Access 请求头只会发送到当前上游同源地址，不会发送给挑战 iframe。不要全站关闭防护，也不要放行动态公网 IP。
+2. **Sub2API API Key**：使用用户侧 `sk-` 调用令牌访问 `/v1/usage` 和 `/v1/sub2api/billing`，不经过网页登录；多个密钥支持固定槽位故障切换或轮询调度。
+3. **Sub2API AT/RT**：旧站继续保存 Access Token + Refresh Token，系统会按 JWT 或上游返回的过期时间提前续期并保存轮换结果。
+4. **浏览器会话复用**：适合登录受 Turnstile 保护、资料接口本身允许会话访问的 New API 二改站点。
+5. **人工接管**：交互挑战、设备确认或站点额外 2FA 出现时，使用可见浏览器完成一次授权，而不是无限重试。
+6. **自管上游 Cloudflare**：为监控服务器使用固定出口 IP，并通过窄范围 WAF Skip 规则只放行指定主机、路径和来源；或在账号“高级设置”填写 Cloudflare Access Service Token。两个 Access 请求头只会发送到当前上游同源地址，不会发送给挑战 iframe。不要全站关闭防护，也不要放行动态公网 IP。
 
 Cloudflare 官方参考：[服务端验证与 token 生命周期](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/)、[识别挑战页响应](https://developers.cloudflare.com/cloudflare-challenges/challenge-types/challenge-pages/detect-response/)、[WAF Skip 规则](https://developers.cloudflare.com/waf/custom-rules/skip/)、[Access Service Token](https://developers.cloudflare.com/cloudflare-one/access-controls/service-credentials/service-tokens/)。
 

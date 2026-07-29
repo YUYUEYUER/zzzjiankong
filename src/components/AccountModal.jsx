@@ -4,13 +4,21 @@ import { api } from '../api.js';
 import { money } from '../lib.js';
 import { Modal } from './Modal.jsx';
 
+const SUB2_AUTH_DEFAULTS = {
+  api_token: { profilePath: '/v1/usage', balancePath: 'remaining', rawUnit: 'USD', formula: 'x * 7.2' },
+  access_token: { profilePath: '/api/v1/users/me', balancePath: 'data.balance', rawUnit: 'CNY', formula: 'x' },
+  password: { profilePath: '/api/v1/users/me', balancePath: 'data.balance', rawUnit: 'CNY', formula: 'x' },
+};
+
 function defaults(type = 'newapi', upstreamId = '') {
+  const sub2Defaults = SUB2_AUTH_DEFAULTS.api_token;
   return {
-    upstreamId, name: '', type, baseUrl: '', region: '未分组', subgroup: '', authMode: 'access_token', username: '', userId: '',
+    upstreamId, name: '', type, baseUrl: '', region: '未分组', subgroup: '', authMode: type === 'sub2api' ? 'api_token' : 'access_token', username: '', userId: '',
     tokenStrategy: 'sticky', apiTokenPoolText: '',
-    profilePath: type === 'sub2api' ? '/api/v1/users/me' : '/api/user/self',
-    balancePath: type === 'sub2api' ? 'data.balance' : 'data.quota',
-    formula: type === 'newapi' ? 'x / 500000 * 7.2' : 'x', rawUnit: type === 'newapi' ? 'quota' : 'CNY',
+    profilePath: type === 'sub2api' ? sub2Defaults.profilePath : '/api/user/self',
+    balancePath: type === 'sub2api' ? sub2Defaults.balancePath : 'data.quota',
+    formula: type === 'sub2api' ? sub2Defaults.formula : type === 'newapi' ? 'x / 500000 * 7.2' : 'x',
+    rawUnit: type === 'sub2api' ? sub2Defaults.rawUnit : type === 'newapi' ? 'quota' : 'CNY',
     turnstileSiteKey: '',
     thresholdLow: 50, thresholdRecover: 60, pollIntervalMinutes: 5, enabled: true,
     notifications: { resend: true, feishu: true },
@@ -31,9 +39,14 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
   useEffect(() => {
     if (!open) return;
     if (editingAccount) {
+      const authMode = editingAccount.authMode || 'access_token';
+      const editingDefaults = editingAccount.type === 'sub2api'
+        ? { ...defaults(editingAccount.type), ...SUB2_AUTH_DEFAULTS[authMode] }
+        : defaults(editingAccount.type);
       setForm({
-        ...defaults(editingAccount.type),
+        ...editingDefaults,
         ...editingAccount,
+        authMode,
         credentials: {
           apiToken: '', accessToken: '', refreshToken: '', password: '', turnstileToken: '',
           cfAccessClientId: '', cfAccessClientSecret: '',
@@ -50,9 +63,20 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
   const setCredential = (key, value) => setForm((current) => ({ ...current, credentials: { ...current.credentials, [key]: value } }));
 
   const payload = useMemo(() => {
-    const credentials = Object.fromEntries(Object.entries(form.credentials || {}).filter(([, value]) => value));
+    const commonCredentialKeys = ['cfAccessClientId', 'cfAccessClientSecret'];
+    const credentialKeys = form.authMode === 'api_token'
+      ? [form.type === 'newapi' ? 'accessToken' : null, ...commonCredentialKeys].filter(Boolean)
+      : form.type === 'sub2api'
+        ? ['accessToken', 'refreshToken', 'password', 'turnstileToken', ...commonCredentialKeys]
+        : form.authMode === 'password'
+          ? [form.type === 'newapi' ? 'accessToken' : null, 'password', ...commonCredentialKeys].filter(Boolean)
+          : ['accessToken', ...commonCredentialKeys];
+    const allowedCredentialKeys = new Set(credentialKeys);
+    const credentials = Object.fromEntries(Object.entries(form.credentials || {}).filter(([key, value]) => (
+      allowedCredentialKeys.has(key) && value
+    )));
     const apiTokens = String(form.apiTokenPoolText || '').split(/[\n,]+/).map((token) => token.trim()).filter(Boolean);
-    if (apiTokens.length) {
+    if (form.authMode === 'api_token' && apiTokens.length) {
       credentials.apiTokens = [...new Set(apiTokens)].slice(0, 20);
       credentials.apiToken = credentials.apiTokens[0];
     }
@@ -81,6 +105,14 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
       authMode,
       profilePath: authMode === 'api_token' ? '/api/usage/token' : '/api/user/self',
       balancePath: authMode === 'api_token' ? 'data.total_available' : 'data.quota',
+    }));
+  };
+
+  const changeSub2AuthMode = (authMode) => {
+    setForm((current) => ({
+      ...current,
+      authMode,
+      ...SUB2_AUTH_DEFAULTS[authMode],
     }));
   };
 
@@ -138,7 +170,7 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
   const isSub2 = form.type === 'sub2api';
   const tokenHint = editingAccount
     ? [
-        editingAccount.hasApiToken ? `API 密钥${editingAccount.apiTokenCount > 1 ? ` × ${editingAccount.apiTokenCount}` : ''}` : null,
+        editingAccount.hasApiToken ? `${editingAccount.type === 'sub2api' ? 'API 令牌' : 'API 密钥'}${editingAccount.apiTokenCount > 1 ? ` × ${editingAccount.apiTokenCount}` : ''}` : null,
         editingAccount.hasAccessToken ? '用户访问令牌' : null,
         editingAccount.hasRefreshToken ? 'RT' : null,
         editingAccount.hasPassword ? '密码' : null,
@@ -176,7 +208,7 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
                 <div>
                   <strong>{form.authMode === 'api_token' ? 'API 密钥：只读取该密钥的可用额度' : form.authMode === 'access_token' ? '新版用户访问令牌：免登录读取整个账户余额' : '账号密码：仅作为回退方式'}</strong>
                   <p>{form.authMode === 'api_token'
-                    ? '使用左侧“API 密钥”页面创建的调用密钥，请求 /api/usage/token。它监控的是该密钥额度，不是整个用户钱包。'
+                    ? '使用左侧“API 密钥”页面创建的调用密钥，请求 /api/usage/token。余额只属于该 Key；额外填写用户访问令牌与 User ID 后，会自动定位并读取它的分组倍率。'
                     : form.authMode === 'access_token'
                       ? '使用“个人资料 → 安全 → 访问令牌”生成的字符串，原样放入 Authorization；NewAPI 同时要求 User ID 请求头，不需要用户名或密码。'
                       : `密码模式遇到挑战时会${turnstileSolver?.enabled ? '进入浏览器验证并保存可用会话；仅在上游明确返回 AT/RT 时才回写令牌' : '尝试登录，建议同时保存用户访问令牌作为回退'}。`}</p>
@@ -214,6 +246,17 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
                 </div>
                 <small>{form.tokenStrategy === 'round_robin' ? '每次采集从下一个 API 密钥开始，失败继续切换。' : '沿用上次成功的 API 密钥，失效时自动切换。'} 系统兼容带或不带 sk- 的密钥；无限额度密钥无法提供有限余额。</small>
               </label>}
+              {form.authMode === 'api_token' && <div className="form-grid two">
+                <label>
+                  <span>User ID（倍率读取）</span>
+                  <input value={form.userId} onChange={(event) => set('userId', event.target.value)} placeholder="用户资料中显示的数字 ID" />
+                </label>
+                <label>
+                  <span>用户访问令牌（倍率读取，可选）</span>
+                  <div className="secret-input"><input type={showSecret ? 'text' : 'password'} value={form.credentials.accessToken} onChange={(event) => setCredential('accessToken', event.target.value)} placeholder={editingAccount?.hasAccessToken ? '已加密保存，留空不修改' : '个人资料 → 安全 → 访问令牌'} /><button type="button" onClick={() => setShowSecret((value) => !value)}>{showSecret ? <EyeSlash size={17} /> : <Eye size={17} />}</button></div>
+                  <small>只用于读取 API Key 列表与用户分组倍率，不参与该 Key 的余额鉴权。</small>
+                </label>
+              </div>}
               {form.authMode !== 'api_token' && <>
                 <label>
                   <span>用户访问令牌{form.authMode === 'password' ? '（登录失败回退）' : ''}</span>
@@ -264,63 +307,111 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
               <div className="auth-hint">
                 <Info size={18} weight="fill" />
                 <div>
-                  <strong>
-                    {turnstileSolver?.enabled
-                      ? `长久登录策略（已启用 ${turnstileSolver.provider} 浏览器验证）`
-                      : '长久登录策略（可选浏览器验证）'}
-                  </strong>
-                  <p>
-                    优先使用 Access Token 拉余额；JWT 临近过期会提前用 Refresh Token 续期；上游返回旋转 RT 时立即加密回写。
-                    两者都失效时，
-                    使用邮箱密码重新登录并自动保存新的 AT/RT。
+                  <strong>{form.authMode === 'api_token'
+                    ? 'Sub2API API 令牌：免登录读取剩余额度'
+                    : form.authMode === 'access_token'
+                      ? 'AT/RT 长久会话：自动续期并回写旋转令牌'
+                      : '账号密码兜底：优先复用 AT/RT，失效后自动登录'}</strong>
+                  {form.authMode === 'api_token' && <p>使用以 sk- 开头的用户 API Key 请求 /v1/usage，读取 wallet、API key 或 subscription 范围返回的 remaining；无需登录账号。</p>}
+                  {form.authMode === 'access_token' && <p>
+                    优先使用 Access Token 拉余额；JWT 临近过期会提前用 Refresh Token 续期；上游返回旋转 RT 时立即加密回写。两者都失效时，可使用邮箱密码重新登录并保存新的 AT/RT。
+                  </p>}
+                  {form.authMode === 'password' && <p>
+                    优先复用已保存的 Access Token / Refresh Token；令牌失效后使用邮箱和密码重新登录并保存新令牌。
                     {turnstileSolver?.enabled && turnstileSolver.provider === 'browser'
-                      ? ' 遇 Cloudflare 挑战时进入真实浏览器流程并在同一会话验真；需要交互时会明确提示人工接管。'
+                      ? ' 遇 Cloudflare 挑战时会在固定出口打开浏览器并等待验证完成。'
                       : turnstileSolver?.enabled
-                        ? ' 遇到验证页面时保持浏览器打开并等待完成；失败再回退 AT/RT。'
-                        : ' 遇 CF 可配置 TURNSTILE_SOLVER=browser；失败仍可回退 AT/RT。'}
-                  </p>
+                        ? ' 遇到验证页面时会保持浏览器打开并等待完成。'
+                        : ' 验证站点可启用浏览器流程。'}
+                  </p>}
                   {tokenHint && <p className="auth-hint-status">已保存凭据：{tokenHint}（字段留空表示不修改）</p>}
                 </div>
               </div>
 
-              <label>
-                <span>登录邮箱（密码回退时使用）</span>
-                <input value={form.username} onChange={(event) => set('username', event.target.value)} placeholder="user@example.com" />
-              </label>
+              <div className="form-grid two">
+                <label>
+                  <span>认证方式</span>
+                  <select value={form.authMode} onChange={(event) => changeSub2AuthMode(event.target.value)}>
+                    <option value="api_token">API 令牌免登录（sk-）</option>
+                    <option value="access_token">Access Token / Refresh Token</option>
+                    <option value="password">账号密码</option>
+                  </select>
+                </label>
+                {form.authMode === 'api_token' && <label>
+                  <span>令牌调度</span>
+                  <select value={form.tokenStrategy || 'sticky'} onChange={(event) => set('tokenStrategy', event.target.value)}>
+                    <option value="sticky">故障切换（推荐）</option>
+                    <option value="round_robin">轮询调度</option>
+                  </select>
+                </label>}
+              </div>
 
-              <label>
-                <span>Access Token（推荐）</span>
+              {form.authMode === 'api_token' && <label>
+                <span>Sub2API API 令牌（每行一个，最多 20 个）</span>
                 <div className="secret-input">
-                  <input
-                    type={showSecret ? 'text' : 'password'}
-                    value={form.credentials.accessToken}
-                    onChange={(event) => setCredential('accessToken', event.target.value)}
-                    placeholder={editingAccount?.hasAccessToken ? '已保存，留空不修改' : 'Bearer 用的 access_token'}
+                  <textarea
+                    className={showSecret ? '' : 'masked-textarea'}
+                    value={form.apiTokenPoolText || ''}
+                    onChange={(event) => set('apiTokenPoolText', event.target.value)}
+                    placeholder={editingAccount?.hasApiToken ? `已加密保存 ${editingAccount.apiTokenCount || 1} 个 API 令牌，留空不修改` : 'sk-...'}
                   />
                   <button type="button" onClick={() => setShowSecret((value) => !value)}>{showSecret ? <EyeSlash size={17} /> : <Eye size={17} />}</button>
                 </div>
-              </label>
+                <small>{form.tokenStrategy === 'round_robin' ? '每次采集从下一个令牌开始，失败继续切换。' : '沿用上次成功令牌，失效时自动切换。'} /v1/usage 会读取 wallet、API key 或 subscription 对应的 remaining。</small>
+              </label>}
 
-              <label>
-                <span>Refresh Token（强烈建议，用于自动续期）</span>
-                <input
-                  type={showSecret ? 'text' : 'password'}
-                  value={form.credentials.refreshToken}
-                  onChange={(event) => setCredential('refreshToken', event.target.value)}
-                  placeholder={editingAccount?.hasRefreshToken ? '已保存，留空不修改' : 'refresh_token'}
-                />
-              </label>
-
-              <div className="form-grid two">
+              {form.authMode !== 'api_token' && <>
                 <label>
+                  <span>登录邮箱{form.authMode === 'access_token' ? '（密码回退时使用）' : ''}</span>
+                  <input value={form.username} onChange={(event) => set('username', event.target.value)} placeholder="user@example.com" />
+                </label>
+
+                {form.authMode === 'password' && <label>
+                  <span>登录密码</span>
+                  <div className="secret-input">
+                    <input
+                      type={showSecret ? 'text' : 'password'}
+                      value={form.credentials.password}
+                      onChange={(event) => setCredential('password', event.target.value)}
+                      placeholder={editingAccount?.hasPassword ? '已保存，留空不修改' : '账号登录密码'}
+                    />
+                    <button type="button" onClick={() => setShowSecret((value) => !value)}>{showSecret ? <EyeSlash size={17} /> : <Eye size={17} />}</button>
+                  </div>
+                </label>}
+
+                <label>
+                  <span>Access Token{form.authMode === 'password' ? '（可选回退）' : '（推荐）'}</span>
+                  <div className="secret-input">
+                    <input
+                      type={showSecret ? 'text' : 'password'}
+                      value={form.credentials.accessToken}
+                      onChange={(event) => setCredential('accessToken', event.target.value)}
+                      placeholder={editingAccount?.hasAccessToken ? '已保存，留空不修改' : 'Bearer 使用的 access_token'}
+                    />
+                    <button type="button" onClick={() => setShowSecret((value) => !value)}>{showSecret ? <EyeSlash size={17} /> : <Eye size={17} />}</button>
+                  </div>
+                </label>
+
+                <label>
+                  <span>Refresh Token{form.authMode === 'password' ? '（可选回退）' : '（用于自动续期）'}</span>
+                  <input
+                    type={showSecret ? 'text' : 'password'}
+                    value={form.credentials.refreshToken}
+                    onChange={(event) => setCredential('refreshToken', event.target.value)}
+                    placeholder={editingAccount?.hasRefreshToken ? '已保存，留空不修改' : 'refresh_token'}
+                  />
+                </label>
+
+                {form.authMode === 'access_token' && <label>
                   <span>登录密码（可选回退）</span>
                   <input
                     type={showSecret ? 'text' : 'password'}
                     value={form.credentials.password}
                     onChange={(event) => setCredential('password', event.target.value)}
-                    placeholder={editingAccount?.hasPassword ? '已保存，留空不修改' : turnstileSolver?.enabled ? '验证页面会在固定出口中等待完成' : '可直登站点使用；验证站点建议保存 AT/RT'}
+                    placeholder={editingAccount?.hasPassword ? '已保存，留空不修改' : 'AT/RT 都失效时用于重新登录'}
                   />
-                </label>
+                </label>}
+
                 <label>
                   <span>一次性 Turnstile Token（可选）</span>
                   <input
@@ -330,7 +421,7 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
                     placeholder="人工验证后粘贴一次；浏览器验证开启时可留空"
                   />
                 </label>
-              </div>
+              </>}
             </>
           )}
         </div>
@@ -353,6 +444,7 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
                   原始值 {preview.rawBalance ?? preview.rawValue}
                   {preview.metadata?.authSource ? ` · 鉴权 ${preview.metadata.authSource}` : ''}
                   {preview.metadata?.apiTokenPoolSize ? ` · API 密钥槽位 ${preview.metadata.apiTokenSlot}/${preview.metadata.apiTokenPoolSize}` : ''}
+                  {preview.metadata?.rateMultiplier !== null && preview.metadata?.rateMultiplier !== undefined && Number.isFinite(Number(preview.metadata.rateMultiplier)) ? ` · 当前倍率 × ${Number(preview.metadata.rateMultiplier)}` : ''}
                   {preview.metadata?.tokenPoolSize ? ` · 令牌槽位 ${preview.metadata.tokenSlot}/${preview.metadata.tokenPoolSize}` : ''}
                   {preview.metadata?.refreshReason ? ` · 主动续期 ${preview.metadata.refreshReason}` : ''}
                   {preview.metadata?.refreshTokenRotated ? ' · RT 已轮换' : ''}

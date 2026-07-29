@@ -183,12 +183,20 @@ function apiTokenAuthorizationCandidates(token) {
   return value.startsWith('sk-') ? [value] : [value, `sk-${value}`];
 }
 
-export function scheduledTokenIndexes(size, strategy = 'sticky', cursor = 0) {
+function hasScheduledTokenCursor(cursor) {
+  return cursor !== undefined
+    && cursor !== null
+    && cursor !== ''
+    && Number.isInteger(Number(cursor));
+}
+
+export function scheduledTokenIndexes(size, strategy = 'sticky', cursor) {
   if (!Number.isInteger(size) || size <= 0) return [];
-  const normalizedCursor = Number.isInteger(Number(cursor))
+  const hasCursor = hasScheduledTokenCursor(cursor);
+  const normalizedCursor = hasCursor
     ? Math.min(size - 1, Math.max(0, Number(cursor)))
     : 0;
-  const start = strategy === 'round_robin' ? (normalizedCursor + 1) % size : normalizedCursor;
+  const start = strategy === 'round_robin' && hasCursor ? (normalizedCursor + 1) % size : normalizedCursor;
   return Array.from({ length: size }, (_, offset) => (start + offset) % size);
 }
 
@@ -452,6 +460,188 @@ async function loginNewApiPassword(root, account, secret, turnstileToken = '') {
   };
 }
 
+function nonnegativeFiniteNumber(raw) {
+  if (raw === null || raw === undefined || raw === '' || typeof raw === 'boolean') return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function finiteMetadataNumber(source, path) {
+  return nonnegativeFiniteNumber(readPath(source, path));
+}
+
+function firstFiniteMetadataNumber(source, paths) {
+  for (const path of paths) {
+    const value = finiteMetadataNumber(source, path);
+    if (value !== undefined) return { value, path };
+  }
+  return undefined;
+}
+
+function directApiKeyRateMetadata(body, source) {
+  const effective = firstFiniteMetadataNumber(body, [
+    'data.effective_rate_multiplier',
+    'effective_rate_multiplier',
+    'data.rate_multiplier',
+    'rate_multiplier',
+    'data.group_ratio',
+    'group_ratio',
+    'data.ratio',
+    'ratio',
+  ]);
+  if (!effective) return {};
+  return {
+    rateMultiplier: effective.value,
+    rateMultiplierStatus: 'available',
+    rateMultiplierSource: source,
+    rateMultiplierPath: effective.path,
+    tokenGroup: String(
+      readPath(body, 'data.group')
+      || readPath(body, 'data.token_group')
+      || readPath(body, 'group')
+      || readPath(body, 'token_group')
+      || '',
+    ),
+  };
+}
+
+function maskNewApiKey(token) {
+  const raw = String(token || '').trim().replace(/^Bearer\s+/i, '').replace(/^sk-/, '');
+  if (!raw) return '';
+  if (raw.length <= 4) return '*'.repeat(raw.length);
+  if (raw.length <= 8) return `${raw.slice(0, 2)}****${raw.slice(-2)}`;
+  return `${raw.slice(0, 4)}**********${raw.slice(-4)}`;
+}
+
+function newApiTokenList(body) {
+  const candidates = [
+    readPath(body, 'data.items'),
+    readPath(body, 'data.data'),
+    readPath(body, 'items'),
+    readPath(body, 'data'),
+  ];
+  return candidates.find(Array.isArray) || [];
+}
+
+function matchNewApiTokenItem(items, authorizationToken, tokenName) {
+  const masked = maskNewApiKey(authorizationToken);
+  const keyMatches = items.filter((item) => {
+    const itemKey = String(item?.key || '').replace(/^sk-/, '');
+    return masked && itemKey === masked;
+  });
+  if (keyMatches.length === 1) return keyMatches[0];
+  const nameMatches = items.filter((item) => tokenName && String(item?.name || '') === tokenName);
+  return nameMatches.length === 1 ? nameMatches[0] : undefined;
+}
+
+async function collectNewApiKeyRate(root, account, secret, authorizationToken, usageBody) {
+  const direct = directApiKeyRateMetadata(usageBody, 'newapi_usage_token');
+  if (direct.rateMultiplier !== undefined) return direct;
+
+  const directGroup = String(
+    readPath(usageBody, 'data.group')
+    || readPath(usageBody, 'data.token_group')
+    || readPath(usageBody, 'group')
+    || readPath(usageBody, 'token_group')
+    || '',
+  );
+  const accessToken = String(secret.accessToken || normalizeTokenPool(secret)[0] || '').trim();
+  if (!accessToken || !account.userId) {
+    return {
+      rateMultiplierStatus: directGroup === 'auto' ? 'dynamic' : 'needs_user_access',
+      rateMultiplierSource: 'newapi_user_groups',
+      tokenGroup: directGroup,
+    };
+  }
+
+  const headers = {
+    Accept: 'application/json',
+    Authorization: accessToken,
+    'New-Api-User': String(account.userId),
+    ...cloudflareAccessHeaders(secret),
+  };
+  try {
+    const [tokensResult, groupsResult] = await Promise.all([
+      requestJson(`${root}/api/token/?p=1&size=100`, { headers }),
+      requestJson(`${root}/api/user/self/groups`, { headers }),
+    ]);
+    assertSuccess(tokensResult.response, tokensResult.body);
+    assertSuccess(groupsResult.response, groupsResult.body);
+
+    const tokenName = String(readPath(usageBody, 'data.name') || readPath(usageBody, 'name') || '');
+    const tokenItem = matchNewApiTokenItem(newApiTokenList(tokensResult.body), authorizationToken, tokenName);
+    if (!tokenItem && !directGroup) {
+      return { rateMultiplierStatus: 'unavailable', rateMultiplierSource: 'newapi_user_groups' };
+    }
+    const tokenGroup = String(tokenItem?.group || directGroup || 'default');
+    if (tokenGroup === 'auto') {
+      return {
+        rateMultiplierStatus: 'dynamic',
+        rateMultiplierSource: 'newapi_user_groups',
+        tokenGroup,
+      };
+    }
+    const groupInfo = readPath(groupsResult.body, 'data')?.[tokenGroup];
+    const rateMultiplier = nonnegativeFiniteNumber(groupInfo?.ratio ?? groupInfo);
+    if (rateMultiplier === undefined) {
+      return {
+        rateMultiplierStatus: 'unavailable',
+        rateMultiplierSource: 'newapi_user_groups',
+        tokenGroup,
+      };
+    }
+    return {
+      rateMultiplier,
+      rateMultiplierStatus: 'available',
+      rateMultiplierSource: 'newapi_user_groups',
+      tokenGroup,
+    };
+  } catch (error) {
+    return {
+      rateMultiplierStatus: isCloudflareChallenge(error) ? 'challenge' : 'unavailable',
+      rateMultiplierSource: 'newapi_user_groups',
+    };
+  }
+}
+
+async function collectSub2ApiKeyRate(root, secret, authorizationToken) {
+  try {
+    const result = await requestJson(`${root}/v1/sub2api/billing`, {
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${authorizationToken}`,
+        ...cloudflareAccessHeaders(secret),
+      },
+    });
+    assertSuccess(result.response, result.body);
+    const rateMultiplier = finiteMetadataNumber(result.body, 'effective_rate_multiplier');
+    if (rateMultiplier === undefined) {
+      return { rateMultiplierStatus: 'unavailable', rateMultiplierSource: 'sub2api_key_billing' };
+    }
+    return {
+      rateMultiplier,
+      rateMultiplierStatus: 'available',
+      rateMultiplierSource: 'sub2api_key_billing',
+      billingScope: result.body.billing_scope,
+      groupRateMultiplier: finiteMetadataNumber(result.body, 'group_rate_multiplier'),
+      userRateMultiplier: finiteMetadataNumber(result.body, 'user_rate_multiplier'),
+      resolvedRateMultiplier: finiteMetadataNumber(result.body, 'resolved_rate_multiplier'),
+      peakRateEnabled: result.body.peak_rate_enabled === true,
+      peakRateMultiplier: finiteMetadataNumber(result.body, 'peak_rate_multiplier'),
+      appliedPeakMultiplier: finiteMetadataNumber(result.body, 'applied_peak_multiplier'),
+      billingTimezone: result.body.timezone,
+      billingObservedAt: result.body.observed_at,
+    };
+  } catch (error) {
+    return {
+      rateMultiplierStatus: error?.status === 404
+        ? 'unsupported'
+        : isCloudflareChallenge(error) ? 'challenge' : 'unavailable',
+      rateMultiplierSource: 'sub2api_key_billing',
+    };
+  }
+}
+
 async function collectNewApiTokenUsage(root, account, secret = {}) {
   const tokenPool = normalizeApiTokenPool(secret);
   if (!tokenPool.length) throw new Error('请填写 New API 左侧“API 密钥”页面创建的调用密钥');
@@ -475,15 +665,22 @@ async function collectNewApiTokenUsage(root, account, secret = {}) {
           throw error;
         }
         const rawBalance = numericBalance(result.body, 'data.total_available');
+        const rateMetadata = await collectNewApiKeyRate(root, account, secret, authorizationToken, result.body);
+        const normalizedTokenPool = tokenPool.map((token, slot) => (
+          slot === index ? authorizationToken : token
+        ));
         const nextSecret = {
           ...secret,
-          apiToken: tokenPool[index],
-          apiTokens: tokenPool,
+          apiToken: authorizationToken,
+          apiTokens: normalizedTokenPool,
           apiTokenCursor: index,
         };
         const poolChanged = Array.isArray(secret.apiTokens)
-          && JSON.stringify(secret.apiTokens.map((token) => String(token || '').trim()).filter(Boolean)) !== JSON.stringify(tokenPool);
-        const changed = poolChanged || secret.apiToken !== tokenPool[index] || Number(secret.apiTokenCursor || 0) !== index;
+          && JSON.stringify(secret.apiTokens.map((token) => String(token || '').trim()).filter(Boolean)) !== JSON.stringify(normalizedTokenPool);
+        const changed = poolChanged
+          || secret.apiToken !== authorizationToken
+          || !hasScheduledTokenCursor(secret.apiTokenCursor)
+          || Number(secret.apiTokenCursor) !== index;
         return {
           rawBalance,
           metadata: {
@@ -499,6 +696,7 @@ async function collectNewApiTokenUsage(root, account, secret = {}) {
             tokenStrategy: account.tokenStrategy || 'sticky',
             tokenFailovers: errors.length,
             tokenPrefixMode: authorizationToken === tokenPool[index] ? 'as_entered' : 'sk_compat',
+            ...rateMetadata,
           },
           ...(changed ? { updatedSecret: nextSecret } : {}),
         };
@@ -516,6 +714,128 @@ async function collectNewApiTokenUsage(root, account, secret = {}) {
   const error = new Error(`API 密钥全部不可用（${errors.join('；')}）`);
   error.code = 'UPSTREAM_AUTH_FAILED';
   error.status = 401;
+  throw error;
+}
+
+function sub2ApiUsageScope(body = {}) {
+  if (String(body.mode || '').toLowerCase() === 'quota_limited' || body.quota) return 'api_key';
+  if (body.subscription) return 'subscription';
+  if (Object.hasOwn(body, 'balance')) return 'wallet';
+  return 'api_key';
+}
+
+function sub2ApiRemaining(body = {}, balancePath = 'remaining') {
+  const raw = readPath(body, balancePath);
+  const value = typeof raw === 'boolean' || raw === null || raw === '' ? Number.NaN : Number(raw);
+  if (value === -1) {
+    const error = new Error(`Sub2API ${balancePath} 返回无限额度（-1），没有可监控的有限余额`);
+    error.code = 'UNMONITORABLE_BALANCE';
+    throw error;
+  }
+  if (!Number.isFinite(value) || value < 0) {
+    const error = new Error(`Sub2API 未返回可监控的有限 ${balancePath}（可能仅配置了速率限制）`);
+    error.code = 'UNMONITORABLE_BALANCE';
+    throw error;
+  }
+  return value;
+}
+
+function isSub2ApiKeyAuthFailure(error) {
+  return error?.code === 'UPSTREAM_AUTH_FAILED' || [401, 403].includes(error?.status);
+}
+
+async function collectSub2ApiTokenUsage(root, account, secret = {}) {
+  const tokenPool = normalizeApiTokenPool(secret);
+  if (!tokenPool.length) throw new Error('请填写 Sub2API 创建的 API Key');
+
+  const usagePath = account.profilePath || '/v1/usage';
+  const balancePath = account.balancePath || 'remaining';
+  const errors = [];
+  let unmonitorableSlots = 0;
+  const indexes = scheduledTokenIndexes(tokenPool.length, account.tokenStrategy, secret.apiTokenCursor);
+  for (const index of indexes) {
+    let slotError;
+    for (const authorizationToken of apiTokenAuthorizationCandidates(tokenPool[index])) {
+      try {
+        const result = await requestJson(`${root}${usagePath}`, {
+          headers: {
+            Accept: 'application/json',
+            Authorization: `Bearer ${authorizationToken}`,
+            ...cloudflareAccessHeaders(secret),
+          },
+        });
+        assertSuccess(result.response, result.body);
+        if (result.body.isValid === false) {
+          const error = new Error(`Sub2API API Key 当前不可用${result.body.status ? `（${result.body.status}）` : ''}`);
+          error.code = 'UPSTREAM_AUTH_FAILED';
+          error.status = 401;
+          throw error;
+        }
+
+        const rawBalance = sub2ApiRemaining(result.body, balancePath);
+        const balanceScope = sub2ApiUsageScope(result.body);
+        const rateMetadata = await collectSub2ApiKeyRate(root, secret, authorizationToken);
+        const normalizedTokenPool = tokenPool.map((token, slot) => (
+          slot === index ? authorizationToken : token
+        ));
+        const nextSecret = {
+          ...secret,
+          apiToken: authorizationToken,
+          apiTokens: normalizedTokenPool,
+          apiTokenCursor: index,
+        };
+        const poolChanged = Array.isArray(secret.apiTokens)
+          && JSON.stringify(secret.apiTokens.map((token) => String(token || '').trim()).filter(Boolean)) !== JSON.stringify(normalizedTokenPool);
+        const changed = poolChanged
+          || secret.apiToken !== authorizationToken
+          || !hasScheduledTokenCursor(secret.apiTokenCursor)
+          || Number(secret.apiTokenCursor) !== index;
+
+        return {
+          rawBalance,
+          metadata: {
+            authSource: 'api_key',
+            credentialScope: 'api_key',
+            balanceScope,
+            mode: result.body.mode,
+            isValid: result.body.isValid,
+            status: result.body.status,
+            remaining: rawBalance,
+            unit: String(result.body.unit || result.body.quota?.unit || 'USD').toUpperCase(),
+            balance: result.body.balance,
+            quota: result.body.quota,
+            planName: result.body.planName,
+            subscription: result.body.subscription,
+            profilePath: usagePath,
+            balancePath,
+            apiTokenPoolSize: tokenPool.length,
+            apiTokenSlot: index + 1,
+            tokenStrategy: account.tokenStrategy || 'sticky',
+            tokenFailovers: errors.length,
+            tokenPrefixMode: authorizationToken === tokenPool[index] ? 'as_entered' : 'sk_compat',
+            ...rateMetadata,
+          },
+          ...(changed ? { updatedSecret: nextSecret } : {}),
+        };
+      } catch (error) {
+        if (isCloudflareChallenge(error)) throw error;
+        if (error.code === 'UNMONITORABLE_BALANCE') {
+          slotError = error;
+          unmonitorableSlots += 1;
+          break;
+        }
+        if (!isSub2ApiKeyAuthFailure(error)) throw error;
+        slotError = error;
+        const enteredWithoutPrefix = authorizationToken === tokenPool[index] && !tokenPool[index].startsWith('sk-');
+        if (!enteredWithoutPrefix) break;
+      }
+    }
+    errors.push(`槽位 ${index + 1}：${slotError?.message || '鉴权失败'}`);
+  }
+
+  const error = new Error(`${unmonitorableSlots ? 'Sub2API API Key 池没有可监控的有限余额' : 'Sub2API API Key 全部不可用'}（${errors.join('；')}）`);
+  error.code = unmonitorableSlots ? 'UNMONITORABLE_BALANCE' : 'UPSTREAM_AUTH_FAILED';
+  if (!unmonitorableSlots) error.status = 401;
   throw error;
 }
 
@@ -631,7 +951,10 @@ async function collectNewApi(account, secret = {}) {
         };
         const poolChanged = Array.isArray(secret.accessTokens)
           && JSON.stringify(secret.accessTokens) !== JSON.stringify(tokenPool);
-        const cursorUpdate = poolChanged || secret.accessToken !== tokenPool[index] || Number(secret.tokenCursor || 0) !== index
+        const cursorUpdate = poolChanged
+          || secret.accessToken !== tokenPool[index]
+          || !hasScheduledTokenCursor(secret.tokenCursor)
+          || Number(secret.tokenCursor) !== index
           ? nextSecret
           : undefined;
         updatedSecret = cursorUpdate || pendingCredentialSecret || updatedSecret;
@@ -1078,6 +1401,7 @@ async function loginSub2Api(root, account, secret) {
 
 async function collectSub2Api(account, secret = {}) {
   const root = baseUrl(account.baseUrl);
+  if (account.authMode === 'api_token') return collectSub2ApiTokenUsage(root, account, secret);
   let accessToken = secret.accessToken || '';
   let refreshToken = secret.refreshToken || '';
   let updatedSecret;
