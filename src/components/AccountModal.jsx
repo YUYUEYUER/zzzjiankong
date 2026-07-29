@@ -6,8 +6,8 @@ import { Modal } from './Modal.jsx';
 
 const SUB2_AUTH_DEFAULTS = {
   api_token: { profilePath: '/v1/usage', balancePath: 'remaining', rawUnit: 'USD', formula: 'x * 7.2' },
-  access_token: { profilePath: '/api/v1/users/me', balancePath: 'data.balance', rawUnit: 'CNY', formula: 'x' },
-  password: { profilePath: '/api/v1/users/me', balancePath: 'data.balance', rawUnit: 'CNY', formula: 'x' },
+  access_token: { profilePath: '/api/v1/auth/me', balancePath: 'data.balance', rawUnit: 'CNY', formula: 'x' },
+  password: { profilePath: '/api/v1/auth/me', balancePath: 'data.balance', rawUnit: 'CNY', formula: 'x' },
 };
 
 function defaults(type = 'newapi', upstreamId = '', upstreamName = '') {

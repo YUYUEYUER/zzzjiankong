@@ -36,6 +36,15 @@ import { getTurnstileSolverStatus } from './turnstile.js';
 import { aggregateUpstreams } from './upstreams.js';
 import { withAccountCredentialLock } from './account-lock.js';
 import { ProxyPoolManager } from './proxy-pool.js';
+import {
+  cancelUpstreamLogin,
+  consumeUpstreamLogin,
+  getUpstreamLogin,
+  getUpstreamLoginCredential,
+  shutdownUpstreamLogins,
+  startUpstreamLogin,
+  updateUpstreamLoginCredential,
+} from './upstream-login.js';
 
 const app = express();
 
@@ -129,6 +138,7 @@ const accountSchema = z.object({
   pollIntervalMinutes: z.coerce.number().int().min(1).max(1440).default(5),
   enabled: z.boolean().default(true),
   notifications: z.object({ resend: z.boolean(), feishu: z.boolean() }).default({ resend: true, feishu: true }),
+  browserLoginId: z.string().uuid().optional(),
   credentials: z.object({
     accessToken: z.string().optional(),
     accessTokens: z.array(z.string().trim().min(1).max(4096)).max(20).optional(),
@@ -151,6 +161,11 @@ const upstreamNameSchema = z.string().trim().min(1, '请填写上游名称').max
 const upstreamSchema = z.object({
   name: upstreamNameSchema,
   proxyMode: z.enum(['direct', 'auto_sticky']).optional(),
+});
+
+const upstreamLoginSchema = z.object({
+  type: z.literal('sub2api'),
+  baseUrl: z.string().url(),
 });
 
 function canonicalUpstreamName(value) {
@@ -226,6 +241,7 @@ function sanitizeAccount(account) {
   let hasApiToken = false;
   let apiTokenCount = 0;
   let hasCfAccess = false;
+  let hasBrowserSession = false;
   try {
     const secret = decryptSecret(encryptedSecret);
     hasAccessToken = Boolean(secret.accessToken);
@@ -237,6 +253,7 @@ function sanitizeAccount(account) {
     apiTokenCount = Math.max(Number(hasApiToken), Array.isArray(secret.apiTokens) ? secret.apiTokens.filter(Boolean).length : 0);
     hasApiToken = apiTokenCount > 0;
     hasCfAccess = Boolean(secret.cfAccessClientId && secret.cfAccessClientSecret);
+    hasBrowserSession = Boolean(secret.sessionCookie || secret.browserProfileId);
   } catch {
     // 密钥不匹配时仍返回账号，但不暴露凭据细节
   }
@@ -250,6 +267,7 @@ function sanitizeAccount(account) {
     hasApiToken,
     apiTokenCount,
     hasCfAccess,
+    hasBrowserSession,
   };
 }
 
@@ -460,6 +478,21 @@ app.post('/api/session/logout', (req, res) => {
 });
 
 app.use('/api', authRequired);
+
+app.post('/api/upstream-logins', (req, res) => {
+  const input = upstreamLoginSchema.parse(req.body);
+  res.status(202).json(startUpstreamLogin(input));
+});
+
+app.get('/api/upstream-logins/:id', (req, res) => {
+  res.json(getUpstreamLogin(req.params.id));
+});
+
+app.delete('/api/upstream-logins/:id', asyncRoute(async (req, res) => {
+  const cancelled = await cancelUpstreamLogin(req.params.id);
+  if (!cancelled) return res.status(404).json({ message: '登录任务不存在或已经结束' });
+  res.status(204).end();
+}));
 
 app.get('/api/security', (req, res) => {
   const auth = store.snapshot().auth;
@@ -735,6 +768,9 @@ app.post('/api/accounts/test', asyncRoute(async (req, res) => {
   const accountId = String(req.body?.id || '');
   const runTest = async () => {
     let secret = input.credentials || {};
+    if (input.browserLoginId) {
+      secret = mergeSecrets(secret, getUpstreamLoginCredential(input.browserLoginId, input.baseUrl));
+    }
     let mayPersistToExistingAccount = false;
     // 编辑已有账号时，在账号锁内读取最新密文，避免与后台续期互相覆盖。
     if (accountId) {
@@ -754,6 +790,9 @@ app.post('/api/accounts/test', asyncRoute(async (req, res) => {
       collected = await collectBalance(input, secret);
     } catch (error) {
       const credentialCheckpoint = takeCredentialCheckpoint(error);
+      if (input.browserLoginId && credentialCheckpoint) {
+        updateUpstreamLoginCredential(input.browserLoginId, credentialCheckpoint);
+      }
       if (accountId && mayPersistToExistingAccount && credentialCheckpoint) {
         await store.mutate((data) => {
           const account = data.accounts.find((item) => item.id === accountId);
@@ -785,6 +824,9 @@ app.post('/api/accounts/test', asyncRoute(async (req, res) => {
         account.metadata = { ...(account.metadata || {}), ...(collected.metadata || {}) };
       });
     }
+    if (input.browserLoginId) {
+      updateUpstreamLoginCredential(input.browserLoginId, collected.updatedSecret || secret);
+    }
     return collected;
   };
   const result = accountId
@@ -802,6 +844,10 @@ app.post('/api/accounts', asyncRoute(async (req, res) => {
   const input = accountSchema.parse(req.body);
   const upstreamName = requestedUpstreamName(req.body);
   evaluateFormula(input.formula, 1);
+  const capturedCredential = input.browserLoginId
+    ? getUpstreamLoginCredential(input.browserLoginId, input.baseUrl)
+    : null;
+  const credentials = mergeSecrets(input.credentials || {}, capturedCredential || {});
   const timestamp = new Date().toISOString();
   let upstreamId = input.upstreamId;
   let implicitUpstream = null;
@@ -819,7 +865,7 @@ app.post('/api/accounts', asyncRoute(async (req, res) => {
     upstreamId,
     id: crypto.randomUUID(),
     subgroup: input.subgroup || input.region,
-    encryptedSecret: encryptSecret(input.credentials || {}),
+    encryptedSecret: encryptSecret(credentials),
     demo: false,
     rawBalance: 0,
     convertedCny: 0,
@@ -831,6 +877,7 @@ app.post('/api/accounts', asyncRoute(async (req, res) => {
     updatedAt: timestamp,
   };
   delete account.credentials;
+  delete account.browserLoginId;
   await store.mutate((data) => {
     if (implicitUpstream) {
       const existing = findUpstreamByName(data, implicitUpstream.name);
@@ -845,6 +892,7 @@ app.post('/api/accounts', asyncRoute(async (req, res) => {
     data.accounts.push(account);
     data.audit.unshift({ id: crypto.randomUUID(), type: 'account.created', accountId: account.id, upstreamId, at: timestamp });
   });
+  if (input.browserLoginId) await consumeUpstreamLogin(input.browserLoginId);
   let syncError = '';
   try {
     await monitor.poll(account.id);
@@ -935,7 +983,8 @@ app.get('/api/accounts/:id/api-keys', asyncRoute(async (req, res) => {
     const account = store.snapshot().accounts.find((item) => item.id === req.params.id);
     if (!account) throw Object.assign(new Error('账号不存在'), { statusCode: 404 });
     const supportsKeyDetails = account.authMode === 'api_token'
-      || (account.type === 'newapi' && account.authMode === 'access_token');
+      || (account.type === 'newapi' && account.authMode === 'access_token')
+      || (account.type === 'sub2api' && account.authMode !== 'api_token');
     if (!supportsKeyDetails) return collectApiKeyDetails(account);
 
     let secret;
@@ -945,8 +994,17 @@ app.get('/api/accounts/:id/api-keys', asyncRoute(async (req, res) => {
       throw Object.assign(new Error('账号凭据无法解密，请重新保存 API Key'), { statusCode: 422 });
     }
     const result = await collectApiKeyDetails(account, secret);
+    const { updatedSecret, ...safeResult } = result;
+    if (updatedSecret) {
+      await store.mutate((data) => {
+        const current = data.accounts.find((item) => item.id === account.id);
+        if (!current) return;
+        current.encryptedSecret = encryptSecret(updatedSecret);
+        current.updatedAt = new Date().toISOString();
+      });
+    }
     return {
-      ...result,
+      ...safeResult,
       keys: result.keys.map((key) => ({
         ...key,
         convertedCny: Number.isFinite(key.rawBalance)
@@ -1059,6 +1117,19 @@ app.use((error, req, res, next) => {
   res.status(500).json({ message: error.message || '服务器内部错误' });
 });
 
-app.listen(config.port, '0.0.0.0', () => {
+const server = app.listen(config.port, '0.0.0.0', () => {
   console.log(`[frosted-console] http://localhost:${config.port}`);
 });
+
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  if (monitor.timer) clearInterval(monitor.timer);
+  await shutdownUpstreamLogins();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 10_000).unref?.();
+}
+
+process.once('SIGINT', () => { shutdown().catch(() => process.exit(1)); });
+process.once('SIGTERM', () => { shutdown().catch(() => process.exit(1)); });

@@ -217,6 +217,112 @@ test('New API account access token enumerates per-key usage and group multiplier
   }
 });
 
+test('Sub2API account session enumerates every key and available group rate without exposing tokens', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    const pathname = new URL(String(url)).pathname;
+    if (pathname !== '/api/v1/settings/public') {
+      assert.equal(options.headers.Authorization, 'Bearer private-sub2-account-token');
+    }
+    if (pathname === '/api/v1/auth/me') {
+      return new Response(JSON.stringify({ code: 0, data: { balance: 24.5, status: 'active' } }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (pathname === '/api/v1/keys') {
+      return new Response(JSON.stringify({
+        code: 0,
+        data: {
+          total: 2,
+          items: [
+            { id: 1, key: 'sk-account-secret-1111', name: 'primary', group_id: 10, status: 'active', quota: 20, quota_used: 6 },
+            { id: 2, key: 'sk-account-secret-2222', name: 'unlimited', group_id: 20, status: 'active', quota: 0, quota_used: 3 },
+          ],
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (pathname === '/api/v1/groups/available') {
+      return new Response(JSON.stringify({
+        code: 0,
+        data: [
+          { id: 10, name: 'Claude', platform: 'anthropic', status: 'active', subscription_type: 'standard', rate_multiplier: 0.8, peak_rate_enabled: false },
+          { id: 20, name: 'Codex', platform: 'openai', status: 'active', subscription_type: 'subscription', rate_multiplier: 1.2, peak_rate_enabled: true, peak_start: '08:00', peak_end: '10:00', peak_rate_multiplier: 1.5 },
+        ],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (pathname === '/api/v1/groups/rates') {
+      return new Response(JSON.stringify({ code: 0, data: { 10: 0.65 } }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (pathname === '/api/v1/settings/public') {
+      return new Response(JSON.stringify({ code: 0, data: { server_timezone: 'UTC' } }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({ message: 'not found' }), { status: 404 });
+  };
+  try {
+    const details = await collectApiKeyDetails({
+      id: 'account-sub2-session',
+      name: 'Sub2 account session',
+      type: 'sub2api',
+      authMode: 'access_token',
+      baseUrl: 'https://sub2.example.com',
+      profilePath: '/api/v1/auth/me',
+      balancePath: 'data.balance',
+    }, { accessToken: 'private-sub2-account-token', refreshToken: 'private-sub2-refresh-token' });
+
+    assert.equal(details.supported, true);
+    assert.equal(details.mode, 'account_session');
+    assert.equal(details.keyCount, 2);
+    assert.equal(details.groupCount, 2);
+    assert.equal(details.groups[0].groupRateMultiplier, 0.8);
+    assert.equal(details.groups[0].userRateMultiplier, 0.65);
+    assert.equal(details.groups[0].effectiveRateMultiplier, 0.65);
+    assert.equal(details.groups[1].peakRateEnabled, true);
+    assert.equal(details.keys[0].rawBalance, 14);
+    assert.equal(details.keys[0].rateMultiplier, 0.65);
+    assert.equal(details.keys[1].status, 'unlimited');
+    assert.equal(details.keys[1].tokenGroup, 'Codex');
+    const serialized = JSON.stringify(details);
+    assert.doesNotMatch(serialized, /private-sub2|sk-account-secret/);
+    assert.match(details.keys[0].maskedToken, /1111$/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Sub2API can read a cookie-only session captured by the interactive browser', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    assert.equal(String(url), 'https://sub2.example.com/api/v1/auth/me');
+    assert.equal(options.headers.Cookie, 'session=browser-cookie');
+    assert.equal(options.headers['User-Agent'], 'Captured Browser UA');
+    assert.equal(options.headers.Authorization, undefined);
+    return new Response(JSON.stringify({ code: 0, data: { balance: 18.5, status: 'active' } }), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    });
+  };
+  try {
+    const result = await collectBalance({
+      type: 'sub2api',
+      authMode: 'access_token',
+      baseUrl: 'https://sub2.example.com',
+      profilePath: '/api/v1/auth/me',
+      balancePath: 'data.balance',
+    }, {
+      sessionCookie: 'session=browser-cookie',
+      sessionUserAgent: 'Captured Browser UA',
+      browserProfileId: 'profile-id',
+    });
+    assert.equal(result.rawBalance, 18.5);
+    assert.equal(result.metadata.authSource, 'browser_cookie');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('opaque token timing uses the stored expiry and login payload includes compatibility fields', () => {
   const current = Date.now();
   const timing = effectiveTokenTiming(

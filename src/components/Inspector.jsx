@@ -58,6 +58,7 @@ export function Inspector({ account, incidents, settings, onOpenIncidents }) {
     account.hasApiToken ? `${account.type === 'sub2api' ? 'API 令牌' : 'API 密钥'}${account.apiTokenCount > 1 ? ` × ${account.apiTokenCount}` : ''}` : null,
     account.hasAccessToken ? `用户访问令牌${account.accessTokenCount > 1 ? ` × ${account.accessTokenCount}` : ''}` : null,
     account.hasRefreshToken ? 'RT' : null,
+    account.hasBrowserSession ? '浏览器 CK' : null,
     account.hasPassword ? '密码' : null,
   ].filter(Boolean).join(' · ') || '未配置' : '';
 

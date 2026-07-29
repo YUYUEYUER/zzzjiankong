@@ -37,8 +37,8 @@ export const config = {
   turnstileSolver,
   turnstileSolverApiKey: resolveTurnstileApiKey(turnstileSolver),
   turnstileSolveTimeoutMs: Math.max(30000, Number(process.env.TURNSTILE_SOLVE_TIMEOUT_MS || 120000)),
-  /** Run Chromium headless; set TURNSTILE_HEADLESS=false to watch the browser */
-  turnstileHeadless: process.env.TURNSTILE_HEADLESS !== "false",
+  /** Keep challenge handling visible by default so a human can complete interactive checks. */
+  turnstileHeadless: process.env.TURNSTILE_HEADLESS === "true",
   /** Only for isolated containers that cannot enable the Chromium sandbox. */
   turnstileDisableBrowserSandbox: process.env.TURNSTILE_DISABLE_BROWSER_SANDBOX === "true",
   /** Global Chromium process cap across different upstream origins. */

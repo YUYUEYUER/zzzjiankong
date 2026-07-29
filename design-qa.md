@@ -1,9 +1,9 @@
 # Design QA
 
 - Source visual: live capture of `https://status.openai.com/` in the in-app browser.
-- Implementation: live capture of `http://localhost:8790/` using the same browser viewport and state.
-- Responsive check: isolated 375 x 812 iframe using the production build and the same browser renderer.
-- Compared state: status overview, one expanded account, quick token form, Sub2API switch, and advanced form handoff.
+- Implementation: Playwright captures of `http://localhost:8787/` using desktop 1280 x 900 and mobile 390 x 844 viewports.
+- Responsive check: production build in Chromium with the Sub2API JSON-import and direct-login states open.
+- Compared state: status overview, one expanded account, quick token form, Sub2API switch, JSON session import, direct account login, and advanced form handoff.
 
 **Findings**
 
@@ -36,6 +36,10 @@
 - Invalidated expanded Key data after account sync/edit and allowed collapse/reopen retries.
 - Filtered demo totals and incidents whenever real accounts are present.
 - Added restrained nonlinear easing to account expansion, summary-state changes, and modal entry.
+- Added a compact JSON session importer directly below the Sub2API API-token field; filename and AT/RT availability remain readable without exposing token values.
+- Added direct Sub2API account login in the same form, with explicit email/password fields and a distinct “登录并添加” action state.
+- Made the quick form internally scrollable and changed mobile actions to normal document flow; coordinate checks confirmed zero overlap between password fields and actions.
+- Added an expanded all-group multiplier table with base, user override, peak-window, and current effective rates before per-Key usage.
 - Removed the old side navigation, charts, glass surfaces, and multi-column workspace from the main experience.
 
 **Follow-up Polish**

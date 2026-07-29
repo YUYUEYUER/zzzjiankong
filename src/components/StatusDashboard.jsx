@@ -52,6 +52,36 @@ function normalizeKeyDetails(payload) {
   return [];
 }
 
+function normalizeGroupDetails(payload) {
+  return Array.isArray(payload?.groups) ? payload.groups : [];
+}
+
+function multiplierLabel(value, fallback = '未配置') {
+  const number = finiteNumber(value);
+  return number === null ? fallback : `x ${compactNumber(number)}`;
+}
+
+function GroupRateRow({ group }) {
+  const platform = {
+    anthropic: 'Claude',
+    openai: 'OpenAI',
+    antigravity: 'Antigravity',
+    gemini: 'Gemini',
+  }[group.platform] || group.platform || '通用';
+  const peak = group.peakRateEnabled
+    ? `${group.peakStart || '--:--'}-${group.peakEnd || '--:--'} · ${multiplierLabel(group.peakRateMultiplier)}${group.peakActive ? ' · 生效中' : ''}`
+    : '未启用';
+  return (
+    <div className="group-rate-row">
+      <div className="group-rate-name"><strong>{group.name}</strong><small>{platform} · {group.subscriptionType === 'subscription' ? '订阅分组' : '标准分组'}</small></div>
+      <div className="key-metric"><span>基础倍率</span><strong>{multiplierLabel(group.groupRateMultiplier)}</strong></div>
+      <div className="key-metric"><span>账号专属</span><strong>{multiplierLabel(group.userRateMultiplier, '使用默认')}</strong></div>
+      <div className="key-metric"><span>峰值倍率</span><strong title={peak}>{peak}</strong></div>
+      <div className="key-metric"><span>当前有效</span><strong>{multiplierLabel(group.effectiveRateMultiplier)}</strong></div>
+    </div>
+  );
+}
+
 function KeyDetailRow({ item, account }) {
   const metadata = item.metadata || item;
   const available = item.status !== 'error' && item.ok !== false;
@@ -89,7 +119,10 @@ function KeyDetailRow({ item, account }) {
 
 function AccountDetails({ account, state, onEdit }) {
   const keyDetails = normalizeKeyDetails(state?.data);
-  const supportsKeyDetails = account.authMode === 'api_token' || (account.type === 'newapi' && account.authMode === 'access_token');
+  const groupDetails = normalizeGroupDetails(state?.data);
+  const supportsKeyDetails = account.authMode === 'api_token'
+    || (account.type === 'newapi' && account.authMode === 'access_token')
+    || (account.type === 'sub2api' && account.authMode !== 'api_token');
   if (state?.loading) {
     return <div className="account-detail-state"><SpinnerGap className="spin" size={18} />正在读取每个 Key 的用量与倍率...</div>;
   }
@@ -98,8 +131,19 @@ function AccountDetails({ account, state, onEdit }) {
     if (state?.error) {
       return <div className="account-detail-state error"><WarningCircle size={18} />{state.error}</div>;
     }
-    if (keyDetails.length) {
-      return <div className="key-detail-list">{keyDetails.map((item, index) => <KeyDetailRow key={`${item.slot || index}-${item.maskedToken || item.maskedKey || item.keyMask || ''}`} item={{ ...item, index }} account={account} />)}</div>;
+    if (keyDetails.length || groupDetails.length) {
+      return <div className="account-detail-stack">
+        {groupDetails.length > 0 && <section className="group-rate-section">
+          <header><strong>全部分组倍率</strong><span>{groupDetails.length} 个可用分组 · {state.data.serverTimezone || 'UTC'}</span></header>
+          <div className="group-rate-list">{groupDetails.map((group, index) => <GroupRateRow key={group.id || index} group={group} />)}</div>
+        </section>}
+        <section className="key-detail-section">
+          <header><strong>API Key 使用情况</strong><span>{keyDetails.length} 个 Key</span></header>
+          {keyDetails.length > 0
+            ? <div className="key-detail-list">{keyDetails.map((item, index) => <KeyDetailRow key={`${item.slot || index}-${item.maskedToken || item.maskedKey || item.keyMask || ''}`} item={{ ...item, index }} account={account} />)}</div>
+            : <div className="account-detail-state">该账号暂时没有 API Key</div>}
+        </section>
+      </div>;
     }
     if (state?.data) {
       return <div className="account-detail-state">{state.data.message || '该账号暂时没有可展示的 API Key'}</div>;
@@ -212,7 +256,9 @@ export function StatusDashboard({
   const detailRevision = visibleAccounts.map((account) => `${account.id}:${account.updatedAt || ''}:${account.lastSyncAt || ''}:${account.apiTokenCount || 0}`).join('|');
   const expandedKeyIds = [...expandedAccounts].filter((id) => {
     const account = visibleAccounts.find((item) => item.id === id);
-    return account && (account.authMode === 'api_token' || (account.type === 'newapi' && account.authMode === 'access_token'));
+    return account && (account.authMode === 'api_token'
+      || (account.type === 'newapi' && account.authMode === 'access_token')
+      || (account.type === 'sub2api' && account.authMode !== 'api_token'));
   }).sort().join('|');
 
   useEffect(() => {
@@ -233,7 +279,8 @@ export function StatusDashboard({
   const toggleAccount = (account) => {
     const nextExpanded = !expandedAccounts.has(account.id);
     const supportsKeyDetails = account.authMode === 'api_token'
-      || (account.type === 'newapi' && account.authMode === 'access_token');
+      || (account.type === 'newapi' && account.authMode === 'access_token')
+      || (account.type === 'sub2api' && account.authMode !== 'api_token');
     if (nextExpanded && supportsKeyDetails) {
       setDetailStates((current) => ({ ...current, [account.id]: { loading: true } }));
     }

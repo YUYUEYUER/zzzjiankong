@@ -29,6 +29,15 @@ export function cloudflareAccessHeaders(secret = {}) {
   };
 }
 
+function upstreamBrowserSessionHeaders(secret = {}) {
+  const cookie = String(secret.sessionCookie || '').trim().replace(/[\r\n]/g, '');
+  const userAgent = String(secret.sessionUserAgent || '').trim().replace(/[\r\n]/g, '');
+  return {
+    ...(cookie ? { Cookie: cookie } : {}),
+    ...(userAgent ? { 'User-Agent': userAgent } : {}),
+  };
+}
+
 export function readPath(source, path) {
   return String(path || '')
     .split('.')
@@ -438,6 +447,7 @@ async function loginNewApiPassword(root, account, secret, turnstileToken = '') {
       'Content-Type': 'application/json',
       Accept: 'application/json',
       ...cloudflareAccessHeaders(secret),
+      ...upstreamBrowserSessionHeaders(secret),
     },
     body: JSON.stringify(body),
   });
@@ -1303,6 +1313,7 @@ async function refreshSub2Api(root, refreshToken, secret = {}) {
       'Content-Type': 'application/json',
       Accept: 'application/json',
       ...cloudflareAccessHeaders(secret),
+      ...upstreamBrowserSessionHeaders(secret),
     },
     body: JSON.stringify({ refresh_token: refreshToken }),
   });
@@ -1325,6 +1336,7 @@ async function postSub2Login(root, account, secret, turnstileToken) {
       'Content-Type': 'application/json',
       Accept: 'application/json',
       ...cloudflareAccessHeaders(secret),
+      ...upstreamBrowserSessionHeaders(secret),
     },
     body: JSON.stringify(body),
   });
@@ -1361,6 +1373,9 @@ async function loginSub2Api(root, account, secret) {
         return {
           accessToken: solved.accessToken,
           refreshToken: solved.refreshToken || '',
+          sessionCookie: solved.cookies || '',
+          sessionUserAgent: solved.userAgent || '',
+          sessionCapturedAt: new Date().toISOString(),
           _authSource: 'password_with_turnstile_browser',
           _profile: solved.profile || null,
         };
@@ -1410,7 +1425,10 @@ async function collectSub2Api(account, secret = {}) {
   let refreshTokenRotated = false;
   let refreshAttempted = false;
   const errors = [];
-  const accessHeaders = cloudflareAccessHeaders(secret);
+  const accessHeaders = {
+    ...cloudflareAccessHeaders(secret),
+    ...upstreamBrowserSessionHeaders(secret),
+  };
 
   const checkpoint = (errorOrMessage) => {
     const error = errorOrMessage instanceof Error
@@ -1431,6 +1449,9 @@ async function collectSub2Api(account, secret = {}) {
       ...secret,
       accessToken,
       refreshToken,
+      ...(tokens.sessionCookie ? { sessionCookie: tokens.sessionCookie } : {}),
+      ...(tokens.sessionUserAgent ? { sessionUserAgent: tokens.sessionUserAgent } : {}),
+      ...(tokens.sessionCapturedAt ? { sessionCapturedAt: tokens.sessionCapturedAt } : {}),
       accessTokenExpiresAt: accessJwtExpiry
         || (tokens.expiresIn ? new Date(Date.now() + tokens.expiresIn * 1000).toISOString() : ''),
       refreshTokenExpiresAt: refreshJwtExpiry
@@ -1473,14 +1494,14 @@ async function collectSub2Api(account, secret = {}) {
     },
   });
 
-  async function tryProfiles(token) {
+  async function tryProfiles(token = '') {
     let lastError;
     for (const path of paths) {
       try {
         const result = await requestJson(`${root}${path}`, {
           headers: {
             ...accessHeaders,
-            Authorization: `Bearer ${token}`,
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
             Accept: 'application/json',
           },
         });
@@ -1496,6 +1517,18 @@ async function collectSub2Api(account, secret = {}) {
 
   const accessTiming = effectiveTokenTiming(accessToken, secret.accessTokenExpiresAt);
   const refreshTiming = effectiveTokenTiming(refreshToken, secret.refreshTokenExpiresAt, 0);
+
+  // Interactive browser login fallback: some customized deployments keep the
+  // authenticated panel session in cookies instead of exposing an AT.
+  if (!accessToken && secret.sessionCookie) {
+    try {
+      authSource = 'browser_cookie';
+      return { ...(await tryProfiles()), updatedSecret };
+    } catch (error) {
+      errors.push(`浏览器 CK：${error.message}`);
+      if (!refreshToken && !secret.password) throw checkpoint(error);
+    }
+  }
 
   // 1) 没有 AT，或 JWT AT 已到期/即将到期时，优先用 RT 主动续期
   if ((!accessToken || accessTiming.expiringSoon) && refreshToken && !refreshTiming.expired) {
@@ -1604,7 +1637,7 @@ async function collectSub2Api(account, secret = {}) {
     }
   }
 
-  if (!accessToken && !refreshToken) {
+  if (!accessToken && !refreshToken && !secret.sessionCookie) {
     throw checkpoint(new Error('Sub2API 需要 Access Token，或 Access+Refresh Token，或可登录的邮箱密码'));
   }
   throw checkpoint(new Error(
@@ -1883,6 +1916,242 @@ async function collectNewApiAccountKeyDetails(account, secret, inspectedAt) {
   throw error;
 }
 
+function sub2PanelData(body = {}) {
+  return body && typeof body === 'object' && Object.hasOwn(body, 'data') ? body.data : body;
+}
+
+function sub2PanelGroups(body = {}) {
+  const data = sub2PanelData(body);
+  return Array.isArray(data) ? data.filter((item) => item && typeof item === 'object') : [];
+}
+
+function sub2PanelRates(body = {}) {
+  const data = sub2PanelData(body);
+  return data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+}
+
+function minutesInTimezone(timezone, current = new Date()) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: timezone || 'UTC',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(current);
+    const hour = Number(parts.find((part) => part.type === 'hour')?.value);
+    const minute = Number(parts.find((part) => part.type === 'minute')?.value);
+    return Number.isInteger(hour) && Number.isInteger(minute) ? hour * 60 + minute : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseClockMinutes(value) {
+  const match = String(value || '').match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (!Number.isInteger(hour) || hour < 0 || hour > 23 || !Number.isInteger(minute) || minute < 0 || minute > 59) return null;
+  return hour * 60 + minute;
+}
+
+function sub2GroupRate(group = {}, userRates = {}, timezone = 'UTC', current = new Date()) {
+  const groupId = String(group.id ?? '');
+  const groupRateMultiplier = nonnegativeFiniteNumber(group.rate_multiplier);
+  const userRateMultiplier = Object.hasOwn(userRates, groupId)
+    ? nonnegativeFiniteNumber(userRates[groupId])
+    : undefined;
+  const resolvedRateMultiplier = userRateMultiplier ?? groupRateMultiplier;
+  const peakStart = parseClockMinutes(group.peak_start);
+  const peakEnd = parseClockMinutes(group.peak_end);
+  const currentMinute = minutesInTimezone(timezone, current);
+  const peakConfigured = group.subscription_type === 'subscription'
+    && group.peak_rate_enabled === true
+    && peakStart !== null
+    && peakEnd !== null
+    && peakStart < peakEnd;
+  const peakActive = peakConfigured && currentMinute !== null && currentMinute >= peakStart && currentMinute < peakEnd;
+  const configuredPeakMultiplier = nonnegativeFiniteNumber(group.peak_rate_multiplier);
+  const appliedPeakMultiplier = peakActive ? (configuredPeakMultiplier ?? 1) : 1;
+  const effectiveRateMultiplier = resolvedRateMultiplier === undefined
+    ? undefined
+    : resolvedRateMultiplier * appliedPeakMultiplier;
+  return {
+    id: group.id,
+    name: String(group.name || `分组 ${groupId}`),
+    platform: String(group.platform || ''),
+    status: String(group.status || ''),
+    subscriptionType: String(group.subscription_type || 'standard'),
+    groupRateMultiplier: groupRateMultiplier ?? null,
+    userRateMultiplier: userRateMultiplier ?? null,
+    resolvedRateMultiplier: resolvedRateMultiplier ?? null,
+    peakRateEnabled: group.peak_rate_enabled === true,
+    peakStart: String(group.peak_start || ''),
+    peakEnd: String(group.peak_end || ''),
+    peakRateMultiplier: configuredPeakMultiplier ?? null,
+    peakActive,
+    appliedPeakMultiplier,
+    effectiveRateMultiplier: effectiveRateMultiplier ?? null,
+    rateMultiplier: effectiveRateMultiplier ?? null,
+    rateMultiplierStatus: effectiveRateMultiplier === undefined ? 'unavailable' : 'available',
+  };
+}
+
+function sub2AccountKeyStatus(item, remaining, unlimited) {
+  const enabled = String(item?.status || '').toLowerCase() === 'active';
+  const expiresAt = item?.expires_at ? Date.parse(item.expires_at) : Number.NaN;
+  if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) {
+    return { status: 'unavailable', ok: false, message: 'Key 已过期' };
+  }
+  if (!enabled) return { status: 'unavailable', ok: false, message: 'Key 已停用' };
+  if (!unlimited && remaining === 0) return { status: 'unavailable', ok: false, message: 'Key 额度已用完' };
+  if (unlimited) return { status: 'unlimited', ok: true, message: '无限额度 Key' };
+  return { status: 'available', ok: true, message: '' };
+}
+
+function sub2AccountKeyItem(item, index, groupRatesById) {
+  const maskedToken = maskApiTokenReference(item?.key || '');
+  const quotaLimit = nonnegativeFiniteNumber(item?.quota) ?? 0;
+  const quotaUsed = nonnegativeFiniteNumber(item?.quota_used) ?? 0;
+  const unlimited = quotaLimit === 0;
+  const remaining = unlimited ? null : Math.max(0, quotaLimit - quotaUsed);
+  const groupRate = groupRatesById.get(String(item?.group_id ?? ''));
+  const status = sub2AccountKeyStatus(item, remaining, unlimited);
+  return {
+    slot: index + 1,
+    label: `${String(item?.name || `Key ${index + 1}`)} · ${maskedToken}`,
+    maskedToken,
+    ...status,
+    errorCode: status.ok ? '' : 'UPSTREAM_KEY_UNAVAILABLE',
+    rawBalance: remaining,
+    unit: 'USD',
+    balanceScope: 'api_key',
+    totalGranted: unlimited ? null : quotaLimit,
+    totalUsed: quotaUsed,
+    used: quotaUsed,
+    remaining,
+    quotaLimit: unlimited ? null : quotaLimit,
+    quotaUsed,
+    unlimitedQuota: unlimited,
+    tokenName: String(item?.name || ''),
+    groupId: item?.group_id ?? null,
+    tokenGroup: groupRate?.name || (item?.group_id == null ? '未绑定' : `分组 ${item.group_id}`),
+    expiresAt: item?.expires_at || null,
+    currentConcurrency: finiteDetailNumber(item?.current_concurrency),
+    rateLimit5h: finiteDetailNumber(item?.rate_limit_5h),
+    rateLimit1d: finiteDetailNumber(item?.rate_limit_1d),
+    rateLimit7d: finiteDetailNumber(item?.rate_limit_7d),
+    usage5h: finiteDetailNumber(item?.usage_5h),
+    usage1d: finiteDetailNumber(item?.usage_1d),
+    usage7d: finiteDetailNumber(item?.usage_7d),
+    rateMultiplier: groupRate?.effectiveRateMultiplier ?? null,
+    rateMultiplierStatus: groupRate?.rateMultiplierStatus || 'unavailable',
+    groupRateMultiplier: groupRate?.groupRateMultiplier ?? null,
+    userRateMultiplier: groupRate?.userRateMultiplier ?? null,
+    resolvedRateMultiplier: groupRate?.resolvedRateMultiplier ?? null,
+    peakRateEnabled: groupRate?.peakRateEnabled || false,
+    peakRateMultiplier: groupRate?.peakRateMultiplier ?? null,
+    appliedPeakMultiplier: groupRate?.appliedPeakMultiplier ?? 1,
+    peakActive: groupRate?.peakActive || false,
+  };
+}
+
+async function collectSub2ApiAccountKeyDetails(account, secret, inspectedAt) {
+  const accountSummary = {
+    id: String(account?.id || ''),
+    name: String(account?.name || ''),
+    type: 'sub2api',
+    authMode: String(account?.authMode || 'access_token'),
+  };
+  const balanceResult = await collectSub2Api(account, secret);
+  const effectiveSecret = balanceResult.updatedSecret || secret;
+  const accessToken = String(effectiveSecret.accessToken || secret.accessToken || '').trim();
+  if (!accessToken && !effectiveSecret.sessionCookie) {
+    return {
+      account: accountSummary,
+      supported: false,
+      mode: accountSummary.authMode,
+      inspectedAt,
+      keyCount: 0,
+      groupCount: 0,
+      keys: [],
+      groups: [],
+      summary: { available: 0, unavailable: 0 },
+      message: '登录态尚未取得 Access Token',
+      ...(balanceResult.updatedSecret ? { updatedSecret: balanceResult.updatedSecret } : {}),
+    };
+  }
+
+  const root = baseUrl(account.baseUrl);
+  const headers = {
+    Accept: 'application/json',
+    ...(accessToken ? { Authorization: `Bearer ${accessToken.replace(/^Bearer\s+/i, '')}` } : {}),
+    ...cloudflareAccessHeaders(effectiveSecret),
+    ...upstreamBrowserSessionHeaders(effectiveSecret),
+  };
+  const [keysResult, groupsResult, ratesResult, settingsResult] = await Promise.all([
+    requestJson(`${root}/api/v1/keys?page=1&page_size=1000`, { headers }),
+    requestJson(`${root}/api/v1/groups/available`, { headers }).catch((error) => ({ error })),
+    requestJson(`${root}/api/v1/groups/rates`, { headers }).catch((error) => ({ error })),
+    requestJson(`${root}/api/v1/settings/public`, { headers: { Accept: 'application/json' } }).catch((error) => ({ error })),
+  ]);
+  assertSuccess(keysResult.response, keysResult.body);
+
+  let groups = [];
+  let userRates = {};
+  let groupRateStatus = 'available';
+  if (groupsResult.error) groupRateStatus = isCloudflareChallenge(groupsResult.error) ? 'challenge' : 'unavailable';
+  else {
+    try {
+      assertSuccess(groupsResult.response, groupsResult.body);
+      groups = sub2PanelGroups(groupsResult.body);
+    } catch (error) {
+      groupRateStatus = isCloudflareChallenge(error) ? 'challenge' : 'unavailable';
+    }
+  }
+  if (ratesResult.error) groupRateStatus = isCloudflareChallenge(ratesResult.error) ? 'challenge' : 'unavailable';
+  else {
+    try {
+      assertSuccess(ratesResult.response, ratesResult.body);
+      userRates = sub2PanelRates(ratesResult.body);
+    } catch (error) {
+      groupRateStatus = isCloudflareChallenge(error) ? 'challenge' : 'unavailable';
+    }
+  }
+  let settings = {};
+  if (!settingsResult.error) {
+    try {
+      assertSuccess(settingsResult.response, settingsResult.body);
+      settings = sub2PanelData(settingsResult.body);
+    } catch {
+      settings = {};
+    }
+  }
+  const timezone = String(settings?.server_timezone || settings?.timezone || 'UTC');
+  const groupRates = groups.map((group) => sub2GroupRate(group, userRates, timezone));
+  const groupRatesById = new Map(groupRates.map((group) => [String(group.id), group]));
+  const keyData = sub2PanelData(keysResult.body);
+  const items = Array.isArray(keyData?.items) ? keyData.items.filter((item) => item && typeof item === 'object') : [];
+  const keys = items.map((item, index) => sub2AccountKeyItem(item, index, groupRatesById));
+  const available = keys.filter((key) => key.ok).length;
+  const total = nonnegativeFiniteNumber(keyData?.total);
+  return {
+    account: accountSummary,
+    supported: true,
+    mode: 'account_session',
+    inspectedAt,
+    keyCount: keys.length,
+    groupCount: groupRates.length,
+    keys,
+    groups: groupRates,
+    groupRateStatus,
+    serverTimezone: timezone,
+    summary: { available, unavailable: keys.length - available },
+    message: total !== undefined && total > keys.length ? `当前展示前 ${keys.length} 个 Key` : '',
+    ...(balanceResult.updatedSecret ? { updatedSecret: balanceResult.updatedSecret } : {}),
+  };
+}
+
 /**
  * Inspect every configured API key without returning any credential material.
  * The regular collector is reused with an isolated one-key pool so scheduling
@@ -1898,6 +2167,9 @@ export async function collectApiKeyDetails(account, secret = {}, options = {}) {
   };
   if (account?.type === 'newapi' && account?.authMode === 'access_token') {
     return withUpstreamProxyContext(account, () => collectNewApiAccountKeyDetails(account, secret, inspectedAt));
+  }
+  if (account?.type === 'sub2api' && account?.authMode !== 'api_token') {
+    return withUpstreamProxyContext(account, () => collectSub2ApiAccountKeyDetails(account, secret, inspectedAt));
   }
   if (account?.authMode !== 'api_token') {
     return {
