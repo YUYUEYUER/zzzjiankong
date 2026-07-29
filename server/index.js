@@ -9,7 +9,7 @@ import { z } from 'zod';
 import { config } from './config.js';
 import { JsonStore } from './store.js';
 import { Monitor } from './monitor.js';
-import { collectBalance, mergeSecrets } from './collectors.js';
+import { collectApiKeyDetails, collectBalance, mergeSecrets } from './collectors.js';
 import { takeCredentialCheckpoint } from './credential-checkpoint.js';
 import { evaluateFormula, normalizeFormula } from './converter.js';
 import {
@@ -877,6 +877,34 @@ app.patch('/api/accounts/:id/upstream', asyncRoute(async (req, res) => {
     state.audit.unshift({ id: crypto.randomUUID(), type: 'account.upstream_changed', accountId: account.id, upstreamId, at: account.updatedAt, details: { previousUpstreamId } });
   });
   res.json({ account: sanitizeAccount(store.snapshot().accounts.find((item) => item.id === req.params.id)) });
+}));
+
+app.get('/api/accounts/:id/api-keys', asyncRoute(async (req, res) => {
+  const details = await withAccountCredentialLock(req.params.id, async () => {
+    const account = store.snapshot().accounts.find((item) => item.id === req.params.id);
+    if (!account) throw Object.assign(new Error('账号不存在'), { statusCode: 404 });
+    const supportsKeyDetails = account.authMode === 'api_token'
+      || (account.type === 'newapi' && account.authMode === 'access_token');
+    if (!supportsKeyDetails) return collectApiKeyDetails(account);
+
+    let secret;
+    try {
+      secret = decryptSecret(account.encryptedSecret);
+    } catch {
+      throw Object.assign(new Error('账号凭据无法解密，请重新保存 API Key'), { statusCode: 422 });
+    }
+    const result = await collectApiKeyDetails(account, secret);
+    return {
+      ...result,
+      keys: result.keys.map((key) => ({
+        ...key,
+        convertedCny: Number.isFinite(key.rawBalance)
+          ? evaluateFormula(account.formula, key.rawBalance)
+          : null,
+      })),
+    };
+  });
+  res.json(details);
 }));
 
 app.delete('/api/accounts/:id', asyncRoute(async (req, res) => {

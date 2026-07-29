@@ -17,10 +17,10 @@ function defaults(type = 'newapi', upstreamId = '') {
     tokenStrategy: 'sticky', apiTokenPoolText: '',
     profilePath: type === 'sub2api' ? sub2Defaults.profilePath : '/api/user/self',
     balancePath: type === 'sub2api' ? sub2Defaults.balancePath : 'data.quota',
-    formula: type === 'sub2api' ? sub2Defaults.formula : type === 'newapi' ? 'x / 500000 * 7.2' : 'x',
+    formula: type === 'sub2api' ? sub2Defaults.formula : type === 'newapi' ? 'x / 500000 * 1' : 'x',
     rawUnit: type === 'sub2api' ? sub2Defaults.rawUnit : type === 'newapi' ? 'quota' : 'CNY',
     turnstileSiteKey: '',
-    thresholdLow: 50, thresholdRecover: 60, pollIntervalMinutes: 5, enabled: true,
+    thresholdLow: 10, thresholdRecover: 15, pollIntervalMinutes: 5, enabled: true,
     notifications: { resend: true, feishu: true },
     credentials: {
       apiToken: '', accessToken: '', refreshToken: '', password: '', turnstileToken: '',
@@ -29,7 +29,7 @@ function defaults(type = 'newapi', upstreamId = '') {
   };
 }
 
-export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamId, onClose, onSaved, pushToast, turnstileSolver }) {
+export function AccountModal({ open, editingAccount, initialDraft, upstreams, defaultUpstreamId, onClose, onSaved, pushToast, turnstileSolver }) {
   const [form, setForm] = useState(defaults());
   const [showSecret, setShowSecret] = useState(false);
   const [advanced, setAdvanced] = useState(false);
@@ -52,12 +52,19 @@ export function AccountModal({ open, editingAccount, upstreams, defaultUpstreamI
           cfAccessClientId: '', cfAccessClientSecret: '',
         },
       });
+    } else if (initialDraft) {
+      const base = defaults(initialDraft.type || 'newapi', initialDraft.upstreamId || defaultUpstreamId || upstreams[0]?.id || '');
+      setForm({
+        ...base,
+        ...initialDraft,
+        credentials: { ...base.credentials, ...(initialDraft.credentials || {}) },
+      });
     } else {
       setForm(defaults('newapi', defaultUpstreamId || upstreams[0]?.id || ''));
     }
     setPreview(null);
     setAdvanced(false);
-  }, [open, editingAccount, defaultUpstreamId, upstreams]);
+  }, [open, editingAccount, initialDraft, defaultUpstreamId]);
 
   const set = (key, value) => setForm((current) => ({ ...current, [key]: value }));
   const setCredential = (key, value) => setForm((current) => ({ ...current, credentials: { ...current.credentials, [key]: value } }));

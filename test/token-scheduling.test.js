@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
 import {
+  collectApiKeyDetails,
   collectBalance,
   cloudflareAccessHeaders,
   effectiveTokenTiming,
@@ -27,6 +28,193 @@ test('New API token pool keeps order and schedules from the expected slot', () =
   assert.deepEqual(scheduledTokenIndexes(3, 'sticky', 1), [1, 2, 0]);
   assert.deepEqual(scheduledTokenIndexes(3, 'round_robin'), [0, 1, 2]);
   assert.deepEqual(scheduledTokenIndexes(3, 'round_robin', 1), [2, 0, 1]);
+});
+
+test('per-key details inspect every New API key without exposing credentials', async () => {
+  const originalFetch = global.fetch;
+  let active = 0;
+  let peak = 0;
+  global.fetch = async (_url, options) => {
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    active -= 1;
+    const authorization = options.headers.Authorization;
+    if (authorization === 'Bearer sk-invalid-secret-3333') {
+      return new Response(JSON.stringify({
+        success: false,
+        message: 'invalid sk-invalid-secret-3333',
+      }), { status: 401, headers: { 'content-type': 'application/json' } });
+    }
+    const second = authorization === 'Bearer sk-private-secret-2222';
+    return new Response(JSON.stringify({
+      code: true,
+      data: {
+        name: second ? 'secondary' : 'primary',
+        total_granted: second ? 900000 : 600000,
+        total_used: second ? 300000 : 100000,
+        total_available: second ? 600000 : 500000,
+        unlimited_quota: false,
+        group: second ? 'vip' : 'default',
+        group_ratio: second ? 0.8 : 1,
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  try {
+    const details = await collectApiKeyDetails({
+      id: 'account-newapi',
+      name: 'New API',
+      type: 'newapi',
+      authMode: 'api_token',
+      baseUrl: 'https://newapi.example.com',
+    }, {
+      apiTokens: [
+        'sk-private-secret-1111',
+        'sk-private-secret-2222',
+        'sk-invalid-secret-3333',
+      ],
+    }, { concurrency: 2 });
+
+    assert.equal(details.supported, true);
+    assert.equal(details.keyCount, 3);
+    assert.deepEqual(details.summary, { available: 2, unavailable: 1 });
+    assert.equal(details.keys[0].rawBalance, 500000);
+    assert.equal(details.keys[0].totalUsed, 100000);
+    assert.equal(details.keys[1].rateMultiplier, 0.8);
+    assert.equal(details.keys[1].tokenGroup, 'vip');
+    assert.equal(details.keys[2].status, 'unavailable');
+    assert.equal(details.keys[2].message, 'Key 鉴权失败或已经失效');
+    assert.ok(peak <= 2);
+    const serialized = JSON.stringify(details);
+    assert.doesNotMatch(serialized, /sk-private-secret|sk-invalid-secret/);
+    assert.match(details.keys[0].maskedToken, /1111$/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('per-key details expose Sub2API quota and billing multiplier metadata', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    const authorization = options.headers.Authorization;
+    const second = authorization === 'Bearer sk-sub2-secret-bbbb';
+    if (String(url).endsWith('/v1/sub2api/billing')) {
+      return new Response(JSON.stringify({
+        billing_scope: 'token',
+        group_rate_multiplier: second ? 0.7 : 0.9,
+        user_rate_multiplier: 1,
+        resolved_rate_multiplier: second ? 0.7 : 0.9,
+        effective_rate_multiplier: second ? 0.84 : 0.9,
+        peak_rate_enabled: second,
+        peak_rate_multiplier: second ? 1.2 : 1,
+        applied_peak_multiplier: second ? 1.2 : 1,
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({
+      mode: 'quota_limited',
+      isValid: true,
+      status: 'active',
+      remaining: second ? 3.5 : 8.5,
+      unit: 'USD',
+      quota: {
+        limit: 10,
+        used: second ? 6.5 : 1.5,
+        remaining: second ? 3.5 : 8.5,
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  try {
+    const details = await collectApiKeyDetails({
+      id: 'account-sub2',
+      name: 'Sub2API',
+      type: 'sub2api',
+      authMode: 'api_token',
+      baseUrl: 'https://sub2.example.com',
+      balancePath: 'remaining',
+    }, {
+      apiTokens: ['sk-sub2-secret-aaaa', 'sk-sub2-secret-bbbb'],
+    });
+
+    assert.equal(details.keyCount, 2);
+    assert.equal(details.keys[0].quotaLimit, 10);
+    assert.equal(details.keys[0].quotaUsed, 1.5);
+    assert.equal(details.keys[1].rawBalance, 3.5);
+    assert.equal(details.keys[1].rateMultiplier, 0.84);
+    assert.equal(details.keys[1].groupRateMultiplier, 0.7);
+    assert.equal(details.keys[1].peakRateEnabled, true);
+    assert.doesNotMatch(JSON.stringify(details), /sk-sub2-secret/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('New API account access token enumerates per-key usage and group multipliers', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    assert.equal(options.headers.Authorization, 'Bearer private-account-token');
+    assert.equal(options.headers['New-Api-User'], '1090');
+    if (String(url).endsWith('/api/user/self/groups')) {
+      return new Response(JSON.stringify({
+        success: true,
+        data: { default: { ratio: 1 }, vip: { ratio: 0.72 } },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    assert.match(String(url), /\/api\/token\/\?/);
+    return new Response(JSON.stringify({
+      success: true,
+      data: {
+        total: 2,
+        items: [
+          {
+            id: 1,
+            key: 'abcd********1111',
+            name: 'primary',
+            status: 1,
+            remain_quota: 500000,
+            used_quota: 100000,
+            unlimited_quota: false,
+            group: 'default',
+            expired_time: -1,
+          },
+          {
+            id: 2,
+            key: 'efgh********2222',
+            name: 'vip-disabled',
+            status: 2,
+            remain_quota: 300000,
+            used_quota: 200000,
+            unlimited_quota: false,
+            group: 'vip',
+            expired_time: -1,
+          },
+        ],
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const details = await collectApiKeyDetails({
+      id: 'account-access-token',
+      name: 'Official account token',
+      type: 'newapi',
+      authMode: 'access_token',
+      baseUrl: 'https://newapi.example.com',
+      userId: '1090',
+    }, { accessToken: 'private-account-token' });
+    assert.equal(details.supported, true);
+    assert.equal(details.mode, 'access_token');
+    assert.equal(details.keyCount, 2);
+    assert.equal(details.keys[0].rawBalance, 500000);
+    assert.equal(details.keys[0].totalUsed, 100000);
+    assert.equal(details.keys[0].rateMultiplier, 1);
+    assert.equal(details.keys[1].rateMultiplier, 0.72);
+    assert.equal(details.keys[1].status, 'unavailable');
+    assert.deepEqual(details.summary, { available: 1, unavailable: 1 });
+    assert.doesNotMatch(JSON.stringify(details), /private-account-token/);
+  } finally {
+    global.fetch = originalFetch;
+  }
 });
 
 test('opaque token timing uses the stored expiry and login payload includes compatibility fields', () => {

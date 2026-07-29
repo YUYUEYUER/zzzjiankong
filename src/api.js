@@ -42,6 +42,7 @@ export const api = {
   deleteAccount: (id) => request(`/api/accounts/${id}`, { method: 'DELETE' }),
   testAccount: (payload) => request('/api/accounts/test', { method: 'POST', body: JSON.stringify(payload) }),
   refreshAccount: (id) => request(`/api/accounts/${id}/refresh`, { method: 'POST' }),
+  accountKeyDetails: (id) => request(`/api/accounts/${id}/api-keys`),
   simulateRecharge: (id) => request(`/api/accounts/${id}/simulate-recharge`, { method: 'POST' }),
   testFormula: (rawValue, formula) => request('/api/formulas/test', { method: 'POST', body: JSON.stringify({ rawValue, formula }) }),
   acknowledge: (id) => request(`/api/incidents/${id}/acknowledge`, { method: 'POST' }),

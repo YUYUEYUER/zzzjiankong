@@ -1,43 +1,44 @@
 # Design QA
 
-- Source visual truth path: `E:\查看上游余额\design\reference\frosted-console-target.png`
-- Implementation screenshot path: `E:\查看上游余额\app\design\final-desktop-1440x1024.png`
-- Mobile screenshot path: `E:\查看上游余额\app\design\final-mobile-390x844.png`
-- Full-view comparison: `E:\查看上游余额\app\design\qa-side-by-side.png`
-- Focused comparison: `E:\查看上游余额\app\design\qa-focused-main.png`
-- Viewport: 1440 x 1024 desktop; 390 x 844 mobile
-- State: seeded desktop overview, `east-prod` selected, connection inspector open, incident queue visible
+- Source visual: live capture of `https://status.openai.com/` in the in-app browser.
+- Implementation: live capture of `http://localhost:8790/` using the same browser viewport and state.
+- Responsive check: isolated 375 x 812 iframe using the production build and the same browser renderer.
+- Compared state: status overview, one expanded account, quick token form, Sub2API switch, and advanced form handoff.
 
 **Findings**
 
 - No actionable P0, P1, or P2 findings remain.
-- [Accepted] The implementation shows the raw New API value as `quota` and applies `x / 500000 * 7.2`. The source mock labels the raw value as USD while using the same quota formula. The implementation intentionally follows the confirmed product behavior rather than preserving that inconsistent mock label.
-- [Accepted] The implementation uses slightly tighter vertical spacing in the chart and inspector. This keeps the account workspace, formula tester, closed-loop timeline, and incident queue visible together at 1440 x 1024 without clipping.
-- [Accepted] Timeline copy is shorter than the generated mock, but all required states remain visible and functional: threshold trigger, Resend, Feishu, manual recharge, two recovery confirmations, and automatic closure.
+- [Accepted] The reference uses uptime bars for public product availability. This balance monitor uses upstream and account rows instead, because balance, threshold state, per-Key usage, and multiplier are the actionable data.
+- [Accepted] The OpenAI logo and product copy were not reproduced. The reference is used as the visual framework; the implementation retains its own Chinese product identity and operational copy.
+- [Accepted] The overall banner changes from green to amber when a low-balance, stopped, or failed account needs attention. This is required product behavior rather than visual drift.
 
 **Required Fidelity Surfaces**
 
-- Fonts and typography: Inter Variable with Chinese system fallbacks preserves the target's compact product typography, numeric hierarchy, zero negative letter spacing, and readable 9-16px operational scale. No clipping or unintended wrapping was found.
-- Spacing and layout rhythm: top glass shelf, slim icon rail, 250px account map, flexible center workspace, 310px inspector, and bottom queue match the source hierarchy. Radii remain at 8px or less. Desktop and mobile layouts do not overlap.
-- Colors and visual tokens: frost-white base, cobalt selection, coral alerts, emerald recovery, ink text, translucent surfaces, and fine dividers match the target. Contrast remains readable across status states.
-- Image quality and asset fidelity: the source contains no photographic or illustrative image assets. The implementation uses the Phosphor icon library for visible icons and Canvas chart rendering for stable screenshots; no placeholder imagery, handcrafted SVG, or inline SVG substitutes were introduced.
-- Copy and content: Chinese operational labels are coherent and reflect the actual workflow. The conversion labels were corrected to distinguish raw quota from final CNY.
-- Interaction states: account selection, search, tabs, range selector, formula test, add/edit modal, credentials visibility, notification settings, manual sync, acknowledgement, demo recharge, recovery confirmation, and automatic closure were exercised.
-- Accessibility and responsiveness: semantic buttons and form labels are present, keyboard focus is visible, reduced-motion is supported, and the 390px layout exposes both the account map and selected workspace in the first viewport.
+- Fonts and typography: Inter Variable with Chinese system fallbacks, fixed font sizes, zero negative letter spacing, and clear heading/body/metadata hierarchy. Long account and host labels truncate without displacing balances or actions.
+- Spacing and layout: centered single column, generous top spacing, one summary banner, one bordered status group, thin dividers, 8px maximum card radius, and quiet row density follow the reference. Desktop capture showed no overlap or horizontal overflow.
+- Colors and tokens: white background, near-black commands, neutral gray dividers, restrained green success, amber attention, and red failure states. No gradients, glass effects, or decorative color fields remain in the main page.
+- Image and icon fidelity: the source contains no required product imagery beyond its own brand mark. The implementation uses Phosphor icons consistently and does not introduce handcrafted SVG or placeholder imagery.
+- Copy and content: every visible sentence describes current balance state, monitoring, alerts, recharge recovery, or account setup. The screen does not contain feature-tour or design-explanation copy.
+- Interaction states: upstream banner opens edit, plus opens the quick official-token form, New API/Sub2API switching updates required fields, Advanced preserves the draft and opens the full form, account rows expand, refresh actions work, and alert history expands in place.
+- Accessibility and responsiveness: semantic buttons and labels are present, focus rings are visible, reduced motion is supported, and the 375px check reported no horizontal overflow and zero visible buttons below 44 x 44px.
 
-**Patches Made During QA**
+**Fixes Applied During QA**
 
-- Removed core-workspace entrance opacity that could leave a background Chrome tab visually blank.
-- Replaced the SVG trend renderer with Chart.js Canvas rendering for stable cross-browser capture.
-- Disabled chart animation and waited for deterministic chart completion before capture.
-- Prevented the demo offline account from creating a new incident during the reference state.
-- Reduced the mobile account map height and prevented the workspace switcher label from wrapping.
-- Moved the demo recharge control into the formula tester so it no longer overlaps the chart axis.
-- Split vendor bundles to remove the original oversized single JavaScript bundle.
+- Increased all visible mobile action targets to at least 44 x 44px.
+- Kept the notification, security, 2FA, and proxy settings entry visible at 375px.
+- Kept account actions hidden on mobile until expansion to preserve scan density.
+- Stacked per-Key metrics and compact account details on narrow screens.
+- Verified the quick-token modal remains fully scrollable inside a 375 x 812 viewport.
+- Prevented 30-second dashboard refreshes from clearing an open account form.
+- Prevented missing balances and multipliers from being rendered as zero.
+- Added official New API account-token inventory so the default setup can expand into per-Key usage and group multipliers.
+- Invalidated expanded Key data after account sync/edit and allowed collapse/reopen retries.
+- Filtered demo totals and incidents whenever real accounts are present.
+- Added restrained nonlinear easing to account expansion, summary-state changes, and modal entry.
+- Removed the old side navigation, charts, glass surfaces, and multi-column workspace from the main experience.
 
 **Follow-up Polish**
 
-- [P3] A future pass could add slightly stronger edge refraction to the glass surfaces on high-end displays.
-- [P3] The inspector could optionally expose longer delivery metadata when the user expands an event.
+- [P3] Historical balance bars can be added later only if they are backed by a clearly defined period and availability calculation.
 
 final result: passed

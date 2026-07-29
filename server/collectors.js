@@ -1623,6 +1623,373 @@ async function collectGeneric(account, secret) {
   return { rawBalance: numericBalance(result.body, account.balancePath), metadata: { authSource: 'generic' } };
 }
 
+export function maskApiTokenReference(token) {
+  const value = String(token || '').trim().replace(/^Bearer\s+/i, '');
+  if (!value) return '';
+  const prefix = value.startsWith('sk-') ? 'sk-' : '';
+  const payload = prefix ? value.slice(prefix.length) : value;
+  if (payload.length <= 4) return `${prefix}${'*'.repeat(payload.length)}`;
+  return `${prefix}********${payload.slice(-4)}`;
+}
+
+function apiKeyProbeFailure(error) {
+  if (isCloudflareChallenge(error)) {
+    return {
+      status: 'challenge',
+      errorCode: 'TURNSTILE_REQUIRED',
+      message: '上游触发了 Cloudflare/Turnstile 验证',
+    };
+  }
+  if (error?.code === 'UNLIMITED_QUOTA') {
+    return {
+      status: 'unlimited',
+      errorCode: 'UNLIMITED_QUOTA',
+      message: '该 Key 为无限额度，接口没有可显示的有限余额',
+    };
+  }
+  if (error?.code === 'UNMONITORABLE_BALANCE') {
+    return {
+      status: 'unmonitorable',
+      errorCode: 'UNMONITORABLE_BALANCE',
+      message: '该 Key 没有可监控的有限余额',
+    };
+  }
+  if (isAuthFailure(error) || isSub2ApiKeyAuthFailure(error)) {
+    return {
+      status: 'unavailable',
+      errorCode: 'UPSTREAM_AUTH_FAILED',
+      message: 'Key 鉴权失败或已经失效',
+    };
+  }
+  return {
+    status: 'error',
+    errorCode: String(error?.code || 'UPSTREAM_REQUEST_FAILED'),
+    message: '上游暂时没有返回该 Key 的用量信息',
+  };
+}
+
+function finiteDetailNumber(value) {
+  return nonnegativeFiniteNumber(value) ?? null;
+}
+
+function redactCredentialText(value, tokens = []) {
+  let output = String(value || '');
+  for (const token of tokens) {
+    const raw = String(token || '').trim().replace(/^Bearer\s+/i, '');
+    const candidates = [...new Set([raw, raw && !raw.startsWith('sk-') ? `sk-${raw}` : ''].filter(Boolean))];
+    for (const candidate of candidates) {
+      if (output === candidate) output = '[redacted]';
+      else if (candidate.length >= 8) output = output.split(candidate).join('[redacted]');
+    }
+  }
+  return output;
+}
+
+function apiKeyProbeSuccess(slot, token, result, rawUnit = '') {
+  const metadata = result.metadata || {};
+  const quota = metadata.quota && typeof metadata.quota === 'object' ? metadata.quota : {};
+  const subscription = metadata.subscription && typeof metadata.subscription === 'object' ? metadata.subscription : {};
+  const expiresAt = metadata.expiresAt || subscription.expiresAt || subscription.expires_at || null;
+  const maskedToken = maskApiTokenReference(token);
+  return {
+    slot,
+    label: `Key ${slot} · ${maskedToken}`,
+    maskedToken,
+    status: 'available',
+    ok: true,
+    errorCode: '',
+    message: '',
+    rawBalance: Number(result.rawBalance),
+    unit: redactCredentialText(metadata.unit || rawUnit, [token]),
+    balanceScope: String(metadata.balanceScope || 'api_key'),
+    totalGranted: finiteDetailNumber(metadata.totalGranted),
+    totalUsed: finiteDetailNumber(metadata.totalUsed),
+    used: finiteDetailNumber(metadata.totalUsed ?? quota.used ?? subscription.used),
+    remaining: finiteDetailNumber(metadata.remaining ?? result.rawBalance),
+    quotaLimit: finiteDetailNumber(quota.limit ?? quota.total ?? subscription.limit),
+    quotaUsed: finiteDetailNumber(quota.used ?? subscription.used),
+    rateMultiplier: finiteDetailNumber(metadata.rateMultiplier),
+    rateMultiplierStatus: String(metadata.rateMultiplierStatus || 'unavailable'),
+    rateMultiplierSource: String(metadata.rateMultiplierSource || ''),
+    tokenGroup: redactCredentialText(metadata.tokenGroup, [token]),
+    groupRateMultiplier: finiteDetailNumber(metadata.groupRateMultiplier),
+    userRateMultiplier: finiteDetailNumber(metadata.userRateMultiplier),
+    resolvedRateMultiplier: finiteDetailNumber(metadata.resolvedRateMultiplier),
+    peakRateEnabled: metadata.peakRateEnabled === true,
+    peakRateMultiplier: finiteDetailNumber(metadata.peakRateMultiplier),
+    appliedPeakMultiplier: finiteDetailNumber(metadata.appliedPeakMultiplier),
+    tokenName: redactCredentialText(metadata.tokenName, [token]),
+    planName: redactCredentialText(metadata.planName || subscription.planName || subscription.name, [token]),
+    expiresAt: typeof expiresAt === 'string' ? redactCredentialText(expiresAt, [token]) : expiresAt,
+  };
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const output = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from(
+    { length: Math.min(items.length, Math.max(1, concurrency)) },
+    async () => {
+      while (cursor < items.length) {
+        const index = cursor;
+        cursor += 1;
+        output[index] = await mapper(items[index], index);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return output;
+}
+
+function newApiInventoryTokenStatus(item = {}) {
+  const enabled = [1, '1', 'enabled', 'active'].includes(item.status);
+  const unlimited = item.unlimited_quota === true;
+  const remaining = nonnegativeFiniteNumber(item.remain_quota);
+  const expiresAt = Number(item.expired_time);
+  const expired = Number.isFinite(expiresAt) && expiresAt > 0 && expiresAt <= Math.floor(Date.now() / 1000);
+  if (expired) return { status: 'unavailable', ok: false, message: 'Key 已过期' };
+  if (!enabled) return { status: 'unavailable', ok: false, message: 'Key 已停用' };
+  if (!unlimited && remaining === 0) return { status: 'unavailable', ok: false, message: 'Key 额度已用完' };
+  if (unlimited) return { status: 'unlimited', ok: true, message: '无限额度 Key' };
+  return { status: 'available', ok: true, message: '' };
+}
+
+function newApiInventoryRate(groups, group, groupRequestStatus = 'unavailable') {
+  const tokenGroup = String(group || 'default');
+  if (tokenGroup === 'auto') {
+    return {
+      tokenGroup,
+      rateMultiplier: null,
+      rateMultiplierStatus: 'dynamic',
+      rateMultiplierSource: 'newapi_user_groups',
+    };
+  }
+  const groupInfo = groups?.[tokenGroup];
+  const rateMultiplier = nonnegativeFiniteNumber(groupInfo?.ratio ?? groupInfo);
+  return {
+    tokenGroup,
+    rateMultiplier: rateMultiplier ?? null,
+    rateMultiplierStatus: rateMultiplier === undefined ? groupRequestStatus : 'available',
+    rateMultiplierSource: 'newapi_user_groups',
+  };
+}
+
+function newApiInventoryItem(item, index, groups, groupRequestStatus) {
+  const maskedToken = maskApiTokenReference(
+    String(item?.key || '').startsWith('sk-') ? item.key : `sk-${item?.key || ''}`,
+  );
+  const remaining = item?.unlimited_quota === true ? null : finiteDetailNumber(item?.remain_quota);
+  const used = finiteDetailNumber(item?.used_quota);
+  const expiry = Number(item?.expired_time);
+  const status = newApiInventoryTokenStatus(item);
+  return {
+    slot: index + 1,
+    label: `${String(item?.name || `Key ${index + 1}`)} · ${maskedToken}`,
+    maskedToken,
+    ...status,
+    errorCode: status.ok ? '' : 'UPSTREAM_KEY_UNAVAILABLE',
+    rawBalance: remaining,
+    unit: 'quota',
+    balanceScope: 'api_key',
+    totalGranted: remaining === null ? null : (remaining || 0) + (used || 0),
+    totalUsed: used,
+    used,
+    remaining,
+    quotaLimit: null,
+    quotaUsed: used,
+    ...newApiInventoryRate(groups, item?.group, groupRequestStatus),
+    tokenName: String(item?.name || ''),
+    planName: '',
+    expiresAt: Number.isFinite(expiry) && expiry > 0 ? new Date(expiry * 1000).toISOString() : null,
+  };
+}
+
+async function collectNewApiAccountKeyDetails(account, secret, inspectedAt) {
+  const accountSummary = {
+    id: String(account?.id || ''),
+    name: String(account?.name || ''),
+    type: 'newapi',
+    authMode: 'access_token',
+  };
+  const tokenPool = normalizeTokenPool(secret);
+  if (!tokenPool.length || !account.userId) {
+    return {
+      account: accountSummary,
+      supported: false,
+      mode: 'access_token',
+      inspectedAt,
+      keyCount: 0,
+      keys: [],
+      summary: { available: 0, unavailable: 0 },
+      message: '需要账户访问令牌与 User ID 才能读取分 Key 用量',
+    };
+  }
+
+  const root = baseUrl(account.baseUrl);
+  const errors = [];
+  const indexes = scheduledTokenIndexes(tokenPool.length, account.tokenStrategy, secret.tokenCursor);
+  for (const index of indexes) {
+    const rawToken = String(tokenPool[index]).replace(/^Bearer\s+/i, '');
+    const authorizationCandidates = [...new Set([`Bearer ${rawToken}`, rawToken])];
+    for (const authorization of authorizationCandidates) {
+      const headers = {
+        Accept: 'application/json',
+        Authorization: authorization,
+        'New-Api-User': String(account.userId),
+        ...cloudflareAccessHeaders(secret),
+      };
+      try {
+        const tokenResult = await requestJson(`${root}/api/token/?p=0&page_size=100&size=100`, { headers });
+        assertSuccess(tokenResult.response, tokenResult.body);
+        const items = newApiTokenList(tokenResult.body).filter((item) => item && typeof item === 'object').slice(0, 100);
+
+        let groups = {};
+        let groupRequestStatus = 'unavailable';
+        try {
+          const groupsResult = await requestJson(`${root}/api/user/self/groups`, { headers });
+          assertSuccess(groupsResult.response, groupsResult.body);
+          groups = readPath(groupsResult.body, 'data') || {};
+          groupRequestStatus = 'unavailable';
+        } catch (error) {
+          groupRequestStatus = isCloudflareChallenge(error) ? 'challenge' : 'unavailable';
+        }
+
+        const keys = items.map((item, itemIndex) => newApiInventoryItem(item, itemIndex, groups, groupRequestStatus));
+        const available = keys.filter((key) => key.ok).length;
+        const total = nonnegativeFiniteNumber(
+          readPath(tokenResult.body, 'data.total')
+          ?? readPath(tokenResult.body, 'total'),
+        );
+        return {
+          account: accountSummary,
+          supported: true,
+          mode: 'access_token',
+          inspectedAt,
+          keyCount: keys.length,
+          keys,
+          summary: { available, unavailable: keys.length - available },
+          message: total !== undefined && total > keys.length ? `当前展示前 ${keys.length} 个 Key` : '',
+        };
+      } catch (error) {
+        if (isCloudflareChallenge(error)) throw error;
+        if (!isAuthFailure(error)) throw error;
+        errors.push(`账户令牌槽位 ${index + 1} 鉴权失败`);
+      }
+    }
+  }
+  const error = new Error(errors.length ? errors.join('；') : '账户访问令牌不可用');
+  error.code = 'UPSTREAM_AUTH_FAILED';
+  error.status = 401;
+  throw error;
+}
+
+/**
+ * Inspect every configured API key without returning any credential material.
+ * The regular collector is reused with an isolated one-key pool so scheduling
+ * and failover never hide an unhealthy slot behind a healthy one.
+ */
+export async function collectApiKeyDetails(account, secret = {}, options = {}) {
+  const inspectedAt = new Date().toISOString();
+  const accountSummary = {
+    id: String(account?.id || ''),
+    name: String(account?.name || ''),
+    type: String(account?.type || ''),
+    authMode: String(account?.authMode || ''),
+  };
+  if (account?.type === 'newapi' && account?.authMode === 'access_token') {
+    return withUpstreamProxyContext(account, () => collectNewApiAccountKeyDetails(account, secret, inspectedAt));
+  }
+  if (account?.authMode !== 'api_token') {
+    return {
+      account: accountSummary,
+      supported: false,
+      mode: account?.authMode || 'access_token',
+      inspectedAt,
+      keyCount: 0,
+      keys: [],
+      summary: { available: 0, unavailable: 0 },
+      message: '该账号使用账户访问令牌，不包含可拆分查看的 API Key',
+    };
+  }
+  const tokens = normalizeApiTokenPool(secret);
+  const safeAccountSummary = {
+    ...accountSummary,
+    name: redactCredentialText(accountSummary.name, tokens),
+  };
+  if (!['newapi', 'sub2api'].includes(account?.type)) {
+    return {
+      account: safeAccountSummary,
+      supported: false,
+      mode: 'api_token',
+      inspectedAt,
+      keyCount: 0,
+      keys: [],
+      summary: { available: 0, unavailable: 0 },
+      message: '当前上游类型不支持分 Key 用量查询',
+    };
+  }
+
+  if (!tokens.length) {
+    return {
+      account: accountSummary,
+      supported: true,
+      mode: 'api_token',
+      inspectedAt,
+      keyCount: 0,
+      keys: [],
+      summary: { available: 0, unavailable: 0 },
+      message: '该账号尚未保存 API Key',
+    };
+  }
+
+  const root = baseUrl(account.baseUrl);
+  const concurrency = Math.min(3, Math.max(1, Number(options.concurrency || 3)));
+  const keys = await withUpstreamProxyContext(account, () => mapWithConcurrency(
+    tokens,
+    concurrency,
+    async (token, index) => {
+      const isolatedSecret = {
+        ...secret,
+        apiToken: token,
+        apiTokens: [token],
+        apiTokenCursor: 0,
+      };
+      delete isolatedSecret.turnstileToken;
+      try {
+        const isolatedAccount = { ...account, tokenStrategy: 'sticky' };
+        const result = account.type === 'newapi'
+          ? await collectNewApiTokenUsage(root, isolatedAccount, isolatedSecret)
+          : await collectSub2ApiTokenUsage(root, isolatedAccount, isolatedSecret);
+        return apiKeyProbeSuccess(index + 1, token, result, account.rawUnit);
+      } catch (error) {
+        const maskedToken = maskApiTokenReference(token);
+        return {
+          slot: index + 1,
+          label: `Key ${index + 1} · ${maskedToken}`,
+          maskedToken,
+          ...apiKeyProbeFailure(error),
+          ok: false,
+          rawBalance: null,
+          unit: '',
+          rateMultiplier: null,
+          rateMultiplierStatus: 'unavailable',
+        };
+      }
+    },
+  ));
+  const available = keys.filter((key) => key.status === 'available').length;
+  return {
+    account: safeAccountSummary,
+    supported: true,
+    mode: 'api_token',
+    inspectedAt,
+    keyCount: keys.length,
+    keys,
+    summary: { available, unavailable: keys.length - available },
+    message: '',
+  };
+}
+
 export async function collectBalance(account, secret) {
   return withUpstreamProxyContext(account, async () => {
     const hasOneShotTurnstileToken = Boolean(secret?.turnstileToken);
