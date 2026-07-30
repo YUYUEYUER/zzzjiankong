@@ -25,6 +25,7 @@ services:
       - proxy-internal
 
   frosted-console:
+    image: ${FROSTED_CONSOLE_IMAGE:-ghcr.io/yuyueyuer/frosted-console:latest}
     build: .
     init: true
     shm_size: "1gb"

@@ -176,6 +176,28 @@ docker compose -f docker-compose.yml -f docker-compose.server.yml logs -f --tail
 
 域名部署仅向宿主机发布 Caddy 的 `80/443`；霜镜的 `8787`、浏览器工作区的 `6080`、Mihomo 控制器和动态代理端口只存在于 Docker 内部网络。浏览器工作区只能通过带登录鉴权的 `/browser/*` 路径访问。
 
+### GHCR 镜像快速部署
+
+生产镜像发布到 `ghcr.io/yuyueyuer/frosted-console`。每次向 `main` 推送代码都会在测试、镜像冒烟和高危漏洞扫描通过后更新 `latest`，并同时发布不可变的 `sha-<12 位提交号>` 标签；推送 `v*` Git 标签时还会发布同名版本标签。镜像目前随私有仓库保持私有，服务器首次拉取前使用只含 `read:packages` 权限的 GitHub 个人访问令牌（classic）登录：
+
+```bash
+read -rsp "GitHub Packages token: " GHCR_TOKEN && echo
+printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u YUYUEYUER --password-stdin
+unset GHCR_TOKEN
+
+./deploy-linux.sh panel.example.com --image
+docker logout ghcr.io
+```
+
+`--image` 会跳过本机应用构建，直接拉取 `FROSTED_CONSOLE_IMAGE`，Mihomo、Caddy、持久化卷和有头浏览器配置与源码构建模式完全相同。需要固定版本时，在命令前指定完整标签：
+
+```bash
+FROSTED_CONSOLE_IMAGE=ghcr.io/yuyueyuer/frosted-console:sha-<提交号> \
+  ./deploy-linux.sh panel.example.com --image
+```
+
+也可以把固定标签写入 `.env` 的 `FROSTED_CONSOLE_IMAGE`，后续无需重复输入。更新私有镜像时先重新登录 GHCR，再重复执行 `--image` 命令。服务器只需拉取镜像时使用 `read:packages`，不需要仓库发布令牌。
+
 ### 手动配置与构建
 
 只有在需要预先填写全部环境变量、接入已有反向代理或调试 Compose 时才使用手动流程：

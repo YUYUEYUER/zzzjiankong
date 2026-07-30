@@ -14,6 +14,7 @@ test('production containers do not publish the application or noVNC ports', asyn
   const server = await readYaml('docker-compose.server.yml');
   const app = base.services['frosted-console'];
 
+  assert.equal(app.image, '${FROSTED_CONSOLE_IMAGE:-ghcr.io/yuyueyuer/frosted-console:latest}');
   assert.equal(app.ports, undefined);
   assert.equal(app.ipc, undefined);
   assert.equal(app.shm_size, '1gb');
@@ -56,13 +57,36 @@ test('one-click Linux deployment generates secrets, builds, and waits for health
     assert.match(script, new RegExp(`ensure_secret ${secret}`));
   }
   assert.match(script, /up -d --build --force-recreate --remove-orphans/);
+  assert.match(script, /pull frosted-console/);
+  assert.match(script, /up -d --no-build --force-recreate --remove-orphans/);
   assert.match(script, /\.State\.Health/);
   assert.match(script, /app_health.*healthy/);
 });
 
 test('GitHub Actions dependencies are pinned to full commit SHAs', async () => {
-  const workflow = await fs.readFile('.github/workflows/security-regression.yml', 'utf8');
-  const references = [...workflow.matchAll(/uses:\s*[^\s#]+@([^\s#]+)/g)].map((match) => match[1]);
+  const files = await fs.readdir('.github/workflows');
+  const workflows = await Promise.all(
+    files.filter((file) => /\.ya?ml$/i.test(file)).map((file) => fs.readFile(`.github/workflows/${file}`, 'utf8')),
+  );
+  const references = workflows.flatMap((workflow) =>
+    [...workflow.matchAll(/uses:\s*[^\s#]+@([^\s#]+)/g)].map((match) => match[1]),
+  );
   assert.ok(references.length > 0);
   for (const reference of references) assert.match(reference, /^[a-f0-9]{40}$/);
+});
+
+test('GHCR publishing uses the repository token and immutable revision tags', async () => {
+  const source = await fs.readFile('.github/workflows/security-regression.yml', 'utf8');
+  const workflow = await readYaml('.github/workflows/security-regression.yml');
+  const publish = workflow.jobs['publish-ghcr'];
+
+  assert.deepEqual(publish.needs, ['verify', 'sbom']);
+  assert.equal(publish.permissions.contents, 'read');
+  assert.equal(publish.permissions.packages, 'write');
+  assert.equal(publish.env.IMAGE_NAME, 'ghcr.io/yuyueyuer/frosted-console');
+  assert.match(source, /secrets\.GITHUB_TOKEN/);
+  assert.match(source, /--platform linux\/amd64/);
+  assert.match(source, /immutable_tag=.*sha-\$\{revision\}/);
+  assert.match(source, /if ! docker pull "\$immutable_tag"/);
+  assert.doesNotMatch(source, /ghp_[A-Za-z0-9]+/);
 });

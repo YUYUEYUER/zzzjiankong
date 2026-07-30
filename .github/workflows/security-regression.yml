@@ -3,6 +3,7 @@ name: Security regression
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -142,3 +143,65 @@ jobs:
           path: frosted-console.spdx.json
           if-no-files-found: error
           retention-days: 30
+
+  publish-ghcr:
+    name: Publish GHCR
+    needs:
+      - verify
+      - sbom
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: publish-ghcr-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      IMAGE_NAME: ghcr.io/yuyueyuer/frosted-console
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build and publish image
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+
+          image="${IMAGE_NAME,,}"
+          revision="${GITHUB_SHA::12}"
+          immutable_tag="${image}:sha-${revision}"
+          created="$(git show -s --format=%cI "$GITHUB_SHA")"
+
+          if ! docker pull "$immutable_tag"; then
+            docker build --pull \
+              --file Dockerfile \
+              --platform linux/amd64 \
+              --build-arg "BUILD_DATE=${created}" \
+              --build-arg "VCS_REF=${GITHUB_SHA}" \
+              --build-arg "VERSION=sha-${revision}" \
+              --tag "$immutable_tag" \
+              .
+            docker push "$immutable_tag"
+          fi
+
+          aliases=()
+          if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
+            aliases+=("${image}:latest")
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            release_tag="${GITHUB_REF_NAME,,}"
+            [[ "$release_tag" =~ ^[a-z0-9_][a-z0-9_.-]{0,127}$ ]]
+            aliases+=("${image}:${release_tag}")
+          fi
+
+          for alias in "${aliases[@]}"; do
+            docker tag "$immutable_tag" "$alias"
+            docker push "$alias"
+          done

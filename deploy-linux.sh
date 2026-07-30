@@ -4,11 +4,12 @@ set -Eeuo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 domain="${1:-${DOMAIN:-}}"
+deploy_mode="${2:---build}"
 if [[ -z "$domain" && -t 0 ]]; then
   read -r -p "请输入面板域名（例如 panel.example.com）: " domain
 fi
 if [[ -z "$domain" ]]; then
-  echo "用法: ./deploy-linux.sh panel.example.com" >&2
+  echo "用法: ./deploy-linux.sh panel.example.com [--build|--image]" >&2
   exit 1
 fi
 if [[ "$domain" == *"://"* || "$domain" == */* || ! "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
@@ -16,6 +17,11 @@ if [[ "$domain" == *"://"* || "$domain" == */* || ! "$domain" =~ ^[A-Za-z0-9]([A
   exit 1
 fi
 domain="${domain,,}"
+
+if [[ "$deploy_mode" != "--build" && "$deploy_mode" != "--image" ]]; then
+  echo "部署模式无效，请使用 --build 或 --image" >&2
+  exit 1
+fi
 
 command -v docker >/dev/null || { echo "请先安装 Docker Engine 与 Compose 插件" >&2; exit 1; }
 docker compose version >/dev/null
@@ -66,7 +72,12 @@ upsert_env SEED_DEMO "false"
 
 compose=(docker compose -f docker-compose.yml -f docker-compose.server.yml)
 "${compose[@]}" config --quiet
-"${compose[@]}" up -d --build --force-recreate --remove-orphans
+if [[ "$deploy_mode" == "--image" ]]; then
+  "${compose[@]}" pull frosted-console
+  "${compose[@]}" up -d --no-build --force-recreate --remove-orphans
+else
+  "${compose[@]}" up -d --build --force-recreate --remove-orphans
+fi
 
 app_container="$("${compose[@]}" ps -q frosted-console)"
 if [[ -z "$app_container" ]]; then
