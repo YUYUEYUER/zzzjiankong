@@ -204,7 +204,7 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, onClose,
         </div>
 
         <div className="form-grid two">
-          <label><span>所属上游</span><input required value={form.upstreamName} onChange={(event) => set('upstreamName', event.target.value)} placeholder="例如：86 或 NewCLI" /></label>
+          <label><span>所属上游</span><input required value={form.upstreamName} onChange={(event) => set('upstreamName', event.target.value)} placeholder="例如 newapi、sub2api" /></label>
           <label><span>账号名称</span><input required value={form.name} onChange={(event) => set('name', event.target.value)} placeholder="例如：主账号" /></label>
         </div>
         <label><span>上游地址</span><input required type="url" value={form.baseUrl} onChange={(event) => set('baseUrl', event.target.value)} placeholder={form.type === 'newapi' ? 'https://newapi.example.com' : 'https://sub2.example.com'} /></label>

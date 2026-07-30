@@ -198,7 +198,7 @@ export function AccountModal({ open, editingAccount, initialDraft, upstreams, de
           <div className="form-section-title"><span>1</span><div><h3>账号归属与站点</h3></div></div>
           <label>
             <span>所属上游</span>
-            <input required value={form.upstreamName || ''} onChange={(event) => set('upstreamName', event.target.value)} placeholder="例如：86 或 NewCLI" />
+            <input required value={form.upstreamName || ''} onChange={(event) => set('upstreamName', event.target.value)} placeholder="例如 newapi、sub2api" />
           </label>
           <div className="type-segmented">
             {[['newapi', 'New API'], ['sub2api', 'Sub2API'], ['generic', '自定义']].map(([id, label]) => (

@@ -79,7 +79,7 @@ export function UpstreamModal({ open, editingUpstream, proxyPool, onClose, onSav
       <form className="upstream-form" onSubmit={submit}>
         <label>
           <span>上游名称</span>
-          <input autoFocus required maxLength={60} value={name} onChange={(event) => setName(event.target.value)} placeholder="例如 86GameStore、NewCLI" />
+          <input autoFocus required maxLength={60} value={name} onChange={(event) => setName(event.target.value)} placeholder="例如 newapi、sub2api" />
         </label>
         <div className="upstream-proxy-section">
           <div className="upstream-proxy-title"><GlobeHemisphereWest size={19} /><div><strong>代理出口</strong><small>同一上游的账号共用固定出口</small></div></div>
