@@ -44,6 +44,32 @@ test('all production base images are pinned to sha256 digests', async () => {
   assert.match(server.services.caddy.image, digestPattern);
 });
 
+test('production dependencies exclude frontend build tools and the runtime image removes npm', async () => {
+  const packageLock = JSON.parse(await fs.readFile('package-lock.json', 'utf8'));
+  const root = packageLock.packages[''];
+  const buildOnly = [
+    '@fontsource-variable/inter',
+    '@marsidev/react-turnstile',
+    '@phosphor-icons/react',
+    '@vitejs/plugin-react',
+    'chart.js',
+    'chartjs-plugin-annotation',
+    'motion',
+    'react',
+    'react-chartjs-2',
+    'react-dom',
+    'vite',
+  ];
+  for (const dependency of buildOnly) {
+    assert.equal(root.dependencies?.[dependency], undefined);
+    assert.ok(root.devDependencies?.[dependency]);
+  }
+
+  const dockerfile = await fs.readFile('Dockerfile', 'utf8');
+  assert.match(dockerfile, /rm -rf "\$npm_global_root\/npm"/);
+  assert.match(dockerfile, /rm -f \/usr\/bin\/npm \/usr\/bin\/npx/);
+});
+
 test('the Linux deployment script is UTF-8 with LF line endings', async () => {
   const source = await fs.readFile('deploy-linux.sh');
   const decoded = new TextDecoder('utf-8', { fatal: true }).decode(source);
