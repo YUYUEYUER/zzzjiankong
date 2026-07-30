@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { generate } from 'otplib';
 
 async function waitForServer(url, child) {
-  for (let attempt = 0; attempt < 80; attempt += 1) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
     if (child.exitCode != null) throw new Error(`test server exited with ${child.exitCode}`);
     try {
       const response = await fetch(`${url}/api/health`);

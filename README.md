@@ -43,6 +43,8 @@ npm start
 
 Sub2API 提供三种接入方式：直接填写 API Key、导入登录态 JSON，或点击 **打开内置浏览器登录**。浏览器方式会打开独立的系统 Chrome；你正常完成 Cloudflare 验证与登录后，AT/RT 或会话 Cookie 会写入应用的加密凭据库。独立 Chrome 配置目录仍可能保留浏览器原生 Cookie、LocalStorage 与缓存，具体边界见下方“浏览器会话数据”。
 
+使用浏览器登录态添加的账号会显示“进入上游”图标。点击后会用原 Chrome 配置目录和已保存 Cookie 打开上游首页，不创建第二个浏览器身份；充值、兑换等操作直接在上游自己的界面完成。
+
 ![添加 Sub2API 监控账号](docs/images/03-add-sub2-account.png)
 
 点击 **测试连接** 确认余额能够读取，再点击 **添加账号**。快速添加默认使用以下配置：
@@ -113,17 +115,41 @@ npm start
 
 ## Docker 部署
 
+### Linux 服务器 + 域名一键部署
+
+准备一台已安装 Docker Engine 与 Compose 插件的 Linux 服务器，将域名的 `A`/`AAAA` 记录指向该服务器，并放行 TCP `80`、TCP `443` 和 UDP `443`。进入项目目录后执行：
+
+```bash
+chmod +x deploy-linux.sh
+./deploy-linux.sh panel.example.com
+```
+
+脚本会自动生成并保留 `MASTER_KEY`、`SESSION_SECRET`、`MIHOMO_SECRET`，构建完整生产页面，启动霜镜、Mihomo、Caddy 和有头浏览器工作区。Caddy 会自动申请和续期 HTTPS 证书；完成后访问 `https://panel.example.com`，首次打开页面设置管理员账号。
+
+重复执行同一命令可更新部署，不会更换已有密钥或清空数据。更新时会整组重建容器，Caddy 同时通过 Docker 内置 DNS 动态刷新霜镜地址，避免应用容器 IP 变化后出现代理中断。查看运行状态与日志：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.server.yml ps
+docker compose -f docker-compose.yml -f docker-compose.server.yml logs -f --tail=200
+```
+
+域名部署仅向公网开放 Caddy 的 `80/443`；霜镜的 `8787` 与浏览器工作区的 `6080` 只绑定服务器回环地址，Mihomo 控制器和动态代理端口只存在于 Docker 内部网络。
+
+### 本机 Docker
+
 1. 将 `.env.example` 复制为 `.env`。
-2. 至少更换 `MASTER_KEY` 和 `SESSION_SECRET`，并保持 `SEED_DEMO=false`。`ADMIN_PASSWORD` 留空时首次打开面板完成管理员初始化。
+2. 至少更换 `MASTER_KEY`、`SESSION_SECRET` 和 `MIHOMO_SECRET`，并保持 `SEED_DEMO=false`。`ADMIN_PASSWORD` 留空时首次打开面板完成管理员初始化。
 3. 启动服务：
 
 ```bash
 docker compose up -d --build
 ```
 
-运行镜像与项目的 Playwright `1.61.1` 版本严格匹配，内置 Chromium 及系统依赖；入口只以 root 修正旧数据卷权限，随后立即降权到 `pwuser`。Compose 同时加载 Playwright 官方同版本的 seccomp profile，以支持非 root Chromium sandbox。Compose 模式适合无头验证，不提供 VNC；需要人工接管时请在有 GUI/X11/VNC 的受控主机运行并设置 `TURNSTILE_HEADLESS=false`。
+本机访问 `http://localhost:8787`；有头浏览器工作区位于 `http://localhost:6080/vnc.html?autoconnect=true&resize=remote&path=websockify`。
 
-数据保存在 Docker 卷 `frosted-data` 中。服务器需允许访问上游域名、`challenges.cloudflare.com`，以及你启用的 Resend/飞书/第三方解题服务。生产环境建议通过 Caddy、Nginx 或 Tailscale 提供 HTTPS 和访问限制。账号凭据锁目前是单进程锁，不要为同一数据卷同时启动多个应用副本。
+运行镜像与项目的 Playwright `1.61.1` 版本严格匹配，内置 Chromium、Xvfb、Openbox、x11vnc 和 noVNC。浏览器始终运行在虚拟显示器中，不使用无头模式；点击“打开内置浏览器登录”或“进入上游”时，域名部署会自动打开同域名下的远程桌面。远程桌面由霜镜登录会话保护，不单独暴露公网 VNC 端口。入口只以 root 修正数据卷和虚拟桌面权限，随后应用、桌面和浏览器全部降权到 `pwuser`；Compose 同时加载 Playwright 官方同版本的 seccomp profile，以支持非 root Chromium sandbox。
+
+数据保存在 Docker 卷 `frosted-data` 中，Caddy 证书保存在 `frosted-caddy-data` 中。服务器需允许访问上游域名、`challenges.cloudflare.com`，以及你启用的 Resend/飞书/第三方解题服务。账号凭据锁目前是单进程锁，不要为同一数据卷同时启动多个应用副本。
 
 ### 浏览器会话数据
 
@@ -237,7 +263,7 @@ npx playwright install --with-deps chromium
 - 浏览器任务进入有界 worker 队列，面板状态包含 worker、active、queued、成功/失败和平均耗时；队列满时快速失败而不是拖垮服务器
 - Docker 启动时会以 `pwuser` 实际启动并关闭一次 Chromium，提前暴露浏览器或 sandbox 配置错误
 
-服务器上的交互式挑战可能无法在无头模式完成。此时错误会明确标记为“需要人工交互”；将 `TURNSTILE_HEADLESS=false` 后，可在有桌面环境的受控机器上完成一次验证，后续轮询优先复用已验证会话。Chromium sandbox 默认开启；只有在隔离、低权限容器确实无法启用时才设置 `TURNSTILE_DISABLE_BROWSER_SANDBOX=true`。
+Linux Docker 部署固定使用有头 Chromium。服务器上的交互式挑战会显示在域名下的浏览器工作区中，可直接人工完成；后续轮询优先复用同一持久浏览器资料与已验证会话。Chromium sandbox 默认开启；只有在隔离、低权限容器确实无法启用时才设置 `TURNSTILE_DISABLE_BROWSER_SANDBOX=true`。
 
 ### 长期稳定路径
 

@@ -20,5 +20,7 @@ When implementing from a selected generated mock, treat that image as the source
 - The first screen must answer which upstream needs attention before showing account formulas or trends.
 - Real upstreams take priority; demo data stays hidden by default when real data exists.
 - Upstream creation and renaming must be explicit, discoverable, and fully functional.
+- Accounts with a saved browser session must expose a direct "enter upstream" action that reuses the original browser profile and cookies instead of creating a second login identity.
+- Linux server deployment must keep Chromium headed and expose its persistent desktop through the authenticated application domain; headless Chromium is not an acceptable Cloudflare login path.
 - Prefer readable tables and solid data surfaces over decorative glass. Keep glass restrained to navigation, top bars, and modals.
 - Do not render controls that only look interactive. Every visible navigation item, filter, menu, and action must work or be removed.

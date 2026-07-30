@@ -78,6 +78,7 @@ export function resolveSystemBrowser() {
     process.platform !== 'win32' && { executablePath: '/usr/bin/google-chrome-stable', name: 'Chrome' },
     process.platform !== 'win32' && { executablePath: '/usr/bin/chromium', name: 'Chromium' },
     process.platform !== 'win32' && { executablePath: '/usr/bin/chromium-browser', name: 'Chromium' },
+    process.platform !== 'win32' && { executablePath: chromium.executablePath(), name: 'Chromium' },
   ].filter(Boolean);
   return candidates.find(({ executablePath }) => existsSync(executablePath)) || null;
 }
@@ -94,6 +95,7 @@ async function freeLoopbackPort() {
 }
 
 export function buildSystemBrowserArgs(job, port) {
+  const targetUrl = job.targetUrl || `${job.origin}/login`;
   return [
     `--remote-debugging-port=${port}`,
     '--remote-debugging-address=127.0.0.1',
@@ -102,8 +104,31 @@ export function buildSystemBrowserArgs(job, port) {
     '--no-default-browser-check',
     '--start-maximized',
     '--new-window',
-    `${job.origin}/login`,
+    targetUrl,
   ];
+}
+
+export function browserCookiesFromHeader(origin, cookieHeader = '') {
+  const url = `${loginOrigin(origin)}/`;
+  const cookies = new Map();
+  for (const segment of String(cookieHeader || '').replace(/[\r\n]/g, '').split(';')) {
+    const separator = segment.indexOf('=');
+    if (separator <= 0) continue;
+    const name = segment.slice(0, separator).trim();
+    const value = segment.slice(separator + 1).trim();
+    if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name)) continue;
+    cookies.set(name, { name, value, url });
+  }
+  return [...cookies.values()];
+}
+
+export async function clearStaleBrowserLocks(profilePath) {
+  await Promise.all([
+    'DevToolsActivePort',
+    'SingletonCookie',
+    'SingletonLock',
+    'SingletonSocket',
+  ].map((name) => fs.rm(path.join(profilePath, name), { force: true })));
 }
 
 async function connectVisibleSystemBrowser(job) {
@@ -112,6 +137,7 @@ async function connectVisibleSystemBrowser(job) {
     throw new Error('未找到系统 Chrome 或 Edge，请安装浏览器或配置 UPSTREAM_BROWSER_PATH');
   }
 
+  await clearStaleBrowserLocks(job.profilePath);
   const port = await freeLoopbackPort();
   const endpoint = `http://127.0.0.1:${port}`;
   const browserProcess = spawn(installed.executablePath, buildSystemBrowserArgs(job, port), {
@@ -293,6 +319,7 @@ async function closeJobBrowser(job) {
   job.browser = null;
   job.browserProcess = null;
   job.context = null;
+  if (job.purpose === 'browse') job.savedCookieHeader = '';
   if (browser) await browser.close().catch(() => {});
   if (browserProcess?.exitCode == null) browserProcess.kill();
   job.closing = false;
@@ -307,14 +334,16 @@ async function runJob(job) {
     job.browserProcess = browserProcess;
     job.browserEngine = browserEngine;
     job.context = context;
-    context.on('page', (page) => watchPage(job, page));
+    if (job.purpose !== 'browse') context.on('page', (page) => watchPage(job, page));
     browser.on('disconnected', () => {
       job.context = null;
       job.browser = null;
       if (activeOrigins.get(job.origin) === job.id) activeOrigins.delete(job.origin);
       if (!job.closing && !['captured', 'consumed', 'cancelled', 'expired'].includes(job.status)) {
         job.status = 'closed';
-        job.message = '浏览器窗口已关闭，尚未检测到有效登录态';
+        job.message = job.purpose === 'browse'
+          ? '上游浏览器窗口已关闭'
+          : '浏览器窗口已关闭，尚未检测到有效登录态';
       }
     });
     const pages = context.pages();
@@ -325,6 +354,19 @@ async function runJob(job) {
         return false;
       }
     }) || pages[0] || await context.newPage();
+    if (job.purpose === 'browse') {
+      const cookies = browserCookiesFromHeader(job.origin, job.savedCookieHeader);
+      job.savedCookieHeader = '';
+      if (cookies.length) await context.addCookies(cookies);
+      await page.goto(job.targetUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(async () => {
+        await page.goto(job.origin, { waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(() => {});
+      });
+      await page.bringToFront().catch(() => {});
+      job.status = 'opened';
+      job.message = cookies.length ? '已复用浏览器登录态打开上游' : '已使用原浏览器配置打开上游';
+      return;
+    }
+
     for (const currentPage of context.pages()) watchPage(job, currentPage);
     job.status = 'waiting';
     job.message = `请在弹出的系统 ${browserEngine} 中完成 Cloudflare 验证与账号登录`;
@@ -363,6 +405,9 @@ export function startUpstreamLogin({ type = 'sub2api', baseUrl }) {
   const origin = loginOrigin(baseUrl);
   const existingId = activeOrigins.get(origin);
   const existing = existingId ? jobs.get(existingId) : null;
+  if (existing?.purpose === 'browse' && ['opening', 'opened'].includes(existing.status)) {
+    throw Object.assign(new Error('请先关闭已打开的上游窗口，再发起新的浏览器登录'), { statusCode: 409 });
+  }
   if (existing && ['opening', 'waiting', 'captured'].includes(existing.status)) return publicJob(existing);
 
   const id = crypto.randomUUID();
@@ -383,6 +428,59 @@ export function startUpstreamLogin({ type = 'sub2api', baseUrl }) {
     hasCookies: false,
     createdAt: now.toISOString(),
     expiresAt: new Date(now.getTime() + LOGIN_TTL_MS).toISOString(),
+    capturedAt: '',
+    context: null,
+    browser: null,
+    browserProcess: null,
+    closing: false,
+    pollTimer: null,
+    timeoutTimer: null,
+    scanning: false,
+  };
+  jobs.set(id, job);
+  activeOrigins.set(origin, id);
+  runJob(job).catch(() => {});
+  return publicJob(job);
+}
+
+export function startUpstreamBrowserSession({ type = 'sub2api', baseUrl, sessionCookie = '' }) {
+  if (type !== 'sub2api') throw Object.assign(new Error('当前仅支持 Sub2API 浏览器会话'), { statusCode: 400 });
+  const origin = loginOrigin(baseUrl);
+  const existingId = activeOrigins.get(origin);
+  const existing = existingId ? jobs.get(existingId) : null;
+  if (existing && ['opening', 'waiting', 'captured', 'opened'].includes(existing.status)) {
+    const page = existing.context?.pages().find((candidate) => {
+      try {
+        return new URL(candidate.url()).origin === origin;
+      } catch {
+        return false;
+      }
+    });
+    page?.bringToFront().catch(() => {});
+    return publicJob(existing);
+  }
+
+  const id = crypto.randomUUID();
+  const browserProfileId = profileId(origin);
+  const now = new Date();
+  const job = {
+    id,
+    type,
+    origin,
+    purpose: 'browse',
+    targetUrl: `${origin}/`,
+    savedCookieHeader: String(sessionCookie || ''),
+    profileId: browserProfileId,
+    profilePath: profileDirectory(browserProfileId),
+    status: 'opening',
+    message: '正在用原浏览器登录态打开上游',
+    error: '',
+    browserEngine: '',
+    candidate: { accessToken: '', refreshToken: '' },
+    secret: null,
+    hasCookies: Boolean(sessionCookie),
+    createdAt: now.toISOString(),
+    expiresAt: '',
     capturedAt: '',
     context: null,
     browser: null,

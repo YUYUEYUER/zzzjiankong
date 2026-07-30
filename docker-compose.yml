@@ -32,7 +32,8 @@ services:
       mihomo:
         condition: service_healthy
     ports:
-      - "8787:8787"
+      - "127.0.0.1:${PORT:-8787}:8787"
+      - "127.0.0.1:${NOVNC_PORT:-6080}:6080"
     env_file:
       - path: .env
         required: false
@@ -46,12 +47,16 @@ services:
       DASHBOARD_TURNSTILE_SITE_KEY: ${DASHBOARD_TURNSTILE_SITE_KEY:-}
       DASHBOARD_TURNSTILE_SECRET_KEY: ${DASHBOARD_TURNSTILE_SECRET_KEY:-}
       TURNSTILE_SOLVER: ${TURNSTILE_SOLVER:-browser}
-      TURNSTILE_HEADLESS: ${TURNSTILE_HEADLESS:-true}
+      TURNSTILE_HEADLESS: ${TURNSTILE_HEADLESS:-false}
       TURNSTILE_DISABLE_BROWSER_SANDBOX: ${TURNSTILE_DISABLE_BROWSER_SANDBOX:-false}
       TURNSTILE_BROWSER_CONCURRENCY: ${TURNSTILE_BROWSER_CONCURRENCY:-2}
       TURNSTILE_BROWSER_QUEUE_LIMIT: ${TURNSTILE_BROWSER_QUEUE_LIMIT:-20}
       TURNSTILE_BROWSER_SMOKE_ON_START: ${TURNSTILE_BROWSER_SMOKE_ON_START:-true}
       UPSTREAM_BROWSER_SESSION_TTL_HOURS: ${UPSTREAM_BROWSER_SESSION_TTL_HOURS:-168}
+      DISPLAY: ${DISPLAY:-:99}
+      NOVNC_ENABLED: ${NOVNC_ENABLED:-true}
+      NOVNC_GEOMETRY: ${NOVNC_GEOMETRY:-1600x900x24}
+      BROWSER_WORKSPACE_URL: ${BROWSER_WORKSPACE_URL:-http://localhost:6080/vnc.html?autoconnect=true&resize=remote&reconnect=true&path=websockify}
       MIHOMO_CONTROLLER_URL: http://mihomo:9090
       MIHOMO_SECRET: ${MIHOMO_SECRET:?MIHOMO_SECRET must be set in .env}
       MIHOMO_SHARED_DIR: /shared-proxy
@@ -66,6 +71,12 @@ services:
       - frosted-proxy:/shared-proxy
     networks:
       - proxy-internal
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
 
 volumes:
   frosted-data:

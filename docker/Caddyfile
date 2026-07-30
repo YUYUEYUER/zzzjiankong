@@ -1,0 +1,51 @@
+{
+	admin off
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	handle /browser {
+		redir /browser/ 308
+	}
+
+	handle_path /browser/* {
+		forward_auth {
+			uri /api/browser-access
+			dynamic a frosted-console 8787 {
+				refresh 5s
+				resolvers 127.0.0.11
+				versions ipv4
+			}
+		}
+		reverse_proxy {
+			dynamic a frosted-console 6080 {
+				refresh 5s
+				resolvers 127.0.0.11
+				versions ipv4
+			}
+		}
+	}
+
+	handle {
+		reverse_proxy {
+			dynamic a frosted-console 8787 {
+				refresh 5s
+				resolvers 127.0.0.11
+				versions ipv4
+			}
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

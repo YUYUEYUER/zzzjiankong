@@ -14,6 +14,18 @@ function resolveTurnstileApiKey(solver) {
   return process.env.TURNSTILE_SOLVER_API_KEY || "";
 }
 
+function browserWorkspaceUrl(value) {
+  const url = String(value || "").trim();
+  if (url.startsWith("/") && !url.startsWith("//")) return url;
+  try {
+    const parsed = new URL(url);
+    const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname.toLowerCase());
+    return loopback && ['http:', 'https:'].includes(parsed.protocol) ? parsed.href : "";
+  } catch {
+    return "";
+  }
+}
+
 const turnstileSolver = String(process.env.TURNSTILE_SOLVER || "browser").toLowerCase();
 
 export const config = {
@@ -26,6 +38,7 @@ export const config = {
   adminUsername: process.env.ADMIN_USERNAME || "admin",
   authDisabled: process.env.AUTH_DISABLED === "true",
   trustProxy: process.env.TRUST_PROXY === "true",
+  browserWorkspaceUrl: browserWorkspaceUrl(process.env.BROWSER_WORKSPACE_URL),
   dashboardTurnstileSiteKey: process.env.DASHBOARD_TURNSTILE_SITE_KEY || "",
   dashboardTurnstileSecretKey: process.env.DASHBOARD_TURNSTILE_SECRET_KEY || "",
   seedDemo: process.env.SEED_DEMO

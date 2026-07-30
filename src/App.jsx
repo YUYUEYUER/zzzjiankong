@@ -44,6 +44,7 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] = useState('notifications');
   const [busyAccount, setBusyAccount] = useState('');
+  const [openingAccount, setOpeningAccount] = useState('');
   const [busyUpstream, setBusyUpstream] = useState('');
   const [loginBusy, setLoginBusy] = useState(false);
   const [loginError, setLoginError] = useState('');
@@ -166,6 +167,22 @@ export function App() {
     }
   };
 
+  const openAccountUpstream = async (account) => {
+    setOpeningAccount(account.id);
+    try {
+      const request = api.openAccountUpstream(account.id);
+      if (dashboard.browserWorkspaceUrl) {
+        window.open(dashboard.browserWorkspaceUrl, 'frosted-upstream-browser', 'noopener,noreferrer');
+      }
+      const job = await request;
+      pushToast(job.status === 'opened' ? '已切换到原上游浏览器窗口' : '正在用原浏览器登录态打开上游', 'success');
+    } catch (error) {
+      pushToast(error.message, 'error');
+    } finally {
+      setOpeningAccount('');
+    }
+  };
+
   const acknowledge = async (id) => {
     try {
       setDashboard(await api.acknowledge(id));
@@ -225,12 +242,14 @@ export function App() {
       <StatusDashboard
         dashboard={dashboard}
         busyAccount={busyAccount}
+        openingAccount={openingAccount}
         busyUpstream={busyUpstream}
         onAddUpstream={() => openUpstreamModal()}
         onEditUpstream={openUpstreamModal}
         onAddAccount={addAccount}
         onEditAccount={openEditAccount}
         onRefreshAccount={refreshAccount}
+        onOpenUpstream={openAccountUpstream}
         onRefreshUpstream={refreshUpstream}
         onSettings={() => { setSettingsInitialTab('notifications'); setSettingsOpen(true); }}
         onLogout={logout}
@@ -238,7 +257,7 @@ export function App() {
         onLoadKeyDetails={api.accountKeyDetails}
       />
       <UpstreamModal open={upstreamModal} editingUpstream={editingUpstream} proxyPool={dashboard.proxyPool} onClose={closeUpstreamModal} onSaved={upstreamSaved} onDeleted={upstreamDeleted} onOpenProxySettings={() => { closeUpstreamModal(); setSettingsInitialTab('proxy'); setSettingsOpen(true); }} pushToast={pushToast} />
-      <QuickAccountModal open={quickAccountOpen} upstreams={dashboard.upstreams} defaultUpstreamId={defaultUpstreamId} onClose={() => setQuickAccountOpen(false)} onSaved={accountSaved} onAdvanced={openAdvancedAccount} pushToast={pushToast} />
+      <QuickAccountModal open={quickAccountOpen} upstreams={dashboard.upstreams} defaultUpstreamId={defaultUpstreamId} browserWorkspaceUrl={dashboard.browserWorkspaceUrl} onClose={() => setQuickAccountOpen(false)} onSaved={accountSaved} onAdvanced={openAdvancedAccount} pushToast={pushToast} />
       <AccountModal open={accountModal} editingAccount={editingAccount} initialDraft={advancedDraft} upstreams={dashboard.upstreams} defaultUpstreamId={defaultUpstreamId} onClose={closeAccountModal} onSaved={accountSaved} pushToast={pushToast} turnstileSolver={dashboard.turnstileSolver} />
       <SettingsModal open={settingsOpen} settings={dashboard.settings} proxyPool={dashboard.proxyPool} initialTab={settingsInitialTab} session={session} onSessionChanged={async () => setSession(await api.session())} onClose={() => setSettingsOpen(false)} onSaved={(settings) => setDashboard((current) => ({ ...current, settings }))} onProxyPoolChanged={async (proxyPool) => { setDashboard((current) => ({ ...current, proxyPool })); await loadDashboard(true); }} pushToast={pushToast} />
       <Toasts toasts={toasts} dismiss={(id) => setToasts((current) => current.filter((toast) => toast.id !== id))} />

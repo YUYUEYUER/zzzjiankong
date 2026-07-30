@@ -19,7 +19,7 @@ function defaults(upstreamName = '') {
   };
 }
 
-export function QuickAccountModal({ open, upstreams, defaultUpstreamId, onClose, onSaved, onAdvanced, pushToast }) {
+export function QuickAccountModal({ open, upstreams, defaultUpstreamId, browserWorkspaceUrl = '', onClose, onSaved, onAdvanced, pushToast }) {
   const [form, setForm] = useState(defaults());
   const [busy, setBusy] = useState('');
   const [preview, setPreview] = useState(null);
@@ -128,7 +128,11 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, onClose,
     setImportError('');
     if (sessionFileInputRef.current) sessionFileInputRef.current.value = '';
     try {
-      const job = await api.startUpstreamLogin({ type: 'sub2api', baseUrl });
+      const request = api.startUpstreamLogin({ type: 'sub2api', baseUrl });
+      if (browserWorkspaceUrl) {
+        window.open(browserWorkspaceUrl, 'frosted-upstream-browser', 'noopener,noreferrer');
+      }
+      const job = await request;
       setForm((current) => ({
         ...current,
         baseUrl,
@@ -256,7 +260,7 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, onClose,
             {browserLoginCaptured ? <CheckCircle size={20} weight="fill" /> : busy === 'browser' || browserLoginWaiting ? <SpinnerGap className="spin" size={20} /> : <SignIn size={20} />}
             <span>
               <strong>{browserLoginCaptured ? (form.browserLogin.captureMode === 'tokens' ? '已取得浏览器 AT / RT' : '已取得浏览器 CK') : browserLoginWaiting ? '等待你在内置浏览器完成登录' : '打开内置浏览器登录'}</strong>
-              <small>{form.browserLogin?.error || form.browserLogin?.message || '弹出独立 Chromium 窗口，正常完成 CF 与账号登录'}</small>
+              <small>{form.browserLogin?.error || form.browserLogin?.message || (browserWorkspaceUrl ? '在服务器有头浏览器中完成 CF 与账号登录' : '弹出独立 Chromium 窗口，正常完成 CF 与账号登录')}</small>
             </span>
             <em>{browserLoginCaptured ? '已就绪' : browserLoginWaiting ? '等待中' : form.browserLogin ? '重试' : '打开'}</em>
           </button>

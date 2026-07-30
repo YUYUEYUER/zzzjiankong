@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   ArrowClockwise,
+  ArrowSquareOut,
   Bell,
   CaretDown,
   CaretRight,
@@ -173,7 +174,7 @@ function AccountDetails({ account, state, onEdit }) {
   );
 }
 
-function AccountRow({ account, expanded, detailState, onToggle, onRefresh, onEdit, busy }) {
+function AccountRow({ account, expanded, detailState, onToggle, onRefresh, onOpenUpstream, onEdit, busy, opening }) {
   return (
     <div className={`status-account ${expanded ? 'expanded' : ''}`}>
       <div className="status-account-main">
@@ -191,6 +192,9 @@ function AccountRow({ account, expanded, detailState, onToggle, onRefresh, onEdi
           <span className={`status-label ${account.status}`}>{statusCopy(account.status)}</span>
         </button>
         <div className="status-account-actions">
+          {account.type === 'sub2api' && account.hasBrowserSession && !account.demo && <button className="quiet-icon-button" type="button" onClick={() => onOpenUpstream(account)} disabled={opening} title="进入上游（复用原浏览器登录态）" aria-label={`进入 ${account.name} 上游`}>
+            <ArrowSquareOut size={18} />
+          </button>}
           <button className="quiet-icon-button" type="button" onClick={() => onRefresh(account.id)} disabled={busy} title="立即同步" aria-label={`同步 ${account.name}`}>
             <ArrowClockwise className={busy ? 'spin' : ''} size={18} />
           </button>
@@ -236,12 +240,14 @@ function IncidentHistory({ incidents, onAcknowledge }) {
 export function StatusDashboard({
   dashboard,
   busyAccount,
+  openingAccount,
   busyUpstream,
   onAddUpstream,
   onEditUpstream,
   onAddAccount,
   onEditAccount,
   onRefreshAccount,
+  onOpenUpstream,
   onRefreshUpstream,
   onSettings,
   onLogout,
@@ -362,8 +368,10 @@ export function StatusDashboard({
                       detailState={detailStates[account.id]}
                       onToggle={() => toggleAccount(account)}
                       onRefresh={onRefreshAccount}
+                      onOpenUpstream={onOpenUpstream}
                       onEdit={onEditAccount}
                       busy={busyAccount === account.id}
+                      opening={openingAccount === account.id}
                     />
                   )) : <button className="empty-account-row" type="button" onClick={() => onAddAccount(upstream.id)}><Plus size={17} />添加第一个监控账号</button>}
                 </div>

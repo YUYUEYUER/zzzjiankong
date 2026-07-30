@@ -42,6 +42,7 @@ import {
   getUpstreamLogin,
   getUpstreamLoginCredential,
   shutdownUpstreamLogins,
+  startUpstreamBrowserSession,
   startUpstreamLogin,
   updateUpstreamLoginCredential,
 } from './upstream-login.js';
@@ -301,6 +302,7 @@ function dashboard() {
     settings: publicSettings(data.settings),
     proxyPool: proxyPool.publicState(),
     turnstileSolver: getTurnstileSolverStatus(config),
+    browserWorkspaceUrl: config.browserWorkspaceUrl,
     summary: {
       totalCny: accounts.reduce((sum, account) => sum + Number(account.convertedCny || 0), 0),
       healthy: accounts.filter((account) => account.status === 'healthy').length,
@@ -479,6 +481,11 @@ app.post('/api/session/logout', (req, res) => {
 
 app.use('/api', authRequired);
 
+app.get('/api/browser-access', (req, res) => {
+  if (!config.browserWorkspaceUrl) return res.status(404).json({ message: '远程浏览器工作区未启用' });
+  return res.status(204).end();
+});
+
 app.post('/api/upstream-logins', (req, res) => {
   const input = upstreamLoginSchema.parse(req.body);
   res.status(202).json(startUpstreamLogin(input));
@@ -492,6 +499,48 @@ app.delete('/api/upstream-logins/:id', asyncRoute(async (req, res) => {
   const cancelled = await cancelUpstreamLogin(req.params.id);
   if (!cancelled) return res.status(404).json({ message: '登录任务不存在或已经结束' });
   res.status(204).end();
+}));
+
+app.post('/api/accounts/:id/open-upstream', asyncRoute(async (req, res) => {
+  const account = store.snapshot().accounts.find((item) => item.id === req.params.id);
+  if (!account) return res.status(404).json({ message: '账号不存在' });
+  if (account.demo) return res.status(400).json({ message: '演示账号没有可进入的上游会话' });
+  if (account.type !== 'sub2api') return res.status(400).json({ message: '当前仅支持进入 Sub2API 浏览器会话' });
+
+  let secret;
+  try {
+    secret = decryptSecret(account.encryptedSecret);
+  } catch {
+    return res.status(422).json({ message: '账号凭据无法解密，请重新保存浏览器登录态' });
+  }
+  if (!secret.sessionCookie && !secret.browserProfileId) {
+    return res.status(409).json({ message: '该账号没有保存浏览器登录态' });
+  }
+  if (secret.browserSessionOrigin && !sameOrigin(secret.browserSessionOrigin, account.baseUrl)) {
+    return res.status(409).json({ message: '保存的浏览器登录态与当前上游地址不一致' });
+  }
+  if (secret.sessionCookie && !secret.browserSessionOrigin && !secret.browserProfileId) {
+    return res.status(409).json({ message: '保存的 Cookie 缺少上游来源，请重新建立浏览器登录态' });
+  }
+
+  const job = startUpstreamBrowserSession({
+    type: account.type,
+    baseUrl: account.baseUrl,
+    sessionCookie: secret.browserSessionOrigin && sameOrigin(secret.browserSessionOrigin, account.baseUrl)
+      ? secret.sessionCookie
+      : '',
+  });
+  await store.mutate((data) => {
+    data.audit.unshift({
+      id: crypto.randomUUID(),
+      type: 'account.upstream_opened',
+      accountId: account.id,
+      upstreamId: account.upstreamId,
+      at: new Date().toISOString(),
+      details: { browserSessionReused: true },
+    });
+  });
+  res.status(202).json(job);
 }));
 
 app.get('/api/security', (req, res) => {

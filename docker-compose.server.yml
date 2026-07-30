@@ -1,0 +1,34 @@
+services:
+  frosted-console:
+    environment:
+      APP_ORIGIN: https://${DOMAIN:?DOMAIN must be set in .env}
+      TRUST_PROXY: "true"
+      TURNSTILE_HEADLESS: "false"
+      NOVNC_ENABLED: "true"
+      BROWSER_WORKSPACE_URL: "/browser/vnc.html?autoconnect=true&resize=remote&reconnect=true&path=browser%2Fwebsockify"
+    expose:
+      - "8787"
+      - "6080"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      frosted-console:
+        condition: service_healthy
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN must be set in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - frosted-caddy-data:/data
+      - frosted-caddy-config:/config
+    networks:
+      - proxy-internal
+
+volumes:
+  frosted-caddy-data:
+  frosted-caddy-config:
