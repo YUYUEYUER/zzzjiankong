@@ -219,6 +219,7 @@ test('New API account access token enumerates per-key usage and group multiplier
 
 test('Sub2API account session enumerates every key and available group rate without exposing tokens', async () => {
   const originalFetch = global.fetch;
+  let usageRequestBody;
   global.fetch = async (url, options = {}) => {
     const pathname = new URL(String(url)).pathname;
     if (pathname !== '/api/v1/settings/public') {
@@ -255,6 +256,20 @@ test('Sub2API account session enumerates every key and available group rate with
         status: 200, headers: { 'content-type': 'application/json' },
       });
     }
+    if (pathname === '/api/v1/usage/dashboard/api-keys-usage') {
+      assert.equal(options.method, 'POST');
+      assert.equal(options.headers['Content-Type'], 'application/json');
+      usageRequestBody = JSON.parse(options.body);
+      return new Response(JSON.stringify({
+        code: 0,
+        data: {
+          stats: {
+            1: { api_key_id: 1, today_actual_cost: 1.25, total_actual_cost: 8.5 },
+            2: { api_key_id: 2, today_actual_cost: 0.5, total_actual_cost: 3.75 },
+          },
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
     if (pathname === '/api/v1/settings/public') {
       return new Response(JSON.stringify({ code: 0, data: { server_timezone: 'UTC' } }), {
         status: 200, headers: { 'content-type': 'application/json' },
@@ -282,12 +297,71 @@ test('Sub2API account session enumerates every key and available group rate with
     assert.equal(details.groups[0].effectiveRateMultiplier, 0.65);
     assert.equal(details.groups[1].peakRateEnabled, true);
     assert.equal(details.keys[0].rawBalance, 14);
+    assert.equal(details.keys[0].quotaUsed, 6);
+    assert.equal(details.keys[0].totalUsed, 8.5);
+    assert.equal(details.keys[0].todayActualCost, 1.25);
+    assert.equal(details.keys[0].usageSource, 'sub2api_usage_stats');
     assert.equal(details.keys[0].rateMultiplier, 0.65);
     assert.equal(details.keys[1].status, 'unlimited');
+    assert.equal(details.keys[1].totalUsed, 3.75);
     assert.equal(details.keys[1].tokenGroup, 'Codex');
+    assert.equal(details.usageStatsStatus, 'available');
+    assert.deepEqual(usageRequestBody, { api_key_ids: [1, 2] });
     const serialized = JSON.stringify(details);
     assert.doesNotMatch(serialized, /private-sub2|sk-account-secret/);
     assert.match(details.keys[0].maskedToken, /1111$/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Sub2API account session falls back to the key quota counter when usage stats are unavailable', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    const pathname = new URL(String(url)).pathname;
+    if (pathname === '/api/v1/auth/me') {
+      return new Response(JSON.stringify({ code: 0, data: { balance: 12, status: 'active' } }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (pathname === '/api/v1/keys') {
+      return new Response(JSON.stringify({
+        code: 0,
+        data: {
+          total: 1,
+          items: [{ id: 9, key: 'sk-fallback-secret-9999', name: 'fallback', status: 'active', quota: 20, quota_used: 4.5 }],
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (pathname === '/api/v1/groups/available') {
+      return new Response(JSON.stringify({ code: 0, data: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (pathname === '/api/v1/groups/rates') {
+      return new Response(JSON.stringify({ code: 0, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (pathname === '/api/v1/settings/public') {
+      return new Response(JSON.stringify({ code: 0, data: { server_timezone: 'UTC' } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ code: 404, message: 'not found' }), {
+      status: 404, headers: { 'content-type': 'application/json' },
+    });
+  };
+  try {
+    const details = await collectApiKeyDetails({
+      id: 'account-sub2-fallback',
+      name: 'Sub2 fallback',
+      type: 'sub2api',
+      authMode: 'access_token',
+      baseUrl: 'https://sub2.example.com',
+      profilePath: '/api/v1/auth/me',
+      balancePath: 'data.balance',
+    }, { accessToken: 'private-fallback-token' });
+
+    assert.equal(details.usageStatsStatus, 'unavailable');
+    assert.equal(details.keys[0].totalUsed, 4.5);
+    assert.equal(details.keys[0].usageStatsStatus, 'unavailable');
+    assert.equal(details.keys[0].usageSource, 'sub2api_key_quota');
+    assert.doesNotMatch(JSON.stringify(details), /private-fallback|sk-fallback-secret/);
   } finally {
     global.fetch = originalFetch;
   }

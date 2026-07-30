@@ -85,9 +85,19 @@ function GroupRateRow({ group }) {
 function KeyDetailRow({ item, account }) {
   const metadata = item.metadata || item;
   const available = item.status !== 'error' && item.ok !== false;
-  const balance = item.convertedCny ?? item.balanceCny;
+  const usesNativeSub2Usage = ['sub2api_usage_stats', 'sub2api_key_quota'].includes(metadata.usageSource);
+  const balance = usesNativeSub2Usage ? null : item.convertedCny ?? item.balanceCny;
   const rawBalance = item.rawBalance ?? metadata.rawBalance;
-  const used = metadata.totalUsed ?? metadata.quotaUsed ?? metadata.usedQuota ?? metadata.used ?? metadata.usage;
+  const used = metadata.totalActualCost ?? metadata.totalUsed ?? metadata.quotaUsed ?? metadata.usedQuota ?? metadata.used ?? metadata.usage;
+  const todayUsed = finiteNumber(metadata.todayActualCost);
+  const usageUnit = item.unit || metadata.unit || account.rawUnit || '';
+  const remainingLabel = metadata.unlimitedQuota
+    ? '无限额度'
+    : finiteNumber(balance) !== null
+      ? money(balance)
+      : finiteNumber(rawBalance) !== null
+        ? `${compactNumber(rawBalance)} ${usageUnit}`
+        : '暂未获取';
   return (
     <div className="key-detail-row">
       <div className="key-identity">
@@ -99,11 +109,12 @@ function KeyDetailRow({ item, account }) {
       </div>
       <div className="key-metric">
         <span>剩余额度</span>
-        <strong>{finiteNumber(balance) !== null ? money(balance) : finiteNumber(rawBalance) !== null ? `${compactNumber(rawBalance)} ${account.rawUnit || ''}` : '暂未获取'}</strong>
+        <strong>{remainingLabel}</strong>
       </div>
       <div className="key-metric">
-        <span>已使用</span>
-        <strong>{finiteNumber(used) !== null ? compactNumber(used) : '暂未获取'}</strong>
+        <span>累计已用</span>
+        <strong>{finiteNumber(used) !== null ? `${compactNumber(used)} ${usageUnit}` : '暂未获取'}</strong>
+        {todayUsed !== null && <small>今日 {compactNumber(todayUsed)} {usageUnit}</small>}
       </div>
       <div className="key-metric">
         <span>倍率</span>

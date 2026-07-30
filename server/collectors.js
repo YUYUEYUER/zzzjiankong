@@ -2009,7 +2009,52 @@ function sub2AccountKeyStatus(item, remaining, unlimited) {
   return { status: 'available', ok: true, message: '' };
 }
 
-function sub2AccountKeyItem(item, index, groupRatesById) {
+function sub2UsageStats(body = {}) {
+  const data = sub2PanelData(body);
+  const rawStats = data?.stats;
+  const entries = Array.isArray(rawStats)
+    ? rawStats.map((item) => [item?.api_key_id, item])
+    : Object.entries(rawStats && typeof rawStats === 'object' ? rawStats : {});
+  const stats = new Map();
+  for (const [rawId, item] of entries) {
+    if (!item || typeof item !== 'object') continue;
+    const id = Number(item.api_key_id ?? rawId);
+    if (!Number.isSafeInteger(id) || id <= 0) continue;
+    stats.set(String(id), {
+      apiKeyId: id,
+      todayActualCost: finiteDetailNumber(item.today_actual_cost),
+      totalActualCost: finiteDetailNumber(item.total_actual_cost),
+    });
+  }
+  return stats;
+}
+
+async function collectSub2ApiKeyUsageStats(root, headers, items) {
+  const ids = [...new Set(items
+    .map((item) => Number(item?.id))
+    .filter((id) => Number.isSafeInteger(id) && id > 0))];
+  if (!ids.length) return new Map();
+
+  const batches = [];
+  for (let index = 0; index < ids.length; index += 100) batches.push(ids.slice(index, index + 100));
+  const results = await Promise.all(batches.map(async (apiKeyIds) => {
+    const result = await requestJson(`${root}/api/v1/usage/dashboard/api-keys-usage`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key_ids: apiKeyIds }),
+    });
+    assertSuccess(result.response, result.body);
+    return sub2UsageStats(result.body);
+  }));
+
+  const merged = new Map();
+  for (const result of results) {
+    for (const [id, stats] of result) merged.set(id, stats);
+  }
+  return merged;
+}
+
+function sub2AccountKeyItem(item, index, groupRatesById, usageStats, usageStatsStatus) {
   const maskedToken = maskApiTokenReference(item?.key || '');
   const quotaLimit = nonnegativeFiniteNumber(item?.quota) ?? 0;
   const quotaUsed = nonnegativeFiniteNumber(item?.quota_used) ?? 0;
@@ -2017,6 +2062,11 @@ function sub2AccountKeyItem(item, index, groupRatesById) {
   const remaining = unlimited ? null : Math.max(0, quotaLimit - quotaUsed);
   const groupRate = groupRatesById.get(String(item?.group_id ?? ''));
   const status = sub2AccountKeyStatus(item, remaining, unlimited);
+  const actualUsage = usageStats.get(String(item?.id ?? ''));
+  const totalActualCost = actualUsage?.totalActualCost ?? null;
+  const todayActualCost = actualUsage?.todayActualCost ?? null;
+  const hasOfficialUsage = totalActualCost !== null || todayActualCost !== null;
+  const totalUsed = totalActualCost ?? quotaUsed;
   return {
     slot: index + 1,
     label: `${String(item?.name || `Key ${index + 1}`)} · ${maskedToken}`,
@@ -2027,12 +2077,18 @@ function sub2AccountKeyItem(item, index, groupRatesById) {
     unit: 'USD',
     balanceScope: 'api_key',
     totalGranted: unlimited ? null : quotaLimit,
-    totalUsed: quotaUsed,
-    used: quotaUsed,
+    totalUsed,
+    used: totalUsed,
     remaining,
     quotaLimit: unlimited ? null : quotaLimit,
     quotaUsed,
     unlimitedQuota: unlimited,
+    todayActualCost,
+    totalActualCost,
+    usageStatsStatus: hasOfficialUsage
+      ? 'available'
+      : usageStatsStatus === 'available' ? 'unavailable' : usageStatsStatus,
+    usageSource: hasOfficialUsage ? 'sub2api_usage_stats' : 'sub2api_key_quota',
     tokenName: String(item?.name || ''),
     groupId: item?.group_id ?? null,
     tokenGroup: groupRate?.name || (item?.group_id == null ? '未绑定' : `分组 ${item.group_id}`),
@@ -2132,7 +2188,23 @@ async function collectSub2ApiAccountKeyDetails(account, secret, inspectedAt) {
   const groupRatesById = new Map(groupRates.map((group) => [String(group.id), group]));
   const keyData = sub2PanelData(keysResult.body);
   const items = Array.isArray(keyData?.items) ? keyData.items.filter((item) => item && typeof item === 'object') : [];
-  const keys = items.map((item, index) => sub2AccountKeyItem(item, index, groupRatesById));
+  let usageStats = new Map();
+  let usageStatsStatus = 'available';
+  try {
+    usageStats = await collectSub2ApiKeyUsageStats(root, headers, items);
+  } catch (error) {
+    usageStatsStatus = isCloudflareChallenge(error) ? 'challenge' : 'unavailable';
+  }
+  const keys = items.map((item, index) => sub2AccountKeyItem(
+    item,
+    index,
+    groupRatesById,
+    usageStats,
+    usageStatsStatus,
+  ));
+  if (usageStatsStatus === 'available' && keys.some((key) => key.usageStatsStatus !== 'available')) {
+    usageStatsStatus = usageStats.size ? 'partial' : 'unavailable';
+  }
   const available = keys.filter((key) => key.ok).length;
   const total = nonnegativeFiniteNumber(keyData?.total);
   return {
@@ -2145,6 +2217,7 @@ async function collectSub2ApiAccountKeyDetails(account, secret, inspectedAt) {
     keys,
     groups: groupRates,
     groupRateStatus,
+    usageStatsStatus,
     serverTimezone: timezone,
     summary: { available, unavailable: keys.length - available },
     message: total !== undefined && total > keys.length ? `当前展示前 ${keys.length} 个 Key` : '',
