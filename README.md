@@ -115,25 +115,83 @@ npm start
 
 ## Docker 部署
 
-### Linux 服务器 + 域名一键部署
+### Linux 服务器 + 域名一键构建（推荐）
 
-准备一台已安装 Docker Engine 与 Compose 插件的 Linux 服务器，将域名的 `A`/`AAAA` 记录指向该服务器，并放行 TCP `80`、TCP `443` 和 UDP `443`。进入项目目录后执行：
+标准部署不需要手动创建 `.env`、生成密钥或编写 Caddy 配置。先准备一台已安装 Docker Engine、Compose v2 与 OpenSSL 的 Linux x86_64 服务器，然后完成以下操作：
+
+1. 将域名的 `A`/`AAAA` 记录指向服务器公网地址。
+2. 防火墙放行 TCP `80`、TCP `443`、UDP `443` 和仅供管理使用的 SSH 端口。
+3. 获取代码并执行一键脚本：
 
 ```bash
+git clone https://github.com/YUYUEYUER/zzzjiankong.git frosted-console
+cd frosted-console
 chmod +x deploy-linux.sh
 ./deploy-linux.sh panel.example.com
 ```
 
-脚本会自动生成并保留 `MASTER_KEY`、`SESSION_SECRET`、`MIHOMO_SECRET` 和一次性 `BOOTSTRAP_TOKEN`，构建完整生产页面，启动霜镜、Mihomo、Caddy 和有头浏览器工作区。Caddy 会自动申请和续期 HTTPS 证书；完成后访问 `https://panel.example.com`，首次打开页面填写引导令牌并设置管理员账号。
+已经进入项目目录时只需执行最后两行；也可以直接运行 `./deploy-linux.sh`，再根据提示输入域名。脚本会自动：
 
-重复执行同一命令可更新部署，不会更换已有密钥或清空数据。更新时会整组重建容器，Caddy 同时通过 Docker 内置 DNS 动态刷新霜镜地址，避免应用容器 IP 变化后出现代理中断。查看运行状态与日志：
+- 创建权限为 `600` 的 `.env`，生成并保留 `MASTER_KEY`、`SESSION_SECRET`、`MIHOMO_SECRET` 和一次性 `BOOTSTRAP_TOKEN`。
+- 写入域名、HTTPS 来源、可信代理和有头浏览器工作区配置。
+- 校验 Compose 配置，构建生产镜像并启动霜镜、Mihomo、Caddy 与有头 Chromium。
+- 等待应用健康检查通过，随后显示访问地址、配置文件位置和首次初始化令牌。
+
+Caddy 会自动申请和续期 HTTPS 证书。脚本成功后访问 `https://panel.example.com`，填写终端显示的引导令牌，自拟管理员用户名和强密码，即可进入完整控制台。
+
+#### 首次配置顺序
+
+1. 使用引导令牌初始化管理员，登录后在“系统设置 → 账户安全”启用 TOTP 并保存恢复码。
+2. 在“上游”中新建站点并选择直连或固定代理策略。
+3. 在对应上游下新增账号，优先使用 API Key/Access Token；需要网页验证时点击“打开内置浏览器登录”。
+4. 按需在“系统设置”配置 Clash 订阅、Resend、飞书和面板 Turnstile。
+
+普通部署只需填写域名和首次管理员信息。以下配置仅在对应功能启用时修改 `.env`：
+
+| 配置 | 何时修改 | 推荐值或入口 |
+|---|---|---|
+| `DOMAIN`、`APP_ORIGIN` | 更换面板域名 | 重新运行 `./deploy-linux.sh 新域名` |
+| `DASHBOARD_TURNSTILE_SITE_KEY`、`DASHBOARD_TURNSTILE_SECRET_KEY` | 需要保护面板登录 | Cloudflare Turnstile 控制台生成 |
+| `UPSTREAM_ALLOWED_HOSTS` | 必须访问明确的内网上游 | 只填写精确主机名，多个用逗号分隔 |
+| `TURNSTILE_BROWSER_CONCURRENCY` | 调整自动验证并发 | 默认 `2`，范围 `1-4` |
+| `UPSTREAM_BROWSER_MAX_ACTIVE` | 调整人工有头浏览器并发 | 默认 `2`，按内存容量增加 |
+| Resend、飞书、Clash 订阅 | 启用通知或代理池 | 登录后直接在页面配置 |
+
+不要手动修改已经投入使用的 `MASTER_KEY`。需要轮换时使用文末的密钥轮换脚本。
+
+#### 更新、状态与日志
+
+更新前先备份，然后重复执行同一个部署命令。脚本会保留已有密钥和 Docker 数据卷，不会清空账号或浏览器资料：
 
 ```bash
+./backup-linux.sh
+git pull --ff-only
+./deploy-linux.sh panel.example.com
+
 docker compose -f docker-compose.yml -f docker-compose.server.yml ps
 docker compose -f docker-compose.yml -f docker-compose.server.yml logs -f --tail=200
 ```
 
+更新时会重建容器，Caddy 通过 Docker 内置 DNS 自动刷新霜镜地址，避免应用容器 IP 变化后代理中断。
+
 域名部署仅向宿主机发布 Caddy 的 `80/443`；霜镜的 `8787`、浏览器工作区的 `6080`、Mihomo 控制器和动态代理端口只存在于 Docker 内部网络。浏览器工作区只能通过带登录鉴权的 `/browser/*` 路径访问。
+
+### 手动配置与构建
+
+只有在需要预先填写全部环境变量、接入已有反向代理或调试 Compose 时才使用手动流程：
+
+1. 将 `.env.example` 复制为 `.env`，设置 `DOMAIN` 和 `APP_ORIGIN=https://你的域名`。
+2. 分别执行 `openssl rand -hex 32`，替换 `MASTER_KEY`、`SESSION_SECRET`、`MIHOMO_SECRET` 和 `BOOTSTRAP_TOKEN`。
+3. 保持 `AUTH_DISABLED=false`、`TRUST_PROXY=true`、`SEED_DEMO=false`、`TURNSTILE_HEADLESS=false`。
+4. 先校验配置，再构建并启动：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.server.yml config --quiet
+docker compose -f docker-compose.yml -f docker-compose.server.yml up -d --build --remove-orphans
+docker compose -f docker-compose.yml -f docker-compose.server.yml ps
+```
+
+手动流程与一键脚本使用相同的 Compose 文件和数据卷，可以随时改回运行 `deploy-linux.sh` 管理。
 
 ### 本机 Docker
 
@@ -318,13 +376,13 @@ npm test
 npm run build
 ```
 
-### 生产服务器配置
+### 生产服务器资源与网络
 
 最低建议：Linux x86_64、Docker Engine 24+ 与 Compose v2、4 vCPU、8 GB 内存、40 GB SSD。启用多个有头 Chromium 会话时，建议 8 vCPU、16 GB 内存；每个并行浏览器槽位预留约 1.5-2 GB 内存。服务器需能访问 Docker Hub、上游站点、`challenges.cloudflare.com` 以及你启用的通知服务；DNS 的 A/AAAA 记录指向服务器，防火墙放行 TCP 80/443 和 UDP 443。
 
 生产部署会启动应用、Mihomo、Caddy 和带 Xvfb/noVNC 的有头浏览器工作区。应用端口 `8787`、工作区端口 `6080`、Mihomo 控制端口与代理监听端口不应暴露到公网；域名访问只经过 Caddy 的 HTTPS。持久化卷必须保留 `frosted-data`、`frosted-backups`、`frosted-proxy`、`frosted-caddy-data` 和 `frosted-caddy-config`。
 
-部署前至少准备 `MASTER_KEY`、`SESSION_SECRET`、`MIHOMO_SECRET` 和长度不少于 32 的 `BOOTSTRAP_TOKEN`，并保持 `AUTH_DISABLED=false`、`TURNSTILE_HEADLESS=false`。首次初始化完成后请妥善保存引导令牌；不要把 `.env`、Docker 卷或浏览器资料目录提交到代码仓库。
+一键脚本会自动准备生产密钥和有头浏览器配置；手动构建时才需要自行填写。首次初始化完成后请妥善保存管理员密码和 TOTP 恢复码；不要把 `.env`、Docker 卷或浏览器资料目录提交到代码仓库。
 
 常用运维命令：
 

@@ -50,6 +50,16 @@ test('the Linux deployment script is UTF-8 with LF line endings', async () => {
   assert.equal(decoded.includes('\uFFFD'), false);
 });
 
+test('one-click Linux deployment generates secrets, builds, and waits for health', async () => {
+  const script = await fs.readFile('deploy-linux.sh', 'utf8');
+  for (const secret of ['MASTER_KEY', 'SESSION_SECRET', 'MIHOMO_SECRET', 'BOOTSTRAP_TOKEN']) {
+    assert.match(script, new RegExp(`ensure_secret ${secret}`));
+  }
+  assert.match(script, /up -d --build --force-recreate --remove-orphans/);
+  assert.match(script, /\.State\.Health/);
+  assert.match(script, /app_health.*healthy/);
+});
+
 test('GitHub Actions dependencies are pinned to full commit SHAs', async () => {
   const workflow = await fs.readFile('.github/workflows/security-regression.yml', 'utf8');
   const references = [...workflow.matchAll(/uses:\s*[^\s#]+@([^\s#]+)/g)].map((match) => match[1]);

@@ -4,6 +4,9 @@ set -Eeuo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 domain="${1:-${DOMAIN:-}}"
+if [[ -z "$domain" && -t 0 ]]; then
+  read -r -p "请输入面板域名（例如 panel.example.com）: " domain
+fi
 if [[ -z "$domain" ]]; then
   echo "用法: ./deploy-linux.sh panel.example.com" >&2
   exit 1
@@ -64,9 +67,38 @@ upsert_env SEED_DEMO "false"
 compose=(docker compose -f docker-compose.yml -f docker-compose.server.yml)
 "${compose[@]}" config --quiet
 "${compose[@]}" up -d --build --force-recreate --remove-orphans
+
+app_container="$("${compose[@]}" ps -q frosted-console)"
+if [[ -z "$app_container" ]]; then
+  echo "霜镜容器未创建，请检查 Docker 日志。" >&2
+  exit 1
+fi
+
+echo "正在等待霜镜通过健康检查..."
+app_health=""
+for ((attempt = 1; attempt <= 180; attempt += 1)); do
+  app_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$app_container" 2>/dev/null || true)"
+  if [[ "$app_health" == "healthy" ]]; then
+    break
+  fi
+  if [[ "$app_health" == "unhealthy" || "$app_health" == "exited" || "$app_health" == "dead" ]]; then
+    "${compose[@]}" logs --tail=120 frosted-console >&2
+    echo "霜镜启动失败，当前状态: $app_health" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+if [[ "$app_health" != "healthy" ]]; then
+  "${compose[@]}" logs --tail=120 frosted-console >&2
+  echo "等待健康检查超时，请根据上方日志排查。" >&2
+  exit 1
+fi
+
 "${compose[@]}" ps
 
 echo
 echo "霜镜已启动: https://$domain"
 echo "首次初始化引导令牌: $(env_value BOOTSTRAP_TOKEN)"
+echo "配置文件: $PWD/.env"
 echo "请确认域名 A/AAAA 记录指向本机，并在防火墙放行 TCP 80/443 与 UDP 443。"
