@@ -5,3 +5,4 @@ data/
 design/
 .npm-cache/
 *.log
+sub2api-session-*.json

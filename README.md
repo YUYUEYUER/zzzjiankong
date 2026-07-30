@@ -4,7 +4,7 @@
 
 ![上游余额监控面板总览](docs/images/01-dashboard.png)
 
-> 文档截图使用虚构账号、掩码 Key 与 `example.com` 域名，不包含真实商家、账号或令牌。
+> 文档截图由隔离的本地样本数据生成，只使用虚构账号、掩码 Key 与 `example.com` 域名，不包含真实商家、账号、余额、令牌或通知地址。
 
 ## 图文快速上手
 
@@ -41,7 +41,7 @@ npm start
 | Sub2API | `sk-` API Key | 通过 `/v1/usage` 读取该 Key 的余额与倍率 |
 | Sub2API | 登录态 JSON 或内置浏览器登录 | 读取账户余额、全部分组倍率及 Key 列表 |
 
-Sub2API 提供三种接入方式：直接填写 API Key、导入登录态 JSON，或点击 **打开内置浏览器登录**。浏览器方式会打开独立的系统 Chrome；你正常完成 Cloudflare 验证与登录后，系统只保存加密后的 AT/RT 或会话 Cookie。
+Sub2API 提供三种接入方式：直接填写 API Key、导入登录态 JSON，或点击 **打开内置浏览器登录**。浏览器方式会打开独立的系统 Chrome；你正常完成 Cloudflare 验证与登录后，AT/RT 或会话 Cookie 会写入应用的加密凭据库。独立 Chrome 配置目录仍可能保留浏览器原生 Cookie、LocalStorage 与缓存，具体边界见下方“浏览器会话数据”。
 
 ![添加 Sub2API 监控账号](docs/images/03-add-sub2-account.png)
 
@@ -54,6 +54,10 @@ Sub2API 提供三种接入方式：直接填写 API Key、导入登录态 JSON�
 
 需要修改接口路径、余额字段、换算公式或阈值时，点击 **高级设置**。
 
+![余额转换公式与告警阈值](docs/images/06-converter.png)
+
+图中示例把 New API quota 按 `x / 500000 * 1` 转换为人民币，并设置 `¥10` 触发、`¥15` 恢复。实际接入时应按上游返回值的单位调整公式；先点击 **测试公式**，确认结果后再保存。
+
 ### 4. 查看余额、倍率和 Key
 
 主页面按上游汇总人民币余额。点击账号条幅展开详情，可查看：
@@ -64,7 +68,7 @@ Sub2API 提供三种接入方式：直接填写 API Key、导入登录态 JSON�
 
 ![查看分组倍率和 API Key](docs/images/04-rates-and-keys.png)
 
-页面和接口不会返回完整 API Key。令牌只在后端加密保存，详情中始终使用掩码显示。
+页面和接口不会返回完整 API Key。应用凭据字段在后端加密保存，详情中始终使用掩码显示；持久 Chrome 配置目录属于单独的浏览器会话存储，不在这项加密承诺内。
 
 ### 5. 配置通知与自动结单
 
@@ -74,6 +78,8 @@ Sub2API 提供三种接入方式：直接填写 API Key、导入登录态 JSON�
 2. 配置飞书群机器人 Webhook，然后单独测试飞书链路。
 3. 保存恢复确认次数和未恢复重复提醒周期。
 4. 余额低于阈值时系统自动建单；手动充值后，连续检测达到恢复阈值便发送恢复通知并结单。
+
+![配置 Resend、飞书与自动结单](docs/images/05-notifications.png)
 
 Resend 和飞书独立记录结果：一个渠道失败不会覆盖另一个渠道的成功状态。
 
@@ -118,6 +124,14 @@ docker compose up -d --build
 运行镜像与项目的 Playwright `1.61.1` 版本严格匹配，内置 Chromium 及系统依赖；入口只以 root 修正旧数据卷权限，随后立即降权到 `pwuser`。Compose 同时加载 Playwright 官方同版本的 seccomp profile，以支持非 root Chromium sandbox。Compose 模式适合无头验证，不提供 VNC；需要人工接管时请在有 GUI/X11/VNC 的受控主机运行并设置 `TURNSTILE_HEADLESS=false`。
 
 数据保存在 Docker 卷 `frosted-data` 中。服务器需允许访问上游域名、`challenges.cloudflare.com`，以及你启用的 Resend/飞书/第三方解题服务。生产环境建议通过 Caddy、Nginx 或 Tailscale 提供 HTTPS 和访问限制。账号凭据锁目前是单进程锁，不要为同一数据卷同时启动多个应用副本。
+
+### 浏览器会话数据
+
+应用数据库中的上游凭据使用 AES-256-GCM 加密；交互登录使用的 Chrome 配置目录位于 `data/upstream-browser-profiles/<站点哈希>-system-chrome/`，其中的 Cookie、LocalStorage 和缓存由 Chrome 自己管理，不再经过应用层加密。`data/` 默认不会进入 Git，但部署时仍应：
+
+- 只允许应用运行用户访问数据目录，并保护磁盘快照、Docker 卷备份和迁移包。
+- 不把浏览器配置目录同步到公开对象存储、日志平台或代码仓库。
+- 账号授权撤销后，同时在上游注销会话；确认不再复用任何浏览器登录态时，停止服务并删除 `data/upstream-browser-profiles/`。
 
 ## 面板登录安全
 
@@ -186,16 +200,29 @@ flowchart LR
 
 ### 默认：真实 Chromium 页面流程
 
-```bash
+将以下配置写入 `.env`：
+
+```dotenv
 TURNSTILE_SOLVER=browser
 TURNSTILE_HEADLESS=false  # 可见浏览器；无桌面服务器运行自动流程时设为 true
 TURNSTILE_DISABLE_BROWSER_SANDBOX=false
 ```
 
-Docker 镜像已内置 Chromium。裸机首次使用时安装浏览器与系统依赖：
+Docker 镜像已内置 Chromium。裸机首次使用时先安装依赖：
 
 ```bash
 npm install
+```
+
+Windows 或 macOS：
+
+```bash
+npx playwright install chromium
+```
+
+Linux：
+
+```bash
 npx playwright install --with-deps chromium
 ```
 
@@ -225,7 +252,9 @@ Cloudflare 官方参考：[服务端验证与 token 生命周期](https://develo
 
 ### 备选：第三方打码
 
-```bash
+将所选服务写入 `.env`：
+
+```dotenv
 TURNSTILE_SOLVER=capsolver
 CAPSOLVER_API_KEY=your-capsolver-key
 
@@ -235,6 +264,26 @@ CAPSOLVER_API_KEY=your-capsolver-key
 ```
 
 第三方服务会接触目标站点 URL、sitekey 和解题任务元数据，使用前应确认上游条款与数据边界。关闭自动处理：`TURNSTILE_SOLVER=none`，改为正式令牌、人工完成浏览器验证或粘贴一次性 Turnstile Token。
+
+## 公开仓库脱敏检查
+
+仓库已经忽略 `.env`、`data/`、`design/` 与日志文件。公开或推送仓库前仍需检查以下内容：
+
+- 不要提交 `.env`、数据卷备份、Clash 订阅、服务日志或浏览器用户目录。
+- Sub2API 登录态 JSON 含 AT/RT，导入后应从下载目录删除；默认文件名 `sub2api-session-*.json` 已加入 `.gitignore`，但仍不应长期保留。
+- 截图只能使用隔离样本；完整 API Key、邮箱、真实域名、Webhook、二维码和余额均应替换或遮盖。
+- 不要把真实令牌写入 issue、提交信息、测试夹具、命令历史或 README 示例。
+- `docs/images/` 仅存放可公开的脱敏图片；`design/` 用于本机设计过程且不会进入 Git。
+
+推送前至少执行：
+
+```bash
+git status --short
+git diff --check
+git grep -n -I -E '(BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|sk-[A-Za-z0-9_-]{20,}|re_[A-Za-z0-9_-]{20,}|/hook/[A-Za-z0-9-]{20,})'
+```
+
+最后一条命令没有输出代表未命中这些常见格式，但仍需人工检查域名、邮箱、无固定前缀的访问令牌和图片内容。
 
 ## 验证
 
