@@ -12,6 +12,7 @@ if [[ "$domain" == *"://"* || "$domain" == */* || ! "$domain" =~ ^[A-Za-z0-9]([A
   echo "域名格式无效，请只填写主机名，例如 panel.example.com" >&2
   exit 1
 fi
+domain="${domain,,}"
 
 command -v docker >/dev/null || { echo "请先安装 Docker Engine 与 Compose 插件" >&2; exit 1; }
 docker compose version >/dev/null
@@ -50,6 +51,7 @@ ensure_secret() {
 ensure_secret MASTER_KEY
 ensure_secret SESSION_SECRET
 ensure_secret MIHOMO_SECRET
+ensure_secret BOOTSTRAP_TOKEN
 upsert_env DOMAIN "$domain"
 upsert_env APP_ORIGIN "https://$domain"
 upsert_env AUTH_DISABLED "false"
@@ -66,4 +68,5 @@ compose=(docker compose -f docker-compose.yml -f docker-compose.server.yml)
 
 echo
 echo "霜镜已启动: https://$domain"
+echo "首次初始化引导令牌: $(env_value BOOTSTRAP_TOKEN)"
 echo "请确认域名 A/AAAA 记录指向本机，并在防火墙放行 TCP 80/443 与 UDP 443。"

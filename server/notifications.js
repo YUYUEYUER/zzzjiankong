@@ -1,3 +1,5 @@
+import { readLimitedBody } from './network-policy.js';
+
 function formatMoney(value) {
   return new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'CNY' }).format(Number(value || 0));
 }
@@ -42,14 +44,16 @@ function notificationCopy(kind, account, incident) {
 }
 
 class ChannelError extends Error {
-  constructor(code, message) {
+  constructor(code, message, { retryable = false, retryAfterMs = 0 } = {}) {
     super(message);
     this.code = code;
+    this.retryable = retryable;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
 async function responseBody(response) {
-  const text = await response.text();
+  const text = await readLimitedBody(response, 64 * 1024);
   if (!text) return {};
   try {
     return JSON.parse(text);
@@ -79,20 +83,37 @@ function configResult(channel, account, settings, secrets, force) {
   return null;
 }
 
-async function sendResend(settings, secrets, copy) {
+function retryAfterMs(response) {
+  const value = response.headers.get('retry-after');
+  if (!value) return 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
+}
+
+async function sendResend(settings, secrets, copy, options = {}) {
   const response = await fetch('https://api.resend.com/emails', {
     method: 'POST',
-    headers: { Authorization: `Bearer ${secrets.resendApiKey}`, 'Content-Type': 'application/json' },
+    headers: {
+      Authorization: `Bearer ${secrets.resendApiKey}`,
+      'Content-Type': 'application/json',
+      ...(options.idempotencyKey ? { 'Idempotency-Key': options.idempotencyKey } : {}),
+    },
     body: JSON.stringify({
       from: settings.resendFrom,
       to: settings.resendTo.split(',').map((item) => item.trim()).filter(Boolean),
       subject: `[霜镜] ${copy.title}`,
       html: `<div style="font-family:system-ui;padding:24px"><h2>${escapeHtml(copy.title)}</h2><p>${escapeHtml(copy.summary)}</p><p style="color:#64748b">霜镜上游余额监控</p></div>`,
     }),
+    signal: AbortSignal.timeout(10_000),
   });
   const body = await responseBody(response);
   if (!response.ok) {
-    throw new ChannelError('provider_rejected', `Resend 拒绝请求 (${response.status})：${concise(body.message, '未提供原因')}`);
+    throw new ChannelError('provider_rejected', `Resend 拒绝请求 (${response.status})：${concise(body.message, '未提供原因')}`, {
+      retryable: response.status === 429 || response.status >= 500,
+      retryAfterMs: retryAfterMs(response),
+    });
   }
   if (!body.id) throw new ChannelError('invalid_response', 'Resend 未返回邮件编号');
   return { externalId: String(body.id), message: 'Resend 已受理' };
@@ -117,10 +138,14 @@ async function sendFeishu(settings, secrets, copy) {
         elements: [{ tag: 'div', text: { tag: 'lark_md', content: copy.summary } }],
       },
     }),
+    signal: AbortSignal.timeout(10_000),
   });
   const body = await responseBody(response);
   if (!response.ok) {
-    throw new ChannelError('provider_rejected', `飞书拒绝请求 (${response.status})：${concise(body.msg || body.StatusMessage, '未提供原因')}`);
+    throw new ChannelError('provider_rejected', `飞书拒绝请求 (${response.status})：${concise(body.msg || body.StatusMessage, '未提供原因')}`, {
+      retryable: response.status === 429 || response.status >= 500,
+      retryAfterMs: retryAfterMs(response),
+    });
   }
   const providerCode = body.code ?? body.StatusCode;
   if (Number(providerCode) !== 0) {
@@ -131,13 +156,13 @@ async function sendFeishu(settings, secrets, copy) {
 
 const senders = { resend: sendResend, feishu: sendFeishu };
 
-async function runChannel(channel, account, settings, secrets, copy, force) {
+async function runChannel(channel, account, settings, secrets, copy, force, options) {
   const startedAt = new Date().toISOString();
   const started = Date.now();
   const blocked = configResult(channel, account, settings, secrets, force);
   if (blocked) return { ...blocked, attemptedAt: null, completedAt: startedAt, durationMs: 0 };
   try {
-    const provider = await senders[channel](settings, secrets, copy);
+    const provider = await senders[channel](settings, secrets, copy, options);
     return {
       status: 'sent',
       attemptedAt: startedAt,
@@ -150,6 +175,8 @@ async function runChannel(channel, account, settings, secrets, copy, force) {
       status: 'failed',
       code: error.code || 'request_failed',
       message: concise(error.message, '发送失败'),
+      retryable: error.retryable ?? ['AbortError', 'TimeoutError', 'TypeError'].includes(error.name),
+      retryAfterMs: Number(error.retryAfterMs || 0),
       attemptedAt: startedAt,
       completedAt: new Date().toISOString(),
       durationMs: Date.now() - started,
@@ -162,7 +189,9 @@ export async function notify(kind, account, incident, settings, secrets, options
   const channels = options.channels || ['resend', 'feishu'];
   const entries = await Promise.all(channels.map(async (channel) => [
     channel,
-    await runChannel(channel, account, settings, secrets, copy, Boolean(options.force)),
+    await runChannel(channel, account, settings, secrets, copy, Boolean(options.force), {
+      idempotencyKey: options.idempotencyKey ? `${options.idempotencyKey}:${channel}` : '',
+    }),
   ]));
   return Object.fromEntries(entries);
 }

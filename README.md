@@ -124,7 +124,7 @@ chmod +x deploy-linux.sh
 ./deploy-linux.sh panel.example.com
 ```
 
-脚本会自动生成并保留 `MASTER_KEY`、`SESSION_SECRET`、`MIHOMO_SECRET`，构建完整生产页面，启动霜镜、Mihomo、Caddy 和有头浏览器工作区。Caddy 会自动申请和续期 HTTPS 证书；完成后访问 `https://panel.example.com`，首次打开页面设置管理员账号。
+脚本会自动生成并保留 `MASTER_KEY`、`SESSION_SECRET`、`MIHOMO_SECRET` 和一次性 `BOOTSTRAP_TOKEN`，构建完整生产页面，启动霜镜、Mihomo、Caddy 和有头浏览器工作区。Caddy 会自动申请和续期 HTTPS 证书；完成后访问 `https://panel.example.com`，首次打开页面填写引导令牌并设置管理员账号。
 
 重复执行同一命令可更新部署，不会更换已有密钥或清空数据。更新时会整组重建容器，Caddy 同时通过 Docker 内置 DNS 动态刷新霜镜地址，避免应用容器 IP 变化后出现代理中断。查看运行状态与日志：
 
@@ -133,16 +133,16 @@ docker compose -f docker-compose.yml -f docker-compose.server.yml ps
 docker compose -f docker-compose.yml -f docker-compose.server.yml logs -f --tail=200
 ```
 
-域名部署仅向公网开放 Caddy 的 `80/443`；霜镜的 `8787` 与浏览器工作区的 `6080` 只绑定服务器回环地址，Mihomo 控制器和动态代理端口只存在于 Docker 内部网络。
+域名部署仅向宿主机发布 Caddy 的 `80/443`；霜镜的 `8787`、浏览器工作区的 `6080`、Mihomo 控制器和动态代理端口只存在于 Docker 内部网络。浏览器工作区只能通过带登录鉴权的 `/browser/*` 路径访问。
 
 ### 本机 Docker
 
 1. 将 `.env.example` 复制为 `.env`。
-2. 至少更换 `MASTER_KEY`、`SESSION_SECRET` 和 `MIHOMO_SECRET`，并保持 `SEED_DEMO=false`。`ADMIN_PASSWORD` 留空时首次打开面板完成管理员初始化。
+2. 至少更换 `MASTER_KEY`、`SESSION_SECRET`、`MIHOMO_SECRET` 和 `BOOTSTRAP_TOKEN`，并保持 `SEED_DEMO=false`。`ADMIN_PASSWORD` 留空时首次打开面板填写引导令牌完成管理员初始化。
 3. 启动服务：
 
 ```bash
-docker compose up -d --build
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 ```
 
 本机访问 `http://localhost:8787`；有头浏览器工作区位于 `http://localhost:6080/vnc.html?autoconnect=true&resize=remote&path=websockify`。
@@ -161,7 +161,7 @@ docker compose up -d --build
 
 ## 面板登录安全
 
-- 首次打开时自拟管理员用户名，页面默认生成满足复杂度要求的强密码。
+- 首次打开时填写部署脚本生成的一次性引导令牌，自拟管理员用户名，页面默认生成满足复杂度要求的强密码。
 - 在 Cloudflare Turnstile 创建站点后，填写 `DASHBOARD_TURNSTILE_SITE_KEY` 和 `DASHBOARD_TURNSTILE_SECRET_KEY`，登录和首次初始化会自动启用人机验证。
 - 登录后进入“系统设置 → 账户安全”扫描二维码启用 TOTP，并离线保存一次性恢复码。
 - 反向代理部署时设置 `APP_ORIGIN=https://你的域名`；仅在可信代理后方设置 `TRUST_PROXY=true`。
@@ -317,3 +317,21 @@ git grep -n -I -E '(BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|sk-[A-Za-z0-9_-]{20,}|
 npm test
 npm run build
 ```
+
+### 生产服务器配置
+
+最低建议：Linux x86_64、Docker Engine 24+ 与 Compose v2、4 vCPU、8 GB 内存、40 GB SSD。启用多个有头 Chromium 会话时，建议 8 vCPU、16 GB 内存；每个并行浏览器槽位预留约 1.5-2 GB 内存。服务器需能访问 Docker Hub、上游站点、`challenges.cloudflare.com` 以及你启用的通知服务；DNS 的 A/AAAA 记录指向服务器，防火墙放行 TCP 80/443 和 UDP 443。
+
+生产部署会启动应用、Mihomo、Caddy 和带 Xvfb/noVNC 的有头浏览器工作区。应用端口 `8787`、工作区端口 `6080`、Mihomo 控制端口与代理监听端口不应暴露到公网；域名访问只经过 Caddy 的 HTTPS。持久化卷必须保留 `frosted-data`、`frosted-backups`、`frosted-proxy`、`frosted-caddy-data` 和 `frosted-caddy-config`。
+
+部署前至少准备 `MASTER_KEY`、`SESSION_SECRET`、`MIHOMO_SECRET` 和长度不少于 32 的 `BOOTSTRAP_TOKEN`，并保持 `AUTH_DISABLED=false`、`TURNSTILE_HEADLESS=false`。首次初始化完成后请妥善保存引导令牌；不要把 `.env`、Docker 卷或浏览器资料目录提交到代码仓库。
+
+常用运维命令：
+
+```bash
+./backup-linux.sh
+./restore-linux.sh /path/to/frosted-console-<timestamp>-<random>.json
+./rotate-master-key-linux.sh
+```
+
+恢复或轮换前会短暂停止应用，完成后自动拉起；保留旧主密钥直到备份恢复验证完成。

@@ -31,6 +31,7 @@ export function LoginScreen({ session, onSetup, onLogin, onVerifyTwoFactor, busy
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [turnstileToken, setTurnstileToken] = useState('');
+  const [bootstrapToken, setBootstrapToken] = useState('');
   const [challengeToken, setChallengeToken] = useState('');
   const [code, setCode] = useState('');
   const turnstileRef = useRef(null);
@@ -52,7 +53,7 @@ export function LoginScreen({ session, onSetup, onLogin, onVerifyTwoFactor, busy
       if (!result) setCode('');
       return;
     }
-    const payload = { username, password, turnstileToken };
+    const payload = { username, password, bootstrapToken, turnstileToken };
     const result = setup ? await onSetup(payload) : await onLogin(payload);
     if (result?.requiresTwoFactor) {
       setChallengeToken(result.challengeToken);
@@ -76,12 +77,13 @@ export function LoginScreen({ session, onSetup, onLogin, onVerifyTwoFactor, busy
             <div className="input-with-icon"><UserCircle size={18} /><input id="admin-username" value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" autoFocus placeholder="3-32 个字符，可自行拟定" /></div>
             <label className="field-label" htmlFor="admin-password">管理员密码</label>
             <div className="input-with-icon password-input"><LockKey size={18} /><input id="admin-password" type={showPassword ? 'text' : 'password'} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={setup ? 'new-password' : 'current-password'} /><button type="button" onClick={() => setShowPassword((value) => !value)} aria-label={showPassword ? '隐藏密码' : '显示密码'}>{showPassword ? <EyeSlash size={17} /> : <Eye size={17} />}</button></div>
+            {setup && session?.bootstrapRequired && <><label className="field-label" htmlFor="bootstrap-token">部署引导令牌</label><div className="input-with-icon"><Key size={18} /><input id="bootstrap-token" type="password" value={bootstrapToken} onChange={(event) => setBootstrapToken(event.target.value)} autoComplete="one-time-code" placeholder="部署终端显示的一次性令牌" /></div></>}
             {setup && <><div className="generated-password-row"><span>已默认生成强密码</span><button type="button" onClick={() => setPassword(generateStrongPassword())}>重新生成</button></div><div className="password-checks">{checks.map(([label, passed]) => <span className={passed ? 'passed' : ''} key={label}><ShieldCheck size={13} weight={passed ? 'fill' : 'regular'} />{label}</span>)}</div></>}
             {session?.turnstile?.enabled && <div className="turnstile-wrap"><Turnstile ref={turnstileRef} siteKey={session.turnstile.siteKey} onSuccess={setTurnstileToken} onExpire={resetTurnstile} onError={resetTurnstile} options={{ action: setup ? 'setup' : 'login', theme: 'light', size: 'flexible' }} /></div>}
           </>}
           {challengeToken && <><label className="field-label" htmlFor="two-factor-code">动态验证码或恢复码</label><div className="input-with-icon"><Key size={18} /><input id="two-factor-code" value={code} onChange={(event) => setCode(event.target.value)} inputMode="numeric" autoComplete="one-time-code" autoFocus placeholder="123456 或 XXXX-XXXX-XXXX" /></div></>}
           {error && <p className="form-error">{error}</p>}
-          <button className="primary-button full" disabled={busy || (challengeToken ? code.length < 6 : !username || !password || (setup && checks.some(([, passed]) => !passed)) || (session?.turnstile?.enabled && !turnstileToken))}>
+          <button className="primary-button full" disabled={busy || (challengeToken ? code.length < 6 : !username || !password || (setup && checks.some(([, passed]) => !passed)) || (setup && session?.bootstrapRequired && !bootstrapToken) || (session?.turnstile?.enabled && !turnstileToken))}>
             {busy ? '正在验证' : challengeToken ? '完成验证' : setup ? '创建管理员并进入' : '继续'} <ArrowRight size={17} />
           </button>
           {challengeToken && <button type="button" className="login-back-button" onClick={() => { setChallengeToken(''); setCode(''); }}>返回密码登录</button>}

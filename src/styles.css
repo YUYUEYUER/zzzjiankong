@@ -544,6 +544,11 @@ td { height: 46px; color: #526177; border-bottom: 1px solid rgba(117,139,168,.14
 .recovery-codes > div { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 6px; }
 .recovery-codes code { padding: 6px 8px; border-radius: 5px; background: white; color: #2d5c48; font-size: 10px; text-align: center; }
 .danger-button { min-height: 34px; border: 1px solid #efb0ac; border-radius: 6px; background: #fff0ef; color: var(--danger); padding: 0 12px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; cursor: pointer; }
+.account-danger-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-right: auto; }
+.recycle-list { display: grid; gap: 1px; background: var(--line); }
+.recycle-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; background: #fff; }
+.recycle-row > div { min-width: 0; display: grid; gap: 3px; }
+.recycle-row strong, .recycle-row small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .switch { margin: 0 !important; }
 .switch input { position: absolute; opacity: 0; pointer-events: none; }
 .switch span { display: block !important; width: 34px; height: 19px; border-radius: 10px; background: #cdd7e2; position: relative; cursor: pointer; transition: .15s; margin: 0 !important; }

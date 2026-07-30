@@ -7,6 +7,7 @@ import {
 } from '../src/quick-account.js';
 
 const baseForm = {
+  upstreamId: 'upstream-sub2',
   upstreamName: '86',
   name: '主账号',
   type: 'sub2api',
@@ -62,6 +63,7 @@ test('Sub2API quick form keeps the existing API-key payload when no session file
   const payload = buildQuickAccountPayload(baseForm);
 
   assert.equal(payload.authMode, 'api_token');
+  assert.equal(payload.upstreamId, 'upstream-sub2');
   assert.equal(payload.profilePath, '/v1/usage');
   assert.equal(payload.balancePath, 'remaining');
   assert.equal(payload.formula, 'x * 7.2');

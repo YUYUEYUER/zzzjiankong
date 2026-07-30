@@ -4,27 +4,13 @@ import fs from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { startTestServer, stopTestServer } from './helpers/server-process.js';
 
 async function listen(server) {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   return server.address();
-}
-
-async function waitForServer(baseUrl, child) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (child.exitCode != null) throw new Error(`test server exited with ${child.exitCode}`);
-    try {
-      const response = await fetch(`${baseUrl}/api/health`);
-      if (response.ok) return;
-    } catch {
-      // still starting
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  throw new Error('test server did not start');
 }
 
 test('API key detail endpoint is authenticated, converts balances, and never returns keys', async () => {
@@ -77,13 +63,7 @@ test('API key detail endpoint is authenticated, converts balances, and never ret
     } : { success: false, message: `invalid ${authorization}` }));
   });
   const upstreamAddress = await listen(upstream);
-  const appPort = 21000 + Math.floor(Math.random() * 2000);
-  const baseUrl = `http://127.0.0.1:${appPort}`;
-  const child = spawn(process.execPath, ['server/index.js'], {
-    cwd: process.cwd(),
-    env: {
-      ...process.env,
-      PORT: String(appPort),
+  const serverProcess = await startTestServer({
       DATA_FILE: path.join(tempDir, 'db.json'),
       MASTER_KEY: 'api-key-details-master-key-with-32-characters',
       SESSION_SECRET: 'api-key-details-session-secret-with-32-characters',
@@ -95,9 +75,8 @@ test('API key detail endpoint is authenticated, converts balances, and never ret
       DASHBOARD_TURNSTILE_SITE_KEY: '',
       DASHBOARD_TURNSTILE_SECRET_KEY: '',
       MONITOR_TICK_MS: '3600000',
-    },
-    stdio: 'ignore',
   });
+  const { child, baseUrl } = serverProcess;
 
   let cookie = '';
   const request = async (route, options = {}) => {
@@ -116,8 +95,6 @@ test('API key detail endpoint is authenticated, converts balances, and never ret
   };
 
   try {
-    await waitForServer(baseUrl, child);
-
     let result = await request('/api/accounts/missing/api-keys');
     assert.equal(result.response.status, 401);
     assert.equal(result.body.error, 'AUTH_REQUIRED');
@@ -129,10 +106,18 @@ test('API key detail endpoint is authenticated, converts balances, and never ret
     assert.equal(result.response.status, 200);
     assert.ok(cookie.includes('frosted_session='));
 
+    result = await request('/api/upstreams', {
+      method: 'POST',
+      body: JSON.stringify({ name: 'Shared Provider', proxyMode: 'direct' }),
+    });
+    assert.equal(result.response.status, 201);
+    const sharedUpstreamId = result.body.upstream.id;
+
     result = await request('/api/accounts', {
       method: 'POST',
       body: JSON.stringify({
         upstreamName: 'Shared Provider',
+        upstreamId: sharedUpstreamId,
         name: 'Integration New API',
         type: 'newapi',
         baseUrl: `http://127.0.0.1:${upstreamAddress.port}`,
@@ -154,7 +139,6 @@ test('API key detail endpoint is authenticated, converts balances, and never ret
     });
     assert.equal(result.response.status, 201);
     const accountId = result.body.account.id;
-    const sharedUpstreamId = result.body.account.upstreamId;
 
     result = await request(`/api/accounts/${accountId}/api-keys`);
     assert.equal(result.response.status, 200);
@@ -172,6 +156,7 @@ test('API key detail endpoint is authenticated, converts balances, and never ret
       method: 'POST',
       body: JSON.stringify({
         upstreamName: 'shared provider',
+        upstreamId: sharedUpstreamId,
         name: 'Official account token',
         type: 'newapi',
         baseUrl: `http://127.0.0.1:${upstreamAddress.port}`,
@@ -206,17 +191,22 @@ test('API key detail endpoint is authenticated, converts balances, and never ret
     assert.equal(result.body.upstreams.filter((upstream) => upstream.id === sharedUpstreamId).length, 1);
     assert.equal(result.body.upstreams.find((upstream) => upstream.id === sharedUpstreamId).accountCount, 2);
 
+    result = await request('/api/upstreams', {
+      method: 'POST',
+      body: JSON.stringify({ name: 'Moved Provider', proxyMode: 'direct' }),
+    });
+    assert.equal(result.response.status, 201);
+    const movedUpstreamId = result.body.upstream.id;
     result = await request(`/api/accounts/${accessAccountId}`, {
       method: 'PATCH',
-      body: JSON.stringify({ upstreamName: 'Moved Provider' }),
+      body: JSON.stringify({ upstreamId: movedUpstreamId }),
     });
     assert.equal(result.response.status, 200);
     assert.notEqual(result.body.account.upstreamId, sharedUpstreamId);
     result = await request('/api/dashboard');
-    assert.equal(result.body.upstreams.filter((upstream) => upstream.name === 'Moved Provider').length, 1);
+    assert.equal(result.body.upstreams.filter((upstream) => upstream.id === movedUpstreamId).length, 1);
   } finally {
-    child.kill();
-    if (child.exitCode == null) await once(child, 'exit');
+    await stopTestServer(child);
     upstream.close();
     await once(upstream, 'close');
     await fs.rm(tempDir, { recursive: true, force: true });

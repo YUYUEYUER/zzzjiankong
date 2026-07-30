@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import { generate } from 'otplib';
 import {
   consumeRecoveryCode,
+  consumeTwoFactorChallenge,
   createSessionToken,
   createTotpEnrollment,
+  createTwoFactorChallenge,
   generateRecoveryCodes,
   hashPassword,
   hashRecoveryCode,
@@ -12,6 +14,8 @@ import {
   verifyPassword,
   verifySessionToken,
   verifyTotpCode,
+  verifyTotpCodeResult,
+  verifyTwoFactorChallenge,
   verifyTurnstileToken,
 } from '../server/security.js';
 import { config } from '../server/config.js';
@@ -32,11 +36,52 @@ test('sessions are bound to the username and session version', () => {
   assert.equal(verifySessionToken(token, { ...auth, usernameCanonical: 'other' }), false);
 });
 
+test('two-factor challenges are single-use and bound to auth state', () => {
+  const auth = {
+    username: 'Owner',
+    usernameCanonical: 'owner',
+    passwordHash: 'hash',
+    sessionVersion: 3,
+    twoFactorEnabled: true,
+  };
+  const token = createTwoFactorChallenge(auth);
+  assert.equal(verifyTwoFactorChallenge(token, auth), true);
+  assert.equal(verifyTwoFactorChallenge(token, { ...auth, sessionVersion: 4 }), false);
+  assert.equal(consumeTwoFactorChallenge(token, auth), true);
+  assert.equal(verifyTwoFactorChallenge(token, auth), false);
+  assert.equal(consumeTwoFactorChallenge(token, auth), false);
+});
+
+test('two-factor challenges expire after five minutes', () => {
+  const auth = {
+    username: 'Owner',
+    usernameCanonical: 'owner',
+    passwordHash: 'hash',
+    sessionVersion: 3,
+    twoFactorEnabled: true,
+  };
+  const originalNow = Date.now;
+  let now = originalNow();
+  Date.now = () => now;
+  try {
+    const token = createTwoFactorChallenge(auth);
+    now += 5 * 60 * 1000;
+    assert.equal(verifyTwoFactorChallenge(token, auth), false);
+    assert.equal(consumeTwoFactorChallenge(token, auth), false);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
 test('TOTP enrollment verifies authenticator codes', async () => {
   const enrollment = createTotpEnrollment('Owner');
   const code = await generate({ secret: enrollment.secret });
   assert.equal(await verifyTotpCode(enrollment.secret, code), true);
   assert.equal(await verifyTotpCode(enrollment.secret, '000000'), false);
+  const accepted = await verifyTotpCodeResult(enrollment.secret, code);
+  assert.equal(accepted.valid, true);
+  const replayed = await verifyTotpCodeResult(enrollment.secret, code, accepted.timeStep);
+  assert.equal(replayed.valid, false);
 });
 
 test('recovery codes are one-time and stored as hashes', () => {

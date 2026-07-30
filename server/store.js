@@ -49,6 +49,7 @@ function defaultAuth() {
     pendingTotpEncrypted: '',
     pendingTotpCreatedAt: null,
     recoveryCodeHashes: [],
+    lastAcceptedTotpCounter: null,
     sessionVersion: 1,
     createdAt: null,
     updatedAt: null,
@@ -117,10 +118,10 @@ export function deriveInitialUpstream(account, idFactory = () => crypto.randomUU
   });
 }
 
-function assertDataShape(data) {
+function normalizeDataShape(data) {
   if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('数据文件格式无效');
   if (!Array.isArray(data.accounts)) throw new Error('数据文件缺少 accounts 数组');
-  for (const key of ['snapshots', 'incidents', 'audit']) {
+  for (const key of ['snapshots', 'incidents', 'audit', 'notificationOutbox']) {
     if (!Array.isArray(data[key])) data[key] = [];
   }
   if (!data.settings || typeof data.settings !== 'object') data.settings = defaultSettings();
@@ -132,19 +133,92 @@ function assertDataShape(data) {
   if (!Array.isArray(data.auth.recoveryCodeHashes)) data.auth.recoveryCodeHashes = [];
 }
 
+function assertObject(value, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} 格式无效`);
+  }
+}
+
+function uniqueIds(items, label) {
+  const ids = new Set();
+  for (const item of items) {
+    assertObject(item, label);
+    const id = String(item.id || '').trim();
+    if (!id) throw new Error(`${label} 缺少 id`);
+    if (ids.has(id)) throw new Error(`${label} id 重复：${id}`);
+    ids.add(id);
+  }
+  return ids;
+}
+
+export function validateDataGraph(data) {
+  assertObject(data, '数据文件');
+  if (Number(data.version) !== STORE_VERSION) throw new Error(`数据版本必须为 ${STORE_VERSION}`);
+  for (const key of ['upstreams', 'accounts', 'snapshots', 'incidents', 'audit', 'notificationOutbox']) {
+    if (!Array.isArray(data[key])) throw new Error(`数据文件缺少 ${key} 数组`);
+  }
+  assertObject(data.settings, 'settings');
+  assertObject(data.auth, 'auth');
+  assertObject(data.proxyPool, 'proxyPool');
+  if (!Array.isArray(data.proxyPool.nodes)) throw new Error('proxyPool 缺少 nodes 数组');
+  if (!Array.isArray(data.auth.recoveryCodeHashes)) throw new Error('auth 缺少 recoveryCodeHashes 数组');
+
+  const upstreamIds = uniqueIds(data.upstreams, '上游');
+  const accountIds = uniqueIds(data.accounts, '账号');
+  const snapshotIds = uniqueIds(data.snapshots, '快照');
+  const incidentIds = uniqueIds(data.incidents, '事件');
+  uniqueIds(data.audit, '审计记录');
+  uniqueIds(data.notificationOutbox, '通知事件');
+
+  const upstreamNames = new Set();
+  for (const upstream of data.upstreams) {
+    const canonical = String(upstream.name || '').trim().normalize('NFKC').toLocaleLowerCase('zh-CN');
+    if (!canonical) throw new Error(`上游 ${upstream.id || 'unknown'} 缺少有效名称`);
+    if (upstreamNames.has(canonical)) throw new Error(`上游名称重复：${upstream.name}`);
+    upstreamNames.add(canonical);
+  }
+
+  for (const account of data.accounts) {
+    if (!account.upstreamId || !upstreamIds.has(account.upstreamId)) {
+      throw new Error(`账号 ${account.id || account.name || 'unknown'} 未关联有效上游`);
+    }
+  }
+  for (const snapshot of data.snapshots) {
+    if (!snapshot.accountId || !accountIds.has(snapshot.accountId)) {
+      throw new Error(`快照 ${snapshot.id || 'unknown'} 未关联有效账号`);
+    }
+  }
+  for (const incident of data.incidents) {
+    if (!incident.accountId || !accountIds.has(incident.accountId)) {
+      throw new Error(`事件 ${incident.id || 'unknown'} 未关联有效账号`);
+    }
+  }
+  for (const event of data.notificationOutbox) {
+    if (event.accountId && !accountIds.has(event.accountId)) {
+      throw new Error(`通知事件 ${event.id || 'unknown'} 未关联有效账号`);
+    }
+    if (event.incidentId && !incidentIds.has(event.incidentId)) {
+      throw new Error(`通知事件 ${event.id || 'unknown'} 未关联有效事件`);
+    }
+    if (event.upstreamId && !upstreamIds.has(event.upstreamId)) {
+      throw new Error(`通知事件 ${event.id || 'unknown'} 未关联有效上游`);
+    }
+  }
+
+  return { upstreamIds, accountIds, snapshotIds, incidentIds };
+}
+
 export function migrateData(source, idFactory = () => crypto.randomUUID()) {
   const data = structuredClone(source);
-  assertDataShape(data);
+  normalizeDataShape(data);
   const fromVersion = Number(data.version || 1);
   if (!Number.isInteger(fromVersion) || fromVersion < 1) throw new Error(`不支持的数据版本 ${data.version}`);
   if (fromVersion > STORE_VERSION) throw new Error(`数据版本 ${fromVersion} 高于当前支持版本 ${STORE_VERSION}`);
 
   if (fromVersion === STORE_VERSION) {
     if (!Array.isArray(data.upstreams)) throw new Error('版本 3 数据缺少 upstreams 数组');
-    const upstreamIds = new Set(data.upstreams.map((upstream) => upstream.id));
-    const invalid = data.accounts.find((account) => !account.upstreamId || !upstreamIds.has(account.upstreamId));
-    if (invalid) throw new Error(`账号 ${invalid.id || invalid.name || 'unknown'} 未关联有效上游`);
     data.upstreams = data.upstreams.map(withProxyDefaults);
+    validateDataGraph(data);
     return { data, changed: false, fromVersion };
   }
 
@@ -162,6 +236,7 @@ export function migrateData(source, idFactory = () => crypto.randomUUID()) {
   data.proxyPool = { ...defaultProxyPool(), ...(data.proxyPool || {}) };
   if (!Array.isArray(data.proxyPool.nodes)) data.proxyPool.nodes = [];
   data.version = STORE_VERSION;
+  validateDataGraph(data);
   return { data, changed: true, fromVersion };
 }
 
@@ -200,11 +275,12 @@ function seedData() {
     proxyPool: defaultProxyPool(),
     auth: defaultAuth(),
     audit: [],
+    notificationOutbox: [],
   };
 }
 
 function blankData() {
-  return { version: STORE_VERSION, upstreams: [], accounts: [], snapshots: [], incidents: [], settings: defaultSettings(), proxyPool: defaultProxyPool(), auth: defaultAuth(), audit: [] };
+  return { version: STORE_VERSION, upstreams: [], accounts: [], snapshots: [], incidents: [], settings: defaultSettings(), proxyPool: defaultProxyPool(), auth: defaultAuth(), audit: [], notificationOutbox: [] };
 }
 
 export class JsonStore {
@@ -212,6 +288,12 @@ export class JsonStore {
     this.file = file;
     this.data = null;
     this.queue = Promise.resolve();
+    this.storageHealth = {
+      status: 'initializing',
+      lastSuccessfulWriteAt: null,
+      lastFailureAt: null,
+      lastErrorCode: null,
+    };
   }
 
   async init() {
@@ -228,9 +310,11 @@ export class JsonStore {
         }
         await this.persist();
       }
+      if (this.storageHealth.status === 'initializing') this.storageHealth.status = 'healthy';
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
       this.data = config.seedDemo ? seedData() : blankData();
+      validateDataGraph(this.data);
       await this.persist();
     }
     return this;
@@ -240,19 +324,70 @@ export class JsonStore {
     return structuredClone(this.data);
   }
 
-  async mutate(mutator) {
-    let result;
-    this.queue = this.queue.then(async () => {
-      result = await mutator(this.data);
-      await this.persist();
+  mutate(mutator) {
+    const operation = this.queue.catch(() => undefined).then(async () => {
+      const draft = structuredClone(this.data);
+      const result = await mutator(draft);
+      validateDataGraph(draft);
+      try {
+        await this.persist(draft);
+      } catch (error) {
+        this.markPersistenceFailure(error);
+        throw error;
+      }
+      this.data = draft;
+      return result;
     });
-    await this.queue;
-    return result;
+    this.queue = operation.catch(() => undefined);
+    return operation;
   }
 
-  async persist() {
-    const temp = `${this.file}.tmp`;
-    await fs.writeFile(temp, JSON.stringify(this.data, null, 2), "utf8");
-    await fs.rename(temp, this.file);
+  health() {
+    return structuredClone(this.storageHealth);
+  }
+
+  async flush() {
+    await this.queue.catch(() => undefined);
+  }
+
+  markPersistenceFailure(error) {
+    this.storageHealth = {
+      ...this.storageHealth,
+      status: 'degraded',
+      lastFailureAt: new Date().toISOString(),
+      lastErrorCode: String(error?.code || error?.name || 'PERSISTENCE_ERROR'),
+    };
+  }
+
+  markPersistenceSuccess() {
+    this.storageHealth = {
+      ...this.storageHealth,
+      status: 'healthy',
+      lastSuccessfulWriteAt: new Date().toISOString(),
+      lastErrorCode: null,
+    };
+  }
+
+  async persist(data = this.data) {
+    validateDataGraph(data);
+    const serialized = JSON.stringify(data, null, 2);
+    const directory = path.dirname(this.file);
+    const temp = path.join(directory, `.${path.basename(this.file)}.${process.pid}.${crypto.randomUUID()}.tmp`);
+    let handle;
+    try {
+      handle = await fs.open(temp, 'wx', 0o600);
+      await handle.writeFile(serialized, 'utf8');
+      await handle.sync();
+      await handle.close();
+      handle = null;
+      await fs.rename(temp, this.file);
+      this.markPersistenceSuccess();
+    } catch (error) {
+      this.markPersistenceFailure(error);
+      throw error;
+    } finally {
+      await handle?.close().catch(() => undefined);
+      await fs.rm(temp, { force: true }).catch(() => undefined);
+    }
   }
 }

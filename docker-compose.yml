@@ -1,8 +1,11 @@
 services:
   mihomo:
-    image: docker.io/metacubex/mihomo:v1.19.28
+    image: docker.io/metacubex/mihomo:v1.19.28@sha256:e6acd921addecfd59a8e2d38203f88356d635b54de6c0673db0e015139989312
     init: true
     restart: unless-stopped
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: "1.0"
     entrypoint: ["/bin/sh", "/bootstrap/mihomo-entrypoint.sh"]
     environment:
       MIHOMO_SECRET: ${MIHOMO_SECRET:?MIHOMO_SECRET must be set in .env}
@@ -24,24 +27,47 @@ services:
   frosted-console:
     build: .
     init: true
-    ipc: host
+    shm_size: "1gb"
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+      - SYS_CHROOT
     security_opt:
       - seccomp=./docker/seccomp_profile.json
+      - no-new-privileges:true
     restart: unless-stopped
+    read_only: true
+    pids_limit: 512
+    mem_limit: 4g
+    cpus: "2.0"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+      nproc: 2048
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=2g
+      - /run:rw,nosuid,nodev,size=64m
+      - /home/pwuser:rw,exec,nosuid,nodev,size=1g
     depends_on:
       mihomo:
         condition: service_healthy
-    ports:
-      - "127.0.0.1:${PORT:-8787}:8787"
-      - "127.0.0.1:${NOVNC_PORT:-6080}:6080"
     env_file:
       - path: .env
         required: false
     environment:
       MASTER_KEY: ${MASTER_KEY:?MASTER_KEY must be set in .env}
+      MASTER_KEY_ID: ${MASTER_KEY_ID:-active}
+      PREVIOUS_MASTER_KEYS: ${PREVIOUS_MASTER_KEYS:-}
+      BACKUP_DIR: /app/data/backups
       SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be set in .env}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN:-}
       AUTH_DISABLED: ${AUTH_DISABLED:-false}
       TRUST_PROXY: ${TRUST_PROXY:-false}
       DASHBOARD_TURNSTILE_SITE_KEY: ${DASHBOARD_TURNSTILE_SITE_KEY:-}
@@ -65,9 +91,12 @@ services:
       MIHOMO_CONTROLLER_BIND_ADDRESS: 0.0.0.0
       UPSTREAM_PROXY_HOST: mihomo
       PROXY_BASE_PORT: ${PROXY_BASE_PORT:-17890}
+      UPSTREAM_RESPONSE_MAX_BYTES: ${UPSTREAM_RESPONSE_MAX_BYTES:-2097152}
+      UPSTREAM_ALLOWED_HOSTS: ${UPSTREAM_ALLOWED_HOSTS:-}
       SEED_DEMO: ${SEED_DEMO:-false}
     volumes:
       - frosted-data:/app/data
+      - frosted-backups:/app/data/backups
       - frosted-proxy:/shared-proxy
     networks:
       - proxy-internal
@@ -80,6 +109,7 @@ services:
 
 volumes:
   frosted-data:
+  frosted-backups:
   frosted-proxy:
 
 networks:

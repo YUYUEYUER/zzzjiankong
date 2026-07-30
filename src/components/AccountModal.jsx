@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { CheckCircle, Eye, EyeSlash, Flask, Info, SpinnerGap } from '@phosphor-icons/react';
+import { CheckCircle, Eraser, Eye, EyeSlash, Flask, Info, SpinnerGap, Trash } from '@phosphor-icons/react';
 import { api } from '../api.js';
 import { money } from '../lib.js';
 import { Modal } from './Modal.jsx';
@@ -29,7 +29,7 @@ function defaults(type = 'newapi', upstreamId = '', upstreamName = '') {
   };
 }
 
-export function AccountModal({ open, editingAccount, initialDraft, upstreams, defaultUpstreamId, onClose, onSaved, pushToast, turnstileSolver }) {
+export function AccountModal({ open, editingAccount, initialDraft, upstreams, defaultUpstreamId, onClose, onSaved, onDeleted, pushToast, turnstileSolver }) {
   const [form, setForm] = useState(defaults());
   const [showSecret, setShowSecret] = useState(false);
   const [advanced, setAdvanced] = useState(false);
@@ -74,6 +74,11 @@ export function AccountModal({ open, editingAccount, initialDraft, upstreams, de
 
   const set = (key, value) => setForm((current) => ({ ...current, [key]: value }));
   const setCredential = (key, value) => setForm((current) => ({ ...current, credentials: { ...current.credentials, [key]: value } }));
+  const selectUpstream = (upstreamId) => setForm((current) => ({
+    ...current,
+    upstreamId,
+    upstreamName: upstreams.find((upstream) => upstream.id === upstreamId)?.name || '',
+  }));
 
   const payload = useMemo(() => {
     const commonCredentialKeys = ['cfAccessClientId', 'cfAccessClientSecret'];
@@ -180,6 +185,36 @@ export function AccountModal({ open, editingAccount, initialDraft, upstreams, de
     }
   };
 
+  const deleteAccount = async () => {
+    if (!editingAccount || !window.confirm(`确认将“${editingAccount.name}”移入回收站？历史记录会保留。`)) return;
+    setBusy('delete');
+    try {
+      await api.deleteAccount(editingAccount.id);
+      pushToast('账号已移入回收站，历史记录已保留', 'success');
+      await onDeleted(editingAccount.id);
+      onClose();
+    } catch (error) {
+      pushToast(error.message, 'error');
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const clearCredentials = async () => {
+    if (!editingAccount || !window.confirm(`确认清除“${editingAccount.name}”的所有凭据？`)) return;
+    setBusy('clear');
+    try {
+      await api.clearAccountCredentials(editingAccount.id);
+      pushToast('凭据已清除，账号已停用', 'success');
+      await onSaved();
+      onClose();
+    } catch (error) {
+      pushToast(error.message, 'error');
+    } finally {
+      setBusy('');
+    }
+  };
+
   const isSub2 = form.type === 'sub2api';
   const tokenHint = editingAccount
     ? [
@@ -198,7 +233,7 @@ export function AccountModal({ open, editingAccount, initialDraft, upstreams, de
           <div className="form-section-title"><span>1</span><div><h3>账号归属与站点</h3></div></div>
           <label>
             <span>所属上游</span>
-            <input required value={form.upstreamName || ''} onChange={(event) => set('upstreamName', event.target.value)} placeholder="例如 newapi、sub2api" />
+            <select required value={form.upstreamId || ''} onChange={(event) => selectUpstream(event.target.value)}><option value="" disabled>请选择已创建的上游</option>{upstreams.map((upstream) => <option key={upstream.id} value={upstream.id}>{upstream.name}</option>)}</select>
           </label>
           <div className="type-segmented">
             {[['newapi', 'New API'], ['sub2api', 'Sub2API'], ['generic', '自定义']].map(([id, label]) => (
@@ -521,6 +556,7 @@ export function AccountModal({ open, editingAccount, initialDraft, upstreams, de
         )}
 
         <footer className="modal-actions">
+          {editingAccount && <div className="account-danger-actions"><button type="button" className="danger-button" onClick={clearCredentials} disabled={Boolean(busy)} title="清除已保存凭据"><Eraser size={16} />清除凭据</button><button type="button" className="danger-button" onClick={deleteAccount} disabled={Boolean(busy)} title="移入回收站"><Trash size={16} />移入回收站</button></div>}
           <button type="button" className="secondary-button" onClick={testConnection} disabled={Boolean(busy)}>
             {busy === 'connection' ? <SpinnerGap className="spin" /> : <Flask size={16} />} 测试连接
           </button>

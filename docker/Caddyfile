@@ -9,6 +9,18 @@
 		redir /browser/ 308
 	}
 
+	# noVNC's binary socket is authorized and proxied by the application so
+	# Origin, short-lived ticket, and session revocation are enforced per connection.
+	handle /browser/websockify* {
+		reverse_proxy {
+			dynamic a frosted-console 8787 {
+				refresh 5s
+				resolvers 127.0.0.11
+				versions ipv4
+			}
+		}
+	}
+
 	handle_path /browser/* {
 		forward_auth {
 			uri /api/browser-access

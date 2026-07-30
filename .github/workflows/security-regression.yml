@@ -1,0 +1,144 @@
+name: Security regression
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm audit --audit-level=high --registry=https://registry.npmjs.org
+      - run: npx playwright install --with-deps chromium
+      - run: npm test
+      - run: npm run build
+      - name: Validate Linux deployment script
+        run: |
+          bash -n deploy-linux.sh backup-linux.sh restore-linux.sh rotate-master-key-linux.sh
+          sh -n server/docker-entrypoint.sh docker/mihomo-entrypoint.sh
+          shellcheck deploy-linux.sh backup-linux.sh restore-linux.sh rotate-master-key-linux.sh
+          shellcheck -s sh server/docker-entrypoint.sh docker/mihomo-entrypoint.sh
+          python3 - <<'PY'
+          from pathlib import Path
+
+          for script in [
+              Path('deploy-linux.sh'),
+              Path('backup-linux.sh'),
+              Path('restore-linux.sh'),
+              Path('rotate-master-key-linux.sh'),
+              Path('server/docker-entrypoint.sh'),
+              Path('docker/mihomo-entrypoint.sh'),
+          ]:
+              source = script.read_bytes()
+              source.decode('utf-8')
+              assert b'\r' not in source, f'{script} must use LF line endings'
+          PY
+      - name: Validate production Compose isolation
+        env:
+          DOMAIN: panel.example.test
+          MASTER_KEY: test-master-key-012345678901234567890123
+          SESSION_SECRET: test-session-secret-01234567890123456789
+          MIHOMO_SECRET: test-mihomo-secret
+          BOOTSTRAP_TOKEN: test-bootstrap-token-012345678901234567890123
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.server.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.server.yml config --format json > /tmp/compose.json
+          python3 - <<'PY'
+          import json
+
+          with open('/tmp/compose.json', encoding='utf-8') as stream:
+              config = json.load(stream)
+          service = config['services']['frosted-console']
+          assert not service.get('ports'), 'production must not publish app or noVNC ports'
+          assert service.get('ipc') != 'host', 'production must not share the host IPC namespace'
+          PY
+
+  sbom:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build production image
+        run: docker build --tag frosted-console:ci .
+      - name: Smoke test the isolated browser desktop
+        env:
+          MASTER_KEY: test-master-key-012345678901234567890123
+          SESSION_SECRET: test-session-secret-01234567890123456789
+          MIHOMO_SECRET: test-mihomo-secret
+          BOOTSTRAP_TOKEN: test-bootstrap-token-012345678901234567890123
+        run: |
+          docker run -d --name frosted-console-smoke \
+            --shm-size 1g \
+            --cap-drop ALL \
+            --cap-add CHOWN \
+            --cap-add DAC_OVERRIDE \
+            --cap-add SETGID \
+            --cap-add SETUID \
+            --cap-add SYS_CHROOT \
+            --security-opt no-new-privileges \
+            --security-opt seccomp="$PWD/docker/seccomp_profile.json" \
+            --env NODE_ENV=production \
+            --env MASTER_KEY \
+            --env SESSION_SECRET \
+            --env MIHOMO_SECRET \
+            --env BOOTSTRAP_TOKEN \
+            --env NOVNC_ENABLED=true \
+            --env TURNSTILE_BROWSER_SMOKE_ON_START=true \
+            --env SEED_DEMO=false \
+            frosted-console:ci
+          trap 'docker logs frosted-console-smoke; docker rm -f frosted-console-smoke' EXIT
+          for attempt in $(seq 1 60); do
+            if docker exec frosted-console-smoke node -e \
+              "Promise.all([fetch('http://127.0.0.1:8787/api/health'), fetch('http://127.0.0.1:6080/vnc.html')]).then(r => process.exit(r.every(x => x.ok) ? 0 : 1)).catch(() => process.exit(1))"; then
+              break
+            fi
+            if [[ "$(docker inspect -f '{{.State.Running}}' frosted-console-smoke)" != "true" ]]; then
+              exit 1
+            fi
+            if [[ "$attempt" == "60" ]]; then
+              exit 1
+            fi
+            sleep 1
+          done
+          docker exec --user pwuser frosted-console-smoke node -e "const fs=require('fs'); if(process.getuid()===0) process.exit(2); try { fs.writeFileSync('/app/server/.write-test','x'); process.exit(1) } catch {} fs.writeFileSync('/app/data/.write-test','x'); fs.unlinkSync('/app/data/.write-test')"
+          docker restart frosted-console-smoke
+          for attempt in $(seq 1 60); do
+            if docker exec frosted-console-smoke node -e "fetch('http://127.0.0.1:8787/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
+              break
+            fi
+            if [[ "$(docker inspect -f '{{.State.Running}}' frosted-console-smoke)" != "true" || "$attempt" == "60" ]]; then
+              exit 1
+            fi
+            sleep 1
+          done
+          docker logs frosted-console-smoke 2>&1 | grep -F "Chromium smoke passed"
+      - name: Scan production image for high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: frosted-console:ci
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          vuln-type: os,library
+      - uses: anchore/sbom-action@9e07fd7fd4c7754e8b7de48b7823674442d75a35 # v0.20.3
+        with:
+          image: frosted-console:ci
+          format: spdx-json
+          output-file: frosted-console.spdx.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: frosted-console-sbom
+          path: frosted-console.spdx.json
+          if-no-files-found: error
+          retention-days: 30

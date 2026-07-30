@@ -5,9 +5,32 @@ import { collectBalance } from './collectors.js';
 import { evaluateFormula } from './converter.js';
 import { attachCredentialCheckpoint, takeCredentialCheckpoint } from './credential-checkpoint.js';
 import { decryptSecret, encryptSecret } from './security.js';
-import { notify } from './notifications.js';
+import { createNotificationOutboxEvent, NotificationOutbox } from './notification-outbox.js';
 
 const now = () => new Date().toISOString();
+
+export function compactSnapshots(snapshots, current = Date.now()) {
+  const retentionStart = current - 90 * 86400000;
+  const detailedStart = current - 24 * 3600000;
+  const hourlyStart = current - 30 * 86400000;
+  const kept = [];
+  const buckets = new Map();
+  for (const snapshot of snapshots) {
+    const captured = new Date(snapshot.capturedAt).getTime();
+    if (!Number.isFinite(captured) || captured < retentionStart) continue;
+    if (captured >= detailedStart) {
+      kept.push(snapshot);
+      continue;
+    }
+    const bucketSize = captured >= hourlyStart ? 3600000 : 86400000;
+    const key = `${snapshot.accountId}:${bucketSize}:${Math.floor(captured / bucketSize)}`;
+    const previous = buckets.get(key);
+    if (!previous || new Date(previous.capturedAt).getTime() < captured) buckets.set(key, snapshot);
+  }
+  return [...kept, ...buckets.values()].sort((left, right) => (
+    new Date(left.capturedAt).getTime() - new Date(right.capturedAt).getTime()
+  ));
+}
 
 function simulate(account, recharge = false) {
   if (recharge) {
@@ -26,11 +49,19 @@ export class Monitor {
     this.collector = collector;
     this.timer = null;
     this.running = new Set();
+    this.outbox = new NotificationOutbox(store);
   }
 
   start() {
     this.timer = setInterval(() => this.tick().catch((error) => console.error('[monitor]', error)), config.monitorTickMs);
     this.timer.unref?.();
+    this.outbox.start();
+  }
+
+  stop() {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+    this.outbox.stop();
   }
 
   async tick() {
@@ -45,7 +76,7 @@ export class Monitor {
   }
 
   reminderDue(incident, settings, current = Date.now()) {
-    const previous = incident.lastReminderAt || incident.lastNotificationAt || incident.openedAt;
+    const previous = incident.lastReminderQueuedAt || incident.lastReminderAt || incident.lastNotificationAt || incident.openedAt;
     const previousTime = new Date(previous || 0).getTime();
     return current - previousTime >= Number(settings.reminderHours || 6) * 3600000;
   }
@@ -114,7 +145,7 @@ export class Monitor {
       if (result.updatedSecret) account.encryptedSecret = encryptSecret(result.updatedSecret);
 
       data.snapshots.push({ id: crypto.randomUUID(), accountId, rawBalance: account.rawBalance, convertedCny, capturedAt: now() });
-      data.snapshots = data.snapshots.filter((snapshot) => Date.now() - new Date(snapshot.capturedAt).getTime() < 90 * 86400000);
+      data.snapshots = compactSnapshots(data.snapshots);
 
       let incident = data.incidents.find((item) => item.accountId === accountId && item.state === 'open');
       if (convertedCny < account.thresholdLow) {
@@ -126,12 +157,17 @@ export class Monitor {
             channelResults: {}, notifications: { reminders: [] }, recoveryChecks: 0,
           };
           data.incidents.unshift(incident);
-          return { kind: 'opened', account: structuredClone(account), incident: structuredClone(incident) };
+          const event = createNotificationOutboxEvent('opened', account, incident);
+          data.notificationOutbox.push(event);
+          return { eventId: event.id };
         }
         incident.currentBalance = convertedCny;
         incident.recoveryChecks = 0;
         if (this.reminderDue(incident, data.settings)) {
-          return { kind: 'reminder', account: structuredClone(account), incident: structuredClone(incident) };
+          incident.lastReminderQueuedAt = now();
+          const event = createNotificationOutboxEvent('reminder', account, incident);
+          data.notificationOutbox.push(event);
+          return { eventId: event.id };
         }
         return null;
       }
@@ -145,7 +181,9 @@ export class Monitor {
             incident.state = 'resolved';
             incident.resolvedAt = now();
             account.recoveryChecks = 0;
-            return { kind: 'recovered', account: structuredClone(account), incident: structuredClone(incident) };
+            const event = createNotificationOutboxEvent('recovered', account, incident);
+            data.notificationOutbox.push(event);
+            return { eventId: event.id };
           }
         } else {
           incident.recoveryChecks = 0;
@@ -157,34 +195,11 @@ export class Monitor {
   }
 
   async sendTransition(transition) {
-    const data = this.store.snapshot();
-    const settings = data.settings;
-    const upstream = data.upstreams.find((item) => item.id === transition.account.upstreamId);
-    const account = { ...transition.account, upstreamName: upstream?.name || '' };
-    const secrets = {
-      resendApiKey: decryptSecret(settings.resendApiKeyEncrypted).value,
-      feishuWebhook: decryptSecret(settings.feishuWebhookEncrypted).value,
-    };
-    const kind = ['opened', 'reminder', 'recovered'].includes(transition.kind) ? transition.kind : 'opened';
-    const results = await notify(kind, account, transition.incident, settings, secrets);
-    await this.store.mutate((state) => {
-      const incident = state.incidents.find((item) => item.id === transition.incident.id);
-      const recordedAt = now();
-      if (incident) {
-        incident.notifications ||= { reminders: [] };
-        incident.notifications.reminders ||= [];
-        if (kind === 'reminder') {
-          incident.notifications.reminders.push({ at: recordedAt, results });
-          incident.notifications.reminders = incident.notifications.reminders.slice(-20);
-          incident.lastReminderAt = recordedAt;
-        } else {
-          incident.notifications[kind] = { at: recordedAt, results };
-        }
-        incident.lastNotificationAt = recordedAt;
-        incident.channelResults = Object.fromEntries(Object.entries(results).map(([channel, result]) => [channel, result.status]));
-      }
-      state.audit.unshift({ id: crypto.randomUUID(), type: `incident.${kind}`, accountId: transition.account.id, upstreamId: transition.account.upstreamId, at: recordedAt, details: results });
-      state.audit = state.audit.slice(0, 500);
-    });
+    if (!transition?.eventId) return;
+    try {
+      await this.outbox.dispatchEvent(transition.eventId);
+    } catch (error) {
+      console.error('[notification-outbox]', error);
+    }
   }
 }

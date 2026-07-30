@@ -108,7 +108,7 @@ export function buildQuickAccountPayload(form) {
   }
 
   return {
-    upstreamId: '',
+    upstreamId: form.upstreamId,
     upstreamName: form.upstreamName.trim(),
     name: form.name.trim(),
     type: form.type,

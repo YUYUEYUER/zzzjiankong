@@ -14,6 +14,7 @@ import { takeCredentialCheckpoint } from './credential-checkpoint.js';
 import { evaluateFormula, normalizeFormula } from './converter.js';
 import {
   consumeRecoveryCode,
+  consumeTwoFactorChallenge,
   createSessionToken,
   createTotpEnrollment,
   createTwoFactorChallenge,
@@ -26,16 +27,20 @@ import {
   passwordIssues,
   usernameMatches,
   verifyPassword,
+  verifyBootstrapToken,
   verifySessionToken,
   verifyTotpCode,
+  verifyTotpCodeResult,
   verifyTurnstileToken,
   verifyTwoFactorChallenge,
 } from './security.js';
 import { notify } from './notifications.js';
 import { getTurnstileSolverStatus } from './turnstile.js';
+import { attachBrowserGateway, browserWorkspaceTicketUrl, closeBrowserConnections, issueBrowserTicket } from './browser-gateway.js';
 import { aggregateUpstreams } from './upstreams.js';
 import { withAccountCredentialLock } from './account-lock.js';
-import { ProxyPoolManager } from './proxy-pool.js';
+import { getUpstreamProxyContext, ProxyPoolManager } from './proxy-pool.js';
+import { parseUpstreamUrl, resolveUpstreamUrl } from './network-policy.js';
 import {
   cancelUpstreamLogin,
   consumeUpstreamLogin,
@@ -58,6 +63,15 @@ function sameOrigin(left, right) {
 }
 
 const store = await new JsonStore().init();
+if (
+  config.production
+  && !config.authDisabled
+  && !store.snapshot().auth.passwordHash
+  && !config.adminPassword
+  && config.bootstrapToken.length < 32
+) {
+  throw new Error('生产环境首次初始化必须配置至少 32 个字符的 BOOTSTRAP_TOKEN');
+}
 if (!store.snapshot().auth.passwordHash && config.adminPassword) {
   const issues = passwordIssues(config.adminPassword);
   if (issues.length) {
@@ -78,12 +92,10 @@ if (!store.snapshot().auth.passwordHash && config.adminPassword) {
   }
 }
 const proxyPool = new ProxyPoolManager(store);
-try {
-  await proxyPool.sync();
-} catch (error) {
+void proxyPool.sync().catch((error) => {
   console.warn(`[proxy] Mihomo 尚未就绪，将自动重试：${error.message}`);
   proxyPool.startSyncRetry();
-}
+});
 const monitor = new Monitor(store);
 monitor.start();
 
@@ -117,11 +129,34 @@ app.use('/api', (req, res, next) => {
   return res.status(403).json({ message: '请求来源校验失败' });
 });
 
+const accountBaseUrlSchema = z.string().trim().min(1, '请填写上游地址').max(2048).superRefine((value, context) => {
+  try {
+    parseUpstreamUrl(value, { production: config.production, allowedHosts: config.upstreamAllowedHosts });
+  } catch (error) {
+    context.addIssue({ code: 'custom', message: error.message });
+  }
+}).transform((value) => {
+  const url = parseUpstreamUrl(value, { production: config.production, allowedHosts: config.upstreamAllowedHosts });
+  url.pathname = url.pathname.replace(/\/$/, '');
+  return url.toString().replace(/\/$/, '');
+});
+
+async function validateUpstreamDestination(value) {
+  if (config.enforceUpstreamNetworkPolicy) {
+    return resolveUpstreamUrl(value, {
+      production: config.production,
+      allowedHosts: config.upstreamAllowedHosts,
+      allowPrivate: false,
+    });
+  }
+  return { url: parseUpstreamUrl(value, { production: config.production, allowedHosts: config.upstreamAllowedHosts }) };
+}
+
 const accountSchema = z.object({
-  upstreamId: z.string().trim().max(80).optional().default(''),
+  upstreamId: z.string().trim().min(1, '请选择所属上游').max(80),
   name: z.string().trim().min(1).max(60),
   type: z.enum(['newapi', 'sub2api', 'generic']),
-  baseUrl: z.union([z.string().url(), z.literal('')]),
+  baseUrl: accountBaseUrlSchema,
   region: z.string().trim().max(40).default('未分组'),
   subgroup: z.string().trim().max(40).optional(),
   authMode: z.enum(['api_token', 'access_token', 'password']).default('access_token'),
@@ -166,7 +201,8 @@ const upstreamSchema = z.object({
 
 const upstreamLoginSchema = z.object({
   type: z.literal('sub2api'),
-  baseUrl: z.string().url(),
+  baseUrl: accountBaseUrlSchema,
+  upstreamId: z.string().trim().min(1).max(80),
 });
 
 function canonicalUpstreamName(value) {
@@ -176,6 +212,17 @@ function canonicalUpstreamName(value) {
 function findUpstreamByName(data, name) {
   const canonical = canonicalUpstreamName(name);
   return data.upstreams.find((upstream) => canonicalUpstreamName(upstream.name) === canonical);
+}
+
+function requireUpstream(upstreamId, data = store.snapshot()) {
+  const upstream = data.upstreams.find((item) => item.id === upstreamId);
+  if (!upstream) throw Object.assign(new Error('所选上游不存在'), { statusCode: 400 });
+  return upstream;
+}
+
+function browserProxyServer(upstreamId) {
+  requireUpstream(upstreamId);
+  return getUpstreamProxyContext(upstreamId)?.browserProxy?.server || '';
 }
 
 function requestedUpstreamName(body) {
@@ -222,7 +269,12 @@ const strongPasswordSchema = z.string().max(128).superRefine((value, context) =>
   const issues = passwordIssues(value);
   if (issues.length) context.addIssue({ code: 'custom', message: `密码强度不足：${issues.join('、')}` });
 });
-const setupSchema = z.object({ username: usernameSchema, password: strongPasswordSchema, turnstileToken: z.string().optional().default('') });
+const setupSchema = z.object({
+  username: usernameSchema,
+  password: strongPasswordSchema,
+  bootstrapToken: z.string().max(512).optional().default(''),
+  turnstileToken: z.string().optional().default(''),
+});
 const loginSchema = z.object({ username: z.string().max(64), password: z.string().max(128), turnstileToken: z.string().optional().default('') });
 const twoFactorLoginSchema = z.object({ challengeToken: z.string().min(1), code: z.string().min(6).max(32) });
 const securityProfileSchema = z.object({
@@ -283,20 +335,45 @@ function publicSettings(settings) {
   };
 }
 
+function dashboardSnapshots(snapshots, accountIds, maxPerAccount = 600) {
+  const grouped = new Map();
+  for (const snapshot of snapshots) {
+    if (!accountIds.has(snapshot.accountId)) continue;
+    const list = grouped.get(snapshot.accountId) || [];
+    list.push(snapshot);
+    grouped.set(snapshot.accountId, list);
+  }
+  const result = [];
+  for (const list of grouped.values()) {
+    list.sort((left, right) => new Date(left.capturedAt).getTime() - new Date(right.capturedAt).getTime());
+    if (list.length <= maxPerAccount) {
+      result.push(...list);
+      continue;
+    }
+    const step = (list.length - 1) / (maxPerAccount - 1);
+    const selected = new Set([0, list.length - 1]);
+    for (let index = 1; index < maxPerAccount - 1; index += 1) selected.add(Math.round(index * step));
+    result.push(...[...selected].sort((a, b) => a - b).map((index) => list[index]));
+  }
+  return result;
+}
+
 function dashboard() {
   const data = store.snapshot();
-  const accounts = data.accounts.map(sanitizeAccount);
+  const accounts = data.accounts.filter((account) => !account.deletedAt).map(sanitizeAccount);
+  const deletedAccounts = data.accounts.filter((account) => account.deletedAt).map(sanitizeAccount);
   const byId = new Map(accounts.map((account) => [account.id, account]));
   const upstreams = aggregateUpstreams(data.upstreams, accounts, data.incidents);
   const upstreamById = new Map(upstreams.map((upstream) => [upstream.id, upstream]));
-  const incidents = data.incidents.map((incident) => {
+  const incidents = data.incidents.filter((incident) => byId.has(incident.accountId)).map((incident) => {
     const account = byId.get(incident.accountId);
     return { ...incident, account, upstream: upstreamById.get(account?.upstreamId) };
   });
   return {
     upstreams,
     accounts,
-    snapshots: data.snapshots,
+    deletedAccounts,
+    snapshots: dashboardSnapshots(data.snapshots, new Set(byId.keys())),
     incidents,
     audit: data.audit.slice(0, 200),
     settings: publicSettings(data.settings),
@@ -341,8 +418,10 @@ function recordLoginFailure(key) {
   const current = loginAttempts.get(key);
   if (!current || Date.now() - current.startedAt >= LOGIN_WINDOW_MS) {
     loginAttempts.set(key, { count: 1, startedAt: Date.now() });
+    return 1;
   } else {
     current.count += 1;
+    return current.count;
   }
 }
 
@@ -350,13 +429,17 @@ function clearLoginFailures(key) {
   loginAttempts.delete(key);
 }
 
+const sessionCookieOptions = {
+  httpOnly: true,
+  sameSite: 'strict',
+  secure: config.production,
+  path: '/',
+};
+
 function setSessionCookie(res, auth) {
   res.cookie('frosted_session', createSessionToken(auth), {
-    httpOnly: true,
-    sameSite: 'strict',
-    secure: config.production,
+    ...sessionCookieOptions,
     maxAge: 12 * 60 * 60 * 1000,
-    path: '/',
   });
 }
 
@@ -368,6 +451,7 @@ function publicSession(req) {
     authenticated,
     authRequired: !config.authDisabled,
     setupRequired: !config.authDisabled && setupRequired,
+    bootstrapRequired: !config.authDisabled && setupRequired && Boolean(config.bootstrapToken),
     username: authenticated && auth.username ? auth.username : '',
     twoFactorEnabled: Boolean(auth.twoFactorEnabled),
     turnstile: {
@@ -378,11 +462,30 @@ function publicSession(req) {
   };
 }
 
-async function verifySecondFactor(auth, code) {
+async function consumeSecondFactor(code) {
+  const auth = store.snapshot().auth;
   const secret = decryptSecret(auth.totpSecretEncrypted).value;
-  if (secret && await verifyTotpCode(secret, code)) return { valid: true, recovery: false, hashes: auth.recoveryCodeHashes };
-  const recovery = consumeRecoveryCode(code, auth.recoveryCodeHashes);
-  return { valid: recovery.valid, recovery: recovery.valid, hashes: recovery.hashes };
+  if (secret && /^\d{6}$/.test(String(code || '').trim())) {
+    const result = await verifyTotpCodeResult(secret, code, auth.lastAcceptedTotpCounter);
+    if (result.valid) {
+      return store.mutate((data) => {
+        const previous = Number(data.auth.lastAcceptedTotpCounter);
+        if (Number.isInteger(previous) && result.timeStep <= previous) {
+          return { valid: false, recovery: false, replayed: true };
+        }
+        data.auth.lastAcceptedTotpCounter = result.timeStep;
+        data.auth.updatedAt = new Date().toISOString();
+        return { valid: true, recovery: false, timeStep: result.timeStep };
+      });
+    }
+  }
+  return store.mutate((data) => {
+    const recovery = consumeRecoveryCode(code, data.auth.recoveryCodeHashes);
+    if (!recovery.valid) return { valid: false, recovery: false };
+    data.auth.recoveryCodeHashes = recovery.hashes;
+    data.auth.updatedAt = new Date().toISOString();
+    return { valid: true, recovery: true };
+  });
 }
 
 function authRequired(req, res, next) {
@@ -395,18 +498,26 @@ function asyncRoute(handler) {
   return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 }
 
-app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString(), storage: store.health() }));
+app.get('/api/ready', (req, res) => {
+  const health = store.health();
+  if (health.status !== 'healthy') return res.status(503).json({ status: 'not_ready', storage: health });
+  return res.json({ status: 'ready', storage: health });
+});
 app.get('/api/session', (req, res) => res.json(publicSession(req)));
 
 app.post('/api/session/setup', asyncRoute(async (req, res) => {
   if (config.authDisabled) return res.status(400).json({ message: '认证已被环境变量关闭' });
+  if (store.snapshot().auth.passwordHash) return res.status(410).json({ message: '管理员初始化入口已关闭' });
   const input = setupSchema.parse(req.body);
-  if (store.snapshot().auth.passwordHash) return res.status(409).json({ message: '管理员账户已经初始化' });
+  if (config.bootstrapToken && !verifyBootstrapToken(config.bootstrapToken, input.bootstrapToken)) {
+    return res.status(403).json({ message: '初始化引导令牌不正确' });
+  }
   await verifyTurnstileToken(input.turnstileToken, req.ip, 'setup');
   const passwordHash = await hashPassword(input.password);
   const timestamp = new Date().toISOString();
   await store.mutate((data) => {
-    if (data.auth.passwordHash) throw Object.assign(new Error('管理员账户已经初始化'), { statusCode: 409 });
+    if (data.auth.passwordHash) throw Object.assign(new Error('管理员初始化入口已关闭'), { statusCode: 410 });
     data.auth = {
       ...data.auth,
       username: input.username,
@@ -453,18 +564,20 @@ app.post('/api/session/verify-2fa', asyncRoute(async (req, res) => {
   const auth = store.snapshot().auth;
   if (!verifyTwoFactorChallenge(input.challengeToken, auth)) return res.status(401).json({ message: '二次验证已过期，请重新登录' });
   const key = checkLoginLimit(req, auth.username, 'two_factor');
-  const verified = await verifySecondFactor(auth, input.code);
+  const verified = await consumeSecondFactor(input.code);
   if (!verified.valid) {
-    recordLoginFailure(key);
+    if (recordLoginFailure(key) >= LOGIN_MAX_ATTEMPTS) {
+      consumeTwoFactorChallenge(input.challengeToken, auth);
+    }
     return res.status(401).json({ message: '验证码或恢复码不正确' });
   }
-  clearLoginFailures(key);
-  if (verified.recovery) {
-    await store.mutate((data) => {
-      data.auth.recoveryCodeHashes = verified.hashes;
-      data.audit.unshift({ id: crypto.randomUUID(), type: 'security.recovery_code_used', at: new Date().toISOString() });
-    });
+  if (!consumeTwoFactorChallenge(input.challengeToken, auth)) {
+    return res.status(401).json({ message: '二次验证已过期，请重新登录' });
   }
+  clearLoginFailures(key);
+  if (verified.recovery) await store.mutate((data) => {
+    data.audit.unshift({ id: crypto.randomUUID(), type: 'security.recovery_code_used', at: new Date().toISOString() });
+  });
   const currentAuth = store.snapshot().auth;
   setSessionCookie(res, currentAuth);
   await store.mutate((data) => {
@@ -474,22 +587,48 @@ app.post('/api/session/verify-2fa', asyncRoute(async (req, res) => {
   res.json({ success: true });
 }));
 
-app.post('/api/session/logout', (req, res) => {
-  res.clearCookie('frosted_session', { path: '/' });
+app.post('/api/session/logout', asyncRoute(async (req, res) => {
+  const token = req.cookies.frosted_session;
+  let revoked = config.authDisabled;
+  if (!config.authDisabled && token && verifySessionToken(token, store.snapshot().auth)) {
+    revoked = await store.mutate((data) => {
+      if (!verifySessionToken(token, data.auth)) return false;
+      data.auth.sessionVersion = Number(data.auth.sessionVersion || 1) + 1;
+      data.auth.updatedAt = new Date().toISOString();
+      data.audit.unshift({ id: crypto.randomUUID(), type: 'security.logout', at: data.auth.updatedAt });
+      return true;
+    });
+  }
+  if (revoked) closeBrowserConnections();
+  res.clearCookie('frosted_session', sessionCookieOptions);
   res.json({ success: true });
-});
+}));
 
 app.use('/api', authRequired);
 
+app.post('/api/browser-ticket', (req, res) => {
+  if (!config.browserWorkspaceUrl) return res.status(404).json({ message: '远程浏览器工作区未启用' });
+  const auth = store.snapshot().auth;
+  const ticket = issueBrowserTicket(auth, config.appOrigin);
+  res.json({ url: browserWorkspaceTicketUrl(ticket), expiresIn: 60 });
+});
+
 app.get('/api/browser-access', (req, res) => {
   if (!config.browserWorkspaceUrl) return res.status(404).json({ message: '远程浏览器工作区未启用' });
+  const origin = req.get('origin');
+  if (origin && !sameOrigin(origin, config.appOrigin)) return res.status(403).json({ message: '浏览器工作区来源不受信任' });
   return res.status(204).end();
 });
 
-app.post('/api/upstream-logins', (req, res) => {
+app.post('/api/upstream-logins', asyncRoute(async (req, res) => {
   const input = upstreamLoginSchema.parse(req.body);
-  res.status(202).json(startUpstreamLogin(input));
-});
+  const destination = await validateUpstreamDestination(input.baseUrl);
+  res.status(202).json(startUpstreamLogin({
+    ...input,
+    proxyServer: browserProxyServer(input.upstreamId),
+    resolvedAddresses: destination.addresses || [],
+  }));
+}));
 
 app.get('/api/upstream-logins/:id', (req, res) => {
   res.json(getUpstreamLogin(req.params.id));
@@ -506,6 +645,7 @@ app.post('/api/accounts/:id/open-upstream', asyncRoute(async (req, res) => {
   if (!account) return res.status(404).json({ message: '账号不存在' });
   if (account.demo) return res.status(400).json({ message: '演示账号没有可进入的上游会话' });
   if (account.type !== 'sub2api') return res.status(400).json({ message: '当前仅支持进入 Sub2API 浏览器会话' });
+  const destination = await validateUpstreamDestination(account.baseUrl);
 
   let secret;
   try {
@@ -529,6 +669,9 @@ app.post('/api/accounts/:id/open-upstream', asyncRoute(async (req, res) => {
     sessionCookie: secret.browserSessionOrigin && sameOrigin(secret.browserSessionOrigin, account.baseUrl)
       ? secret.sessionCookie
       : '',
+    browserProfileId: secret.browserProfileId,
+    proxyServer: browserProxyServer(account.upstreamId),
+    resolvedAddresses: destination.addresses || [],
   });
   await store.mutate((data) => {
     data.audit.unshift({
@@ -565,7 +708,7 @@ app.patch('/api/security/profile', asyncRoute(async (req, res) => {
     data.auth.username = input.username || data.auth.username;
     data.auth.usernameCanonical = normalizeUsername(data.auth.username);
     data.auth.passwordHash = nextPasswordHash;
-    data.auth.sessionVersion = Number(data.auth.sessionVersion || 1) + 1;
+  data.auth.sessionVersion = Number(data.auth.sessionVersion || 1) + 1;
     data.auth.updatedAt = timestamp;
     data.audit.unshift({
       id: crypto.randomUUID(),
@@ -574,6 +717,7 @@ app.patch('/api/security/profile', asyncRoute(async (req, res) => {
       details: { usernameChanged: previousUsername !== data.auth.username, passwordChanged: Boolean(input.newPassword) },
     });
   });
+  closeBrowserConnections();
   const updated = store.snapshot().auth;
   setSessionCookie(res, updated);
   res.json({ username: updated.username, twoFactorEnabled: Boolean(updated.twoFactorEnabled) });
@@ -611,10 +755,12 @@ app.post('/api/security/2fa/enable', asyncRoute(async (req, res) => {
     data.auth.pendingTotpEncrypted = '';
     data.auth.pendingTotpCreatedAt = null;
     data.auth.recoveryCodeHashes = recoveryCodes.map(hashRecoveryCode);
-    data.auth.sessionVersion = Number(data.auth.sessionVersion || 1) + 1;
+    data.auth.lastAcceptedTotpCounter = null;
+  data.auth.sessionVersion = Number(data.auth.sessionVersion || 1) + 1;
     data.auth.updatedAt = timestamp;
     data.audit.unshift({ id: crypto.randomUUID(), type: 'security.2fa_enabled', at: timestamp });
   });
+  closeBrowserConnections();
   const updated = store.snapshot().auth;
   setSessionCookie(res, updated);
   res.json({ success: true, recoveryCodes });
@@ -625,7 +771,7 @@ app.post('/api/security/2fa/recovery-codes', asyncRoute(async (req, res) => {
   const auth = store.snapshot().auth;
   if (!auth.twoFactorEnabled) return res.status(400).json({ message: '两步验证尚未启用' });
   if (!await verifyPassword(input.currentPassword, auth.passwordHash)) return res.status(401).json({ message: '当前密码不正确' });
-  const verified = await verifySecondFactor(auth, input.code);
+  const verified = await consumeSecondFactor(input.code);
   if (!verified.valid) return res.status(400).json({ message: '验证码或恢复码不正确' });
   const recoveryCodes = generateRecoveryCodes();
   await store.mutate((data) => {
@@ -640,7 +786,7 @@ app.delete('/api/security/2fa', asyncRoute(async (req, res) => {
   const auth = store.snapshot().auth;
   if (!auth.twoFactorEnabled) return res.status(400).json({ message: '两步验证尚未启用' });
   if (!await verifyPassword(input.currentPassword, auth.passwordHash)) return res.status(401).json({ message: '当前密码不正确' });
-  const verified = await verifySecondFactor(auth, input.code);
+  const verified = await consumeSecondFactor(input.code);
   if (!verified.valid) return res.status(400).json({ message: '验证码或恢复码不正确' });
   const timestamp = new Date().toISOString();
   await store.mutate((data) => {
@@ -649,10 +795,12 @@ app.delete('/api/security/2fa', asyncRoute(async (req, res) => {
     data.auth.pendingTotpEncrypted = '';
     data.auth.pendingTotpCreatedAt = null;
     data.auth.recoveryCodeHashes = [];
-    data.auth.sessionVersion = Number(data.auth.sessionVersion || 1) + 1;
+    data.auth.lastAcceptedTotpCounter = null;
+  data.auth.sessionVersion = Number(data.auth.sessionVersion || 1) + 1;
     data.auth.updatedAt = timestamp;
     data.audit.unshift({ id: crypto.randomUUID(), type: 'security.2fa_disabled', at: timestamp });
   });
+  closeBrowserConnections();
   const updated = store.snapshot().auth;
   setSessionCookie(res, updated);
   res.json({ success: true });
@@ -678,6 +826,9 @@ app.post('/api/upstreams', asyncRoute(async (req, res) => {
   }
   const auditId = crypto.randomUUID();
   const create = () => store.mutate((data) => {
+    if (findUpstreamByName(data, upstream.name)) {
+      throw Object.assign(new Error('已存在同名上游'), { statusCode: 409 });
+    }
     data.upstreams.push(upstream);
     data.audit.unshift({ id: auditId, type: 'upstream.created', upstreamId: upstream.id, at: timestamp, details: { name: upstream.name } });
   });
@@ -713,6 +864,10 @@ app.patch('/api/upstreams/:id', asyncRoute(async (req, res) => {
   const update = () => store.mutate((data) => {
     const upstream = data.upstreams.find((item) => item.id === req.params.id);
     if (!upstream) throw Object.assign(new Error('上游不存在'), { statusCode: 404 });
+    const duplicate = findUpstreamByName(data, input.name);
+    if (duplicate && duplicate.id !== upstream.id) {
+      throw Object.assign(new Error('已存在同名上游'), { statusCode: 409 });
+    }
     const previousName = upstream.name;
     upstream.name = input.name;
     if (input.proxyMode) {
@@ -754,9 +909,13 @@ app.delete('/api/upstreams/:id', asyncRoute(async (req, res) => {
   const previousIndex = data.upstreams.findIndex((item) => item.id === req.params.id);
   if (previousIndex < 0) return res.status(404).json({ message: '上游不存在' });
   const previous = data.upstreams[previousIndex];
-  if (data.accounts.some((account) => account.upstreamId === req.params.id)) return res.status(409).json({ message: '该上游仍有关联账号，请先移动或删除账号' });
   const auditId = crypto.randomUUID();
   const remove = () => store.mutate((state) => {
+    const target = state.upstreams.find((item) => item.id === req.params.id);
+    if (!target) throw Object.assign(new Error('上游不存在'), { statusCode: 404 });
+    if (state.accounts.some((account) => account.upstreamId === req.params.id)) {
+      throw Object.assign(new Error('该上游仍有关联账号，请先移动或删除账号'), { statusCode: 409 });
+    }
     state.upstreams = state.upstreams.filter((item) => item.id !== req.params.id);
     state.audit.unshift({ id: auditId, type: 'upstream.deleted', upstreamId: req.params.id, at: new Date().toISOString() });
   });
@@ -813,6 +972,8 @@ app.post('/api/formulas/test', (req, res) => {
 
 app.post('/api/accounts/test', asyncRoute(async (req, res) => {
   const input = accountSchema.parse(req.body);
+  await validateUpstreamDestination(input.baseUrl);
+  requireUpstream(input.upstreamId);
   evaluateFormula(input.formula, 1);
   const accountId = String(req.body?.id || '');
   const runTest = async () => {
@@ -891,27 +1052,15 @@ app.post('/api/accounts/test', asyncRoute(async (req, res) => {
 
 app.post('/api/accounts', asyncRoute(async (req, res) => {
   const input = accountSchema.parse(req.body);
-  const upstreamName = requestedUpstreamName(req.body);
+  await validateUpstreamDestination(input.baseUrl);
   evaluateFormula(input.formula, 1);
   const capturedCredential = input.browserLoginId
     ? getUpstreamLoginCredential(input.browserLoginId, input.baseUrl)
     : null;
   const credentials = mergeSecrets(input.credentials || {}, capturedCredential || {});
   const timestamp = new Date().toISOString();
-  let upstreamId = input.upstreamId;
-  let implicitUpstream = null;
-  const currentData = store.snapshot();
-  if (upstreamName) {
-    upstreamId = findUpstreamByName(currentData, upstreamName)?.id || '';
-  }
-  if (upstreamId && !currentData.upstreams.some((upstream) => upstream.id === upstreamId)) return res.status(400).json({ message: '所选上游不存在' });
-  if (!upstreamId) {
-    implicitUpstream = createDirectUpstream(upstreamName || input.name, timestamp);
-    upstreamId = implicitUpstream.id;
-  }
   const account = {
     ...input,
-    upstreamId,
     id: crypto.randomUUID(),
     subgroup: input.subgroup || input.region,
     encryptedSecret: encryptSecret(credentials),
@@ -928,18 +1077,9 @@ app.post('/api/accounts', asyncRoute(async (req, res) => {
   delete account.credentials;
   delete account.browserLoginId;
   await store.mutate((data) => {
-    if (implicitUpstream) {
-      const existing = findUpstreamByName(data, implicitUpstream.name);
-      if (existing) {
-        upstreamId = existing.id;
-        account.upstreamId = existing.id;
-      } else {
-        data.upstreams.push(implicitUpstream);
-        data.audit.unshift({ id: crypto.randomUUID(), type: 'upstream.created', upstreamId: implicitUpstream.id, at: timestamp, details: { name: implicitUpstream.name } });
-      }
-    }
+    requireUpstream(account.upstreamId, data);
     data.accounts.push(account);
-    data.audit.unshift({ id: crypto.randomUUID(), type: 'account.created', accountId: account.id, upstreamId, at: timestamp });
+    data.audit.unshift({ id: crypto.randomUUID(), type: 'account.created', accountId: account.id, upstreamId: account.upstreamId, at: timestamp });
   });
   if (input.browserLoginId) await consumeUpstreamLogin(input.browserLoginId);
   let syncError = '';
@@ -956,22 +1096,10 @@ app.patch('/api/accounts/:id', asyncRoute(async (req, res) => {
     const currentData = store.snapshot();
     const current = currentData.accounts.find((item) => item.id === req.params.id);
     if (!current) return { status: 404, message: '账号不存在' };
-    const upstreamName = requestedUpstreamName(req.body);
     const timestamp = new Date().toISOString();
-    let targetUpstreamId = req.body.upstreamId || current.upstreamId;
-    let implicitUpstream = null;
-    if (upstreamName) {
-      const existing = findUpstreamByName(currentData, upstreamName);
-      if (existing) targetUpstreamId = existing.id;
-      else {
-        implicitUpstream = createDirectUpstream(upstreamName, timestamp);
-        targetUpstreamId = implicitUpstream.id;
-      }
-    }
+    const targetUpstreamId = req.body.upstreamId || current.upstreamId;
     const merged = accountSchema.parse({ ...current, ...req.body, upstreamId: targetUpstreamId, credentials: req.body.credentials || undefined });
-    if (!implicitUpstream && !currentData.upstreams.some((upstream) => upstream.id === merged.upstreamId)) {
-      return { status: 400, message: '所选上游不存在' };
-    }
+    await validateUpstreamDestination(merged.baseUrl);
     evaluateFormula(merged.formula, Number(current.rawBalance || 1));
     const originChanged = !sameOrigin(current.baseUrl, merged.baseUrl);
     if (originChanged && !req.body.credentials) {
@@ -980,14 +1108,8 @@ app.patch('/api/accounts/:id', asyncRoute(async (req, res) => {
     const changedFields = Object.keys(req.body || {}).filter((key) => key !== 'credentials' && key !== 'encryptedSecret');
     await store.mutate((data) => {
       const account = data.accounts.find((item) => item.id === req.params.id);
-      if (implicitUpstream) {
-        const existing = findUpstreamByName(data, implicitUpstream.name);
-        if (existing) merged.upstreamId = existing.id;
-        else {
-          data.upstreams.push(implicitUpstream);
-          data.audit.unshift({ id: crypto.randomUUID(), type: 'upstream.created', upstreamId: implicitUpstream.id, at: timestamp, details: { name: implicitUpstream.name } });
-        }
-      }
+      if (!account) throw Object.assign(new Error('账号不存在'), { statusCode: 404 });
+      requireUpstream(merged.upstreamId, data);
       let nextSecret = account.encryptedSecret;
       if (req.body.credentials) {
         let existing = {};
@@ -1013,18 +1135,17 @@ app.patch('/api/accounts/:id', asyncRoute(async (req, res) => {
 
 app.patch('/api/accounts/:id/upstream', asyncRoute(async (req, res) => {
   const upstreamId = z.string().trim().min(1).parse(req.body?.upstreamId);
-  const data = store.snapshot();
-  const current = data.accounts.find((account) => account.id === req.params.id);
-  if (!current) return res.status(404).json({ message: '账号不存在' });
-  if (!data.upstreams.some((upstream) => upstream.id === upstreamId)) return res.status(400).json({ message: '所选上游不存在' });
-  const previousUpstreamId = current.upstreamId;
-  await store.mutate((state) => {
-    const account = state.accounts.find((item) => item.id === req.params.id);
-    account.upstreamId = upstreamId;
-    account.updatedAt = new Date().toISOString();
-    state.audit.unshift({ id: crypto.randomUUID(), type: 'account.upstream_changed', accountId: account.id, upstreamId, at: account.updatedAt, details: { previousUpstreamId } });
-  });
-  res.json({ account: sanitizeAccount(store.snapshot().accounts.find((item) => item.id === req.params.id)) });
+  const account = await withAccountCredentialLock(req.params.id, () => store.mutate((state) => {
+    const current = state.accounts.find((item) => item.id === req.params.id);
+    if (!current) throw Object.assign(new Error('账号不存在'), { statusCode: 404 });
+    requireUpstream(upstreamId, state);
+    const previousUpstreamId = current.upstreamId;
+    current.upstreamId = upstreamId;
+    current.updatedAt = new Date().toISOString();
+    state.audit.unshift({ id: crypto.randomUUID(), type: 'account.upstream_changed', accountId: current.id, upstreamId, at: current.updatedAt, details: { previousUpstreamId } });
+    return structuredClone(current);
+  }));
+  res.json({ account: sanitizeAccount(account) });
 }));
 
 app.get('/api/accounts/:id/api-keys', asyncRoute(async (req, res) => {
@@ -1065,13 +1186,77 @@ app.get('/api/accounts/:id/api-keys', asyncRoute(async (req, res) => {
   res.json(details);
 }));
 
-app.delete('/api/accounts/:id', asyncRoute(async (req, res) => {
-  await store.mutate((data) => {
-    data.accounts = data.accounts.filter((item) => item.id !== req.params.id);
-    data.snapshots = data.snapshots.filter((item) => item.accountId !== req.params.id);
-    data.incidents = data.incidents.filter((item) => item.accountId !== req.params.id);
+app.get('/api/accounts/:id/snapshots', (req, res) => {
+  const input = z.object({
+    cursor: z.string().datetime().optional(),
+    limit: z.coerce.number().int().min(1).max(500).default(100),
+  }).parse(req.query);
+  const data = store.snapshot();
+  const account = data.accounts.find((item) => item.id === req.params.id);
+  if (!account) return res.status(404).json({ message: '账号不存在' });
+  const snapshots = data.snapshots
+    .filter((item) => item.accountId === account.id && (!input.cursor || item.capturedAt < input.cursor))
+    .sort((left, right) => right.capturedAt.localeCompare(left.capturedAt))
+    .slice(0, input.limit);
+  return res.json({
+    snapshots,
+    nextCursor: snapshots.length === input.limit ? snapshots.at(-1).capturedAt : null,
   });
+});
+
+app.delete('/api/accounts/:id', asyncRoute(async (req, res) => {
+  await withAccountCredentialLock(req.params.id, () => store.mutate((data) => {
+    const account = data.accounts.find((item) => item.id === req.params.id);
+    if (!account || account.deletedAt) throw Object.assign(new Error('账号不存在'), { statusCode: 404 });
+    const timestamp = new Date().toISOString();
+    account.enabledBeforeDelete = Boolean(account.enabled);
+    account.enabled = false;
+    account.deletedAt = timestamp;
+    account.status = 'deleted';
+    account.updatedAt = timestamp;
+    for (const event of data.notificationOutbox) {
+      if (event.accountId === account.id && !['completed', 'dead', 'cancelled'].includes(event.status)) {
+        event.status = 'cancelled';
+        event.cancelledAt = timestamp;
+      }
+    }
+    data.audit.unshift({ id: crypto.randomUUID(), type: 'account.deleted', accountId: account.id, upstreamId: account.upstreamId, at: timestamp });
+  }));
   res.status(204).end();
+}));
+
+app.post('/api/accounts/:id/restore', asyncRoute(async (req, res) => {
+  const account = await withAccountCredentialLock(req.params.id, () => store.mutate((data) => {
+    const current = data.accounts.find((item) => item.id === req.params.id);
+    if (!current || !current.deletedAt) throw Object.assign(new Error('回收站中没有该账号'), { statusCode: 404 });
+    requireUpstream(current.upstreamId, data);
+    const timestamp = new Date().toISOString();
+    current.enabled = Boolean(current.enabledBeforeDelete);
+    delete current.enabledBeforeDelete;
+    current.deletedAt = null;
+    current.status = 'pending';
+    current.lastError = '';
+    current.updatedAt = timestamp;
+    data.audit.unshift({ id: crypto.randomUUID(), type: 'account.restored', accountId: current.id, upstreamId: current.upstreamId, at: timestamp });
+    return structuredClone(current);
+  }));
+  res.json({ account: sanitizeAccount(account) });
+}));
+
+app.delete('/api/accounts/:id/credentials', asyncRoute(async (req, res) => {
+  const account = await withAccountCredentialLock(req.params.id, () => store.mutate((data) => {
+    const current = data.accounts.find((item) => item.id === req.params.id && !item.deletedAt);
+    if (!current) throw Object.assign(new Error('账号不存在'), { statusCode: 404 });
+    const timestamp = new Date().toISOString();
+    current.encryptedSecret = '';
+    current.enabled = false;
+    current.status = 'credentials_required';
+    current.lastError = '凭据已清除，请重新编辑账号后启用';
+    current.updatedAt = timestamp;
+    data.audit.unshift({ id: crypto.randomUUID(), type: 'account.credentials_cleared', accountId: current.id, upstreamId: current.upstreamId, at: timestamp });
+    return structuredClone(current);
+  }));
+  res.json({ account: sanitizeAccount(account) });
 }));
 
 app.post('/api/accounts/:id/refresh', asyncRoute(async (req, res) => {
@@ -1167,14 +1352,19 @@ app.use((error, req, res, next) => {
 });
 
 const server = app.listen(config.port, '0.0.0.0', () => {
-  console.log(`[frosted-console] http://localhost:${config.port}`);
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : config.port;
+  console.log(`[frosted-console] http://localhost:${port}`);
+  process.send?.({ type: 'ready', port });
 });
+const browserGateway = attachBrowserGateway(server, store);
 
 let shuttingDown = false;
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
-  if (monitor.timer) clearInterval(monitor.timer);
+  monitor.stop();
+  browserGateway.close();
   await shutdownUpstreamLogins();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 10_000).unref?.();

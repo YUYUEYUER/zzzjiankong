@@ -1,0 +1,5 @@
+services:
+  frosted-console:
+    ports:
+      - "127.0.0.1:${PORT:-8787}:8787"
+      - "127.0.0.1:${NOVNC_PORT:-6080}:6080"

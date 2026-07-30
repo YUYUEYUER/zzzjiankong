@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   ArrowClockwise,
+  ArrowCounterClockwise,
   ArrowSquareOut,
   Bell,
   CaretDown,
@@ -12,6 +13,7 @@ import {
   Plus,
   SignOut,
   SpinnerGap,
+  Trash,
   WarningCircle,
 } from '@phosphor-icons/react';
 import { AnimatePresence, motion } from 'motion/react';
@@ -253,10 +255,12 @@ export function StatusDashboard({
   onLogout,
   onAcknowledge,
   onLoadKeyDetails,
+  onRestoreAccount,
 }) {
   const [expandedAccounts, setExpandedAccounts] = useState(() => new Set());
   const [detailStates, setDetailStates] = useState({});
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [recycleOpen, setRecycleOpen] = useState(false);
 
   const realAccounts = useMemo(() => dashboard.accounts.filter((account) => !account.demo), [dashboard.accounts]);
   const visibleAccounts = realAccounts.length ? realAccounts : dashboard.accounts;
@@ -386,6 +390,11 @@ export function StatusDashboard({
           <ClockCounterClockwise size={19} />{historyOpen ? '收起告警历史' : '查看告警历史'}
         </button>
         {historyOpen && <section className="history-panel"><header><div><Bell size={18} /><h2>告警与自动结单记录</h2></div><span>最近 {Math.min(12, visibleIncidents.length)} 条</span></header><IncidentHistory incidents={visibleIncidents} onAcknowledge={onAcknowledge} /></section>}
+
+        {dashboard.deletedAccounts?.length > 0 && <>
+          <button className="history-toggle" type="button" onClick={() => setRecycleOpen((value) => !value)} aria-expanded={recycleOpen}><Trash size={19} />{recycleOpen ? '收起回收站' : `回收站 · ${dashboard.deletedAccounts.length} 个账号`}</button>
+          {recycleOpen && <section className="history-panel recycle-panel"><header><div><Trash size={18} /><h2>账号回收站</h2></div><span>历史记录保留</span></header><div className="recycle-list">{dashboard.deletedAccounts.map((account) => <div className="recycle-row" key={account.id}><div><strong>{account.name}</strong><small>{hostname(account.baseUrl)} · 删除于 {relativeTime(account.deletedAt)}</small></div><button type="button" className="text-command" onClick={() => onRestoreAccount(account)}><ArrowCounterClockwise size={16} />恢复</button></div>)}</div></section>}
+        </>}
 
         <footer className="status-footer">余额统一换算为人民币。低于账号阈值时触发 Resend / 飞书通知，充值恢复后自动结单。</footer>
       </div>

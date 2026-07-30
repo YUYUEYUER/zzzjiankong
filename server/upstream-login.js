@@ -9,8 +9,11 @@ import { config } from './config.js';
 
 const LOGIN_TTL_MS = Math.max(2 * 60_000, Number(process.env.UPSTREAM_LOGIN_TTL_MS || 10 * 60_000));
 const CAPTURE_TTL_MS = Math.max(LOGIN_TTL_MS, Number(process.env.UPSTREAM_CAPTURE_TTL_MS || 30 * 60_000));
+const PROFILE_ID_PATTERN = /^[A-Za-z0-9_-]{24,64}$/;
+const ACTIVE_JOB_STATUSES = new Set(['opening', 'waiting', 'captured', 'opened']);
 const jobs = new Map();
-const activeOrigins = new Map();
+const activeProfiles = new Map();
+let sweepPromise = null;
 
 function normalizedKey(value) {
   return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -54,12 +57,47 @@ function loginOrigin(value) {
   return url.origin;
 }
 
-function profileId(origin) {
-  return crypto.createHash('sha256').update(origin).digest('hex').slice(0, 24);
+function statusError(message, statusCode) {
+  return Object.assign(new Error(message), { statusCode });
+}
+
+export function createBrowserProfileId() {
+  return crypto.randomBytes(18).toString('base64url');
+}
+
+export function validateBrowserProfileId(value) {
+  if (typeof value !== 'string' || value !== value.trim() || !PROFILE_ID_PATTERN.test(value)) {
+    throw statusError('保存的浏览器资料标识无效，请重新建立浏览器登录态', 409);
+  }
+  return value;
+}
+
+export function normalizeBrowserProxyServer(value = '') {
+  if (value == null || value === '') return '';
+  if (typeof value !== 'string' || value !== value.trim()) {
+    throw statusError('浏览器代理地址格式无效', 400);
+  }
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw statusError('浏览器代理地址格式无效', 400);
+  }
+  if (!['http:', 'https:', 'socks4:', 'socks5:'].includes(url.protocol)
+    || !url.hostname
+    || url.username
+    || url.password
+    || (url.pathname && url.pathname !== '/')
+    || url.search
+    || url.hash) {
+    throw statusError('浏览器代理仅支持不含凭据和路径的 HTTP(S)/SOCKS 地址', 400);
+  }
+  return `${url.protocol}//${url.host}`;
 }
 
 function profileDirectory(id) {
-  return path.join(path.dirname(config.dataFile), 'upstream-browser-profiles', `${id}-system-chrome`);
+  const profile = validateBrowserProfileId(id);
+  return path.join(path.dirname(config.dataFile), 'upstream-browser-profiles', `${profile}-system-chrome`);
 }
 
 export function resolveSystemBrowser() {
@@ -96,7 +134,8 @@ async function freeLoopbackPort() {
 
 export function buildSystemBrowserArgs(job, port) {
   const targetUrl = job.targetUrl || `${job.origin}/login`;
-  return [
+  const proxyServer = normalizeBrowserProxyServer(job.proxyServer);
+  const args = [
     `--remote-debugging-port=${port}`,
     '--remote-debugging-address=127.0.0.1',
     `--user-data-dir=${job.profilePath}`,
@@ -104,8 +143,26 @@ export function buildSystemBrowserArgs(job, port) {
     '--no-default-browser-check',
     '--start-maximized',
     '--new-window',
-    targetUrl,
+    '--disable-quic',
   ];
+  if (!proxyServer && Array.isArray(job.resolvedAddresses) && job.resolvedAddresses.length) {
+    const addresses = job.resolvedAddresses
+      .map((entry) => String(entry?.address || '').trim())
+      .filter(Boolean)
+      .map((address) => address.includes(':') ? `[${address}]` : address);
+    if (addresses.length) args.push(`--host-resolver-rules=MAP ${new URL(targetUrl).hostname} ${addresses[0]}, EXCLUDE localhost`);
+  }
+  if (proxyServer) {
+    args.push(
+      `--proxy-server=${proxyServer}`,
+      '--proxy-bypass-list=<-loopback>',
+      '--dns-prefetch-disable',
+      '--disable-features=AsyncDns',
+      '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+    );
+  }
+  args.push(targetUrl);
+  return args;
 }
 
 export function browserCookiesFromHeader(origin, cookieHeader = '') {
@@ -267,7 +324,10 @@ async function captureJob(job, page, tokens = {}) {
   job.captureMode = accessToken ? 'tokens' : 'cookies';
   job.status = 'captured';
   job.capturedAt = new Date().toISOString();
-  job.expiresAt = new Date(Date.now() + CAPTURE_TTL_MS).toISOString();
+  job.expiresAt = new Date(Math.min(
+    Date.now() + CAPTURE_TTL_MS,
+    Date.parse(job.absoluteExpiresAt),
+  )).toISOString();
   job.message = accessToken
     ? `登录成功，已取得${job.secret.refreshToken ? ' AT + RT' : ' AT'}${session.hasCookies ? ' 与浏览器 Cookie' : ''}`
     : '登录成功，已取得浏览器 Cookie';
@@ -310,26 +370,140 @@ function watchPage(job, page) {
   });
 }
 
-async function closeJobBrowser(job) {
-  clearInterval(job.pollTimer);
-  clearTimeout(job.timeoutTimer);
-  const browser = job.browser;
-  const browserProcess = job.browserProcess;
-  job.closing = true;
-  job.browser = null;
-  job.browserProcess = null;
-  job.context = null;
-  if (job.purpose === 'browse') job.savedCookieHeader = '';
-  if (browser) await browser.close().catch(() => {});
-  if (browserProcess?.exitCode == null) browserProcess.kill();
-  job.closing = false;
-  if (activeOrigins.get(job.origin) === job.id) activeOrigins.delete(job.origin);
+function isActiveJob(job) {
+  return Boolean(job && ACTIVE_JOB_STATUSES.has(job.status));
 }
+
+function releaseProfileLock(job) {
+  if (activeProfiles.get(job.profileId) === job.id) activeProfiles.delete(job.profileId);
+}
+
+function markForRemoval(job, current = Date.now(), delay = config.upstreamBrowserResultRetentionMs) {
+  job.removeAfter = current + delay;
+}
+
+function expirationTime(job) {
+  const values = [job.expiresAt, job.absoluteExpiresAt]
+    .map((value) => Date.parse(value))
+    .filter(Number.isFinite);
+  return values.length ? Math.min(...values) : Number.POSITIVE_INFINITY;
+}
+
+function markExpired(job, current = Date.now()) {
+  if (!isActiveJob(job)) return false;
+  job.status = 'expired';
+  job.secret = null;
+  job.message = job.purpose === 'browse'
+    ? '上游浏览器会话已到期，请重新打开'
+    : '登录任务已过期，请重新发起';
+  markForRemoval(job, current);
+  return true;
+}
+
+function pruneProfileLocks() {
+  for (const [profile, id] of activeProfiles) {
+    const job = jobs.get(id);
+    if (!job || (!isActiveJob(job) && !job.closing && !job.launching && !job.context && !job.browserProcess)) {
+      activeProfiles.delete(profile);
+    }
+  }
+}
+
+function activeJobForProfile(profile) {
+  const id = activeProfiles.get(profile);
+  const job = id ? jobs.get(id) : null;
+  if (isActiveJob(job)) return job;
+  if (!job || (!job.closing && !job.launching && !job.context && !job.browserProcess)) activeProfiles.delete(profile);
+  return null;
+}
+
+function reserveBrowserJob(job) {
+  pruneProfileLocks();
+  const limit = Math.max(1, Number(config.upstreamBrowserMaxActive || 1));
+  if (activeProfiles.size >= limit) {
+    const error = statusError(`有头浏览器任务已达到上限（${limit}），请关闭已有窗口后重试`, 429);
+    error.retryAfterSeconds = Math.max(1, Math.ceil(config.upstreamBrowserSweepIntervalMs / 1000));
+    throw error;
+  }
+  jobs.set(job.id, job);
+  activeProfiles.set(job.profileId, job.id);
+}
+
+async function closeJobBrowser(job) {
+  if (job.closePromise) return job.closePromise;
+  job.closePromise = (async () => {
+    clearInterval(job.pollTimer);
+    clearTimeout(job.timeoutTimer);
+    const browser = job.browser;
+    const browserProcess = job.browserProcess;
+    job.closing = true;
+    job.browser = null;
+    job.browserProcess = null;
+    job.context = null;
+    if (job.purpose === 'browse') job.savedCookieHeader = '';
+    try {
+      if (browser) await browser.close().catch(() => {});
+      if (browserProcess && browserProcess.exitCode == null) browserProcess.kill();
+    } finally {
+      job.closing = false;
+      if (!job.launching) releaseProfileLock(job);
+    }
+  })();
+  try {
+    await job.closePromise;
+  } finally {
+    job.closePromise = null;
+  }
+}
+
+export async function sweepExpiredUpstreamLogins(current = Date.now()) {
+  if (sweepPromise) return sweepPromise;
+  sweepPromise = (async () => {
+    let expired = 0;
+    for (const job of jobs.values()) {
+      if (isActiveJob(job) && expirationTime(job) <= current && markExpired(job, current)) {
+        expired += 1;
+        await closeJobBrowser(job);
+      }
+    }
+    for (const [id, job] of jobs) {
+      if (!isActiveJob(job) && Number(job.removeAfter || Number.POSITIVE_INFINITY) <= current) {
+        jobs.delete(id);
+      }
+    }
+    pruneProfileLocks();
+    return expired;
+  })();
+  try {
+    return await sweepPromise;
+  } finally {
+    sweepPromise = null;
+  }
+}
+
+const jobSweepTimer = setInterval(() => {
+  sweepExpiredUpstreamLogins().catch((error) => console.error('[upstream-browser-sweep]', error));
+}, config.upstreamBrowserSweepIntervalMs);
+jobSweepTimer.unref?.();
 
 async function runJob(job) {
   try {
     await fs.mkdir(job.profilePath, { recursive: true });
-    const { browser, browserProcess, context, browserEngine } = await connectVisibleSystemBrowser(job);
+    if (!isActiveJob(job)) return;
+    job.launching = true;
+    let connection;
+    try {
+      connection = await connectVisibleSystemBrowser(job);
+    } finally {
+      job.launching = false;
+    }
+    const { browser, browserProcess, context, browserEngine } = connection;
+    if (!isActiveJob(job)) {
+      await browser.close().catch(() => {});
+      if (browserProcess && browserProcess.exitCode == null) browserProcess.kill();
+      releaseProfileLock(job);
+      return;
+    }
     job.browser = browser;
     job.browserProcess = browserProcess;
     job.browserEngine = browserEngine;
@@ -338,12 +512,13 @@ async function runJob(job) {
     browser.on('disconnected', () => {
       job.context = null;
       job.browser = null;
-      if (activeOrigins.get(job.origin) === job.id) activeOrigins.delete(job.origin);
+      releaseProfileLock(job);
       if (!job.closing && !['captured', 'consumed', 'cancelled', 'expired'].includes(job.status)) {
         job.status = 'closed';
         job.message = job.purpose === 'browse'
           ? '上游浏览器窗口已关闭'
           : '浏览器窗口已关闭，尚未检测到有效登录态';
+        markForRemoval(job);
       }
     });
     const pages = context.pages();
@@ -358,9 +533,11 @@ async function runJob(job) {
       const cookies = browserCookiesFromHeader(job.origin, job.savedCookieHeader);
       job.savedCookieHeader = '';
       if (cookies.length) await context.addCookies(cookies);
+      if (!isActiveJob(job)) return;
       await page.goto(job.targetUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(async () => {
         await page.goto(job.origin, { waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(() => {});
       });
+      if (!isActiveJob(job)) return;
       await page.bringToFront().catch(() => {});
       job.status = 'opened';
       job.message = cookies.length ? '已复用浏览器登录态打开上游' : '已使用原浏览器配置打开上游';
@@ -382,41 +559,44 @@ async function runJob(job) {
         await page.goto(job.origin, { waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(() => {});
       });
     }
+    if (!isActiveJob(job)) return;
     await scanJob(job);
     if (job.status !== 'captured') {
       job.pollTimer = setInterval(() => { scanJob(job).catch(() => {}); }, 750);
       job.timeoutTimer = setTimeout(async () => {
         if (!['opening', 'waiting'].includes(job.status)) return;
-        job.status = 'expired';
-        job.message = '登录窗口等待超时，请重新发起';
-        await closeJobBrowser(job);
+        if (markExpired(job)) {
+          job.message = '登录窗口等待超时，请重新发起';
+          await closeJobBrowser(job);
+        }
       }, LOGIN_TTL_MS);
     }
   } catch (error) {
-    job.status = 'failed';
-    job.error = String(error?.message || error || '浏览器启动失败');
-    job.message = '内置浏览器启动失败';
+    if (!['consumed', 'cancelled', 'expired'].includes(job.status)) {
+      job.status = 'failed';
+      job.error = String(error?.message || error || '浏览器启动失败');
+      job.message = '内置浏览器启动失败';
+      markForRemoval(job);
+    }
     await closeJobBrowser(job);
   }
 }
 
-export function startUpstreamLogin({ type = 'sub2api', baseUrl }) {
+export function startUpstreamLogin({ type = 'sub2api', baseUrl, proxyServer = '', resolvedAddresses = [] }) {
   if (type !== 'sub2api') throw Object.assign(new Error('当前仅支持 Sub2API 浏览器登录'), { statusCode: 400 });
   const origin = loginOrigin(baseUrl);
-  const existingId = activeOrigins.get(origin);
-  const existing = existingId ? jobs.get(existingId) : null;
-  if (existing?.purpose === 'browse' && ['opening', 'opened'].includes(existing.status)) {
-    throw Object.assign(new Error('请先关闭已打开的上游窗口，再发起新的浏览器登录'), { statusCode: 409 });
-  }
-  if (existing && ['opening', 'waiting', 'captured'].includes(existing.status)) return publicJob(existing);
+  const normalizedProxy = normalizeBrowserProxyServer(proxyServer);
 
   const id = crypto.randomUUID();
-  const browserProfileId = profileId(origin);
+  const browserProfileId = createBrowserProfileId();
   const now = new Date();
+  const absoluteExpiresAt = new Date(now.getTime() + config.upstreamBrowserAbsoluteTtlMs).toISOString();
   const job = {
     id,
     type,
     origin,
+    proxyServer: normalizedProxy,
+    resolvedAddresses,
     profileId: browserProfileId,
     profilePath: profileDirectory(browserProfileId),
     status: 'opening',
@@ -427,7 +607,8 @@ export function startUpstreamLogin({ type = 'sub2api', baseUrl }) {
     secret: null,
     hasCookies: false,
     createdAt: now.toISOString(),
-    expiresAt: new Date(now.getTime() + LOGIN_TTL_MS).toISOString(),
+    expiresAt: new Date(Math.min(now.getTime() + LOGIN_TTL_MS, Date.parse(absoluteExpiresAt))).toISOString(),
+    absoluteExpiresAt,
     capturedAt: '',
     context: null,
     browser: null,
@@ -436,19 +617,36 @@ export function startUpstreamLogin({ type = 'sub2api', baseUrl }) {
     pollTimer: null,
     timeoutTimer: null,
     scanning: false,
+    launching: false,
+    closePromise: null,
+    runPromise: null,
+    removeAfter: 0,
   };
-  jobs.set(id, job);
-  activeOrigins.set(origin, id);
-  runJob(job).catch(() => {});
+  reserveBrowserJob(job);
+  job.runPromise = runJob(job).catch(() => {});
   return publicJob(job);
 }
 
-export function startUpstreamBrowserSession({ type = 'sub2api', baseUrl, sessionCookie = '' }) {
+export function startUpstreamBrowserSession({
+  type = 'sub2api',
+  baseUrl,
+  sessionCookie = '',
+  browserProfileId,
+  proxyServer = '',
+  resolvedAddresses = [],
+}) {
   if (type !== 'sub2api') throw Object.assign(new Error('当前仅支持 Sub2API 浏览器会话'), { statusCode: 400 });
   const origin = loginOrigin(baseUrl);
-  const existingId = activeOrigins.get(origin);
-  const existing = existingId ? jobs.get(existingId) : null;
-  if (existing && ['opening', 'waiting', 'captured', 'opened'].includes(existing.status)) {
+  const savedProfileId = validateBrowserProfileId(browserProfileId);
+  const normalizedProxy = normalizeBrowserProxyServer(proxyServer);
+  const existing = activeJobForProfile(savedProfileId);
+  if (existing) {
+    if (existing.origin !== origin) {
+      throw statusError('浏览器资料正在用于其他上游来源', 409);
+    }
+    if (existing.proxyServer !== normalizedProxy) {
+      throw statusError('浏览器资料正在使用不同的代理策略，请先关闭已有窗口', 409);
+    }
     const page = existing.context?.pages().find((candidate) => {
       try {
         return new URL(candidate.url()).origin === origin;
@@ -461,17 +659,19 @@ export function startUpstreamBrowserSession({ type = 'sub2api', baseUrl, session
   }
 
   const id = crypto.randomUUID();
-  const browserProfileId = profileId(origin);
   const now = new Date();
+  const absoluteExpiresAt = new Date(now.getTime() + config.upstreamBrowserAbsoluteTtlMs).toISOString();
   const job = {
     id,
     type,
     origin,
+    proxyServer: normalizedProxy,
+    resolvedAddresses,
     purpose: 'browse',
     targetUrl: `${origin}/`,
     savedCookieHeader: String(sessionCookie || ''),
-    profileId: browserProfileId,
-    profilePath: profileDirectory(browserProfileId),
+    profileId: savedProfileId,
+    profilePath: profileDirectory(savedProfileId),
     status: 'opening',
     message: '正在用原浏览器登录态打开上游',
     error: '',
@@ -480,7 +680,8 @@ export function startUpstreamBrowserSession({ type = 'sub2api', baseUrl, session
     secret: null,
     hasCookies: Boolean(sessionCookie),
     createdAt: now.toISOString(),
-    expiresAt: '',
+    expiresAt: absoluteExpiresAt,
+    absoluteExpiresAt,
     capturedAt: '',
     context: null,
     browser: null,
@@ -489,20 +690,20 @@ export function startUpstreamBrowserSession({ type = 'sub2api', baseUrl, session
     pollTimer: null,
     timeoutTimer: null,
     scanning: false,
+    launching: false,
+    closePromise: null,
+    runPromise: null,
+    removeAfter: 0,
   };
-  jobs.set(id, job);
-  activeOrigins.set(origin, id);
-  runJob(job).catch(() => {});
+  reserveBrowserJob(job);
+  job.runPromise = runJob(job).catch(() => {});
   return publicJob(job);
 }
 
 export function getUpstreamLogin(id) {
   const job = jobs.get(String(id || ''));
   if (!job) throw Object.assign(new Error('登录任务不存在或已经过期'), { statusCode: 404 });
-  if (Date.parse(job.expiresAt) <= Date.now() && job.status === 'captured') {
-    job.status = 'expired';
-    job.secret = null;
-    job.message = '捕获的登录态已过期，请重新登录';
+  if (isActiveJob(job) && expirationTime(job) <= Date.now() && markExpired(job)) {
     closeJobBrowser(job).catch(() => {});
   }
   return publicJob(job);
@@ -510,6 +711,9 @@ export function getUpstreamLogin(id) {
 
 export function getUpstreamLoginCredential(id, expectedBaseUrl) {
   const job = jobs.get(String(id || ''));
+  if (isActiveJob(job) && expirationTime(job) <= Date.now() && markExpired(job)) {
+    closeJobBrowser(job).catch(() => {});
+  }
   if (!job || job.status !== 'captured' || !job.secret) {
     throw Object.assign(new Error('内置浏览器尚未取得有效登录态'), { statusCode: 409 });
   }
@@ -521,6 +725,9 @@ export function getUpstreamLoginCredential(id, expectedBaseUrl) {
 
 export function updateUpstreamLoginCredential(id, secret = {}) {
   const job = jobs.get(String(id || ''));
+  if (isActiveJob(job) && expirationTime(job) <= Date.now() && markExpired(job)) {
+    closeJobBrowser(job).catch(() => {});
+  }
   if (!job || job.status !== 'captured' || !job.secret) return;
   job.secret = { ...job.secret, ...secret };
 }
@@ -531,8 +738,8 @@ export async function consumeUpstreamLogin(id) {
   job.status = 'consumed';
   job.secret = null;
   job.message = '登录态已加密保存到监控账号';
+  markForRemoval(job, Date.now(), 60_000);
   await closeJobBrowser(job);
-  setTimeout(() => jobs.delete(job.id), 60_000).unref?.();
 }
 
 export async function cancelUpstreamLogin(id) {
@@ -541,18 +748,20 @@ export async function cancelUpstreamLogin(id) {
   job.status = 'cancelled';
   job.secret = null;
   job.message = '登录任务已取消';
+  markForRemoval(job, Date.now(), 60_000);
   await closeJobBrowser(job);
-  setTimeout(() => jobs.delete(job.id), 60_000).unref?.();
   return true;
 }
 
 export async function shutdownUpstreamLogins() {
-  const activeJobs = [...jobs.values()].filter((job) => job.context || job.browserProcess);
+  const allJobs = [...jobs.values()];
+  const activeJobs = allJobs.filter((job) => isActiveJob(job) || job.context || job.browserProcess || job.launching);
   await Promise.allSettled(activeJobs.map(async (job) => {
     job.status = 'cancelled';
     job.secret = null;
     await closeJobBrowser(job);
   }));
-  activeOrigins.clear();
+  await Promise.allSettled(allJobs.map((job) => job.runPromise).filter(Boolean));
+  activeProfiles.clear();
   jobs.clear();
 }

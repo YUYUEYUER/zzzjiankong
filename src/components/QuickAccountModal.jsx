@@ -5,9 +5,10 @@ import { money } from '../lib.js';
 import { applySub2ApiSession, buildQuickAccountPayload, parseSub2ApiSession } from '../quick-account.js';
 import { Modal } from './Modal.jsx';
 
-function defaults(upstreamName = '') {
+function defaults(upstream = null) {
   return {
-    upstreamName,
+    upstreamId: upstream?.id || '',
+    upstreamName: upstream?.name || '',
     name: '',
     type: 'newapi',
     baseUrl: '',
@@ -30,7 +31,7 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, browserW
   useEffect(() => {
     if (!open) return;
     const defaultUpstream = upstreams.find((upstream) => upstream.id === defaultUpstreamId) || upstreams[0];
-    setForm(defaults(defaultUpstream?.name || ''));
+    setForm(defaults(defaultUpstream));
     setPreview(null);
     setBusy('');
     setImportError('');
@@ -66,6 +67,12 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, browserW
   const set = (key, value) => {
     setPreview(null);
     setForm((current) => ({ ...current, [key]: value }));
+  };
+
+  const selectUpstream = (upstreamId) => {
+    const upstream = upstreams.find((item) => item.id === upstreamId);
+    setPreview(null);
+    setForm((current) => ({ ...current, upstreamId, upstreamName: upstream?.name || '' }));
   };
 
   const changeType = (type) => {
@@ -128,9 +135,13 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, browserW
     setImportError('');
     if (sessionFileInputRef.current) sessionFileInputRef.current.value = '';
     try {
-      const request = api.startUpstreamLogin({ type: 'sub2api', baseUrl });
+      const request = api.startUpstreamLogin({ type: 'sub2api', baseUrl, upstreamId: form.upstreamId });
+      const popup = browserWorkspaceUrl
+        ? window.open(browserWorkspaceUrl, 'frosted-upstream-browser', 'noopener,noreferrer')
+        : null;
       if (browserWorkspaceUrl) {
-        window.open(browserWorkspaceUrl, 'frosted-upstream-browser', 'noopener,noreferrer');
+        const ticket = await api.browserTicket().catch(() => null);
+        if (ticket?.url && popup && !popup.closed) popup.location.href = ticket.url;
       }
       const job = await request;
       setForm((current) => ({
@@ -208,7 +219,7 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, browserW
         </div>
 
         <div className="form-grid two">
-          <label><span>所属上游</span><input required value={form.upstreamName} onChange={(event) => set('upstreamName', event.target.value)} placeholder="例如 newapi、sub2api" /></label>
+          <label><span>所属上游</span><select required value={form.upstreamId} onChange={(event) => selectUpstream(event.target.value)}><option value="" disabled>请选择已创建的上游</option>{upstreams.map((upstream) => <option key={upstream.id} value={upstream.id}>{upstream.name}</option>)}</select></label>
           <label><span>账号名称</span><input required value={form.name} onChange={(event) => set('name', event.target.value)} placeholder="例如：主账号" /></label>
         </div>
         <label><span>上游地址</span><input required type="url" value={form.baseUrl} onChange={(event) => set('baseUrl', event.target.value)} placeholder={form.type === 'newapi' ? 'https://newapi.example.com' : 'https://sub2.example.com'} /></label>

@@ -9,12 +9,20 @@ import {
   turnstileTokenState,
 } from './turnstile.js';
 import { currentUpstreamProxyContext, withUpstreamProxyContext } from './proxy-pool.js';
+import {
+  createPinnedDispatcher,
+  parseUpstreamUrl,
+  readLimitedBody,
+  resolveUpstreamUrl,
+} from './network-policy.js';
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function baseUrl(value) {
-  const url = new URL(value);
-  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('站点地址仅支持 HTTP 或 HTTPS');
+  const url = parseUpstreamUrl(value, {
+    production: config.production,
+    allowedHosts: config.upstreamAllowedHosts,
+  });
   url.pathname = url.pathname.replace(/\/$/, '');
   return url.toString().replace(/\/$/, '');
 }
@@ -63,10 +71,37 @@ async function fetchWithSameOriginRedirects(url, options = {}, maxRedirects = 5)
   let currentOptions = { ...options, redirect: 'manual' };
 
   for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount += 1) {
-    const response = await fetch(currentUrl, currentOptions);
-    if (![301, 302, 303, 307, 308].includes(response.status)) return response;
+    const proxy = currentUpstreamProxyContext();
+    let dispatcher = proxy?.dispatcher || currentOptions.dispatcher;
+    let ownedDispatcher = null;
+    if (config.enforceUpstreamNetworkPolicy) {
+      const resolved = await resolveUpstreamUrl(currentUrl, {
+        production: config.production,
+        allowedHosts: config.upstreamAllowedHosts,
+        allowPrivate: false,
+      });
+      if (!dispatcher) {
+        ownedDispatcher = createPinnedDispatcher(resolved);
+        dispatcher = ownedDispatcher;
+      }
+    } else {
+      parseUpstreamUrl(currentUrl, {
+        production: config.production,
+        allowedHosts: config.upstreamAllowedHosts,
+      });
+    }
+    let response;
+    try {
+      response = await fetch(currentUrl, { ...currentOptions, ...(dispatcher ? { dispatcher } : {}) });
+    } catch (error) {
+      await ownedDispatcher?.close?.().catch(() => {});
+      throw error;
+    }
+    if (![301, 302, 303, 307, 308].includes(response.status)) {
+      return { response, release: () => ownedDispatcher?.close?.() };
+    }
     const location = response.headers.get('location');
-    if (!location) return response;
+    if (!location) return { response, release: () => ownedDispatcher?.close?.() };
     if (redirectCount === maxRedirects) throw new Error('上游重定向次数过多');
 
     const nextUrl = new URL(location, currentUrl);
@@ -74,6 +109,7 @@ async function fetchWithSameOriginRedirects(url, options = {}, maxRedirects = 5)
       await response.body?.cancel().catch(() => {});
       const error = new Error('上游尝试跨域重定向，已阻止凭据发送到其他站点');
       error.code = 'UPSTREAM_CROSS_ORIGIN_REDIRECT';
+      await ownedDispatcher?.close?.().catch(() => {});
       throw error;
     }
 
@@ -88,6 +124,7 @@ async function fetchWithSameOriginRedirects(url, options = {}, maxRedirects = 5)
       currentOptions = { ...currentOptions, method: 'GET', body: undefined, headers };
     }
     await response.body?.cancel().catch(() => {});
+    await ownedDispatcher?.close?.().catch(() => {});
     currentUrl = nextUrl.toString();
   }
   throw new Error('上游重定向次数过多');
@@ -96,14 +133,15 @@ async function fetchWithSameOriginRedirects(url, options = {}, maxRedirects = 5)
 async function requestJson(url, options = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs || 12000);
+  let release = null;
   try {
-    const proxy = currentUpstreamProxyContext();
-    const response = await fetchWithSameOriginRedirects(url, {
+    const result = await fetchWithSameOriginRedirects(url, {
       ...options,
-      ...(proxy?.dispatcher && !options.dispatcher ? { dispatcher: proxy.dispatcher } : {}),
       signal: controller.signal,
     });
-    const text = await response.text();
+    const { response } = result;
+    release = result.release;
+    const text = await readLimitedBody(response, config.upstreamResponseMaxBytes);
     let body = {};
     let parsed = true;
     try {
@@ -127,6 +165,11 @@ async function requestJson(url, options = {}) {
     throw error;
   } finally {
     clearTimeout(timer);
+    try {
+      await release?.();
+    } catch {
+      // Closing an owned dispatcher must not replace the upstream result.
+    }
   }
 }
 

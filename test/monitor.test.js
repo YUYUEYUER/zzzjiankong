@@ -5,9 +5,27 @@ import path from 'node:path';
 import os from 'node:os';
 import { inspect } from 'node:util';
 import { JsonStore } from '../server/store.js';
-import { Monitor } from '../server/monitor.js';
+import { compactSnapshots, Monitor } from '../server/monitor.js';
 import { attachCredentialCheckpoint } from '../server/credential-checkpoint.js';
 import { decryptSecret, encryptSecret } from '../server/security.js';
+
+test('snapshot compaction keeps recent detail and bounded older history', () => {
+  const current = Date.UTC(2026, 6, 30, 12);
+  const snapshots = [];
+  for (let minutes = 0; minutes < 90 * 24 * 60; minutes += 1) {
+    snapshots.push({
+      id: `snapshot-${minutes}`,
+      accountId: 'account-1',
+      capturedAt: new Date(current - minutes * 60000).toISOString(),
+    });
+  }
+  snapshots.push({ id: 'expired', accountId: 'account-1', capturedAt: new Date(current - 91 * 86400000).toISOString() });
+  const compacted = compactSnapshots(snapshots, current);
+  assert.ok(compacted.length < 2300);
+  assert.equal(compacted.some((item) => item.id === 'expired'), false);
+  assert.equal(compacted.filter((item) => new Date(item.capturedAt).getTime() >= current - 24 * 3600000).length, 1441);
+  assert.ok(compacted.some((item) => new Date(item.capturedAt).getTime() < current - 60 * 86400000));
+});
 
 test('manual recharge closes an incident after two healthy polls', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'frosted-console-'));

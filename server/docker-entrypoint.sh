@@ -13,7 +13,7 @@ start_remote_desktop() {
   runtime_dir="/tmp/frosted-pwuser-runtime"
   mkdir -p "$runtime_dir"
   chown pwuser:pwuser "$runtime_dir"
-  chmod 700 "$runtime_dir"
+  runuser -u pwuser -- chmod 700 "$runtime_dir"
 
   runuser -u pwuser -- env HOME=/home/pwuser XDG_RUNTIME_DIR="$runtime_dir" \
     Xvfb "$DISPLAY" -screen 0 "$geometry" -ac +extension RANDR >/tmp/frosted-xvfb.log 2>&1 &
@@ -41,6 +41,9 @@ start_remote_desktop() {
 
 if [ "$(id -u)" = "0" ]; then
   chown -R pwuser:pwuser /app/data
+  if [ -d /home/pwuser ]; then
+    chown -R pwuser:pwuser /home/pwuser
+  fi
   if [ -n "${MIHOMO_SHARED_DIR:-}" ]; then
     mkdir -p "$MIHOMO_SHARED_DIR"
     chown -R pwuser:pwuser "$MIHOMO_SHARED_DIR"

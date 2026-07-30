@@ -10,6 +10,9 @@
     "preview": "vite preview --host 0.0.0.0",
     "test": "node --test",
     "smoke:browser": "node server/browser-smoke.js",
+    "backup": "node server/backup.js create",
+    "restore": "node server/backup.js restore",
+    "rotate-master-key": "node server/rotate-master-key.js",
     "postinstall": "node -e \"try{require('child_process').execSync('npx playwright install chromium',{stdio:'inherit'})}catch(e){console.warn('[postinstall] playwright chromium skipped:',e.message)}\""
   },
   "dependencies": {
@@ -33,6 +36,7 @@
     "react-dom": "19.2.0",
     "undici": "7.28.0",
     "vite": "6.4.3",
+    "ws": "^8.21.1",
     "yaml": "^2.9.0",
     "zod": "^4.4.3"
   }
