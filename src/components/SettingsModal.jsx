@@ -6,6 +6,9 @@ import { Modal } from './Modal.jsx';
 import { SecurityPanel } from './SecurityPanel.jsx';
 import { ProxyPoolPanel } from './ProxyPoolPanel.jsx';
 
+const DEFAULT_REMINDER_MINUTES = 360;
+const REMINDER_PRESETS = [180, 360, 720, 1440];
+
 function readiness(channel, form) {
   if (channel === 'resend') {
     const missing = [
@@ -42,11 +45,16 @@ export function SettingsModal({ open, settings, proxyPool, initialTab = 'notific
   const [busy, setBusy] = useState('');
   const [tests, setTests] = useState({});
   const [tab, setTab] = useState('notifications');
+  const [reminderMode, setReminderMode] = useState('360');
+  const [customReminderMinutes, setCustomReminderMinutes] = useState(DEFAULT_REMINDER_MINUTES);
   const wasOpen = useRef(false);
 
   useEffect(() => {
     if (open && !wasOpen.current) {
-      setForm({ ...settings, resendApiKey: '', feishuWebhook: '' });
+      const reminderMinutes = Number(settings?.reminderMinutes) || DEFAULT_REMINDER_MINUTES;
+      setForm({ ...settings, reminderMinutes, resendApiKey: '', feishuWebhook: '' });
+      setReminderMode(REMINDER_PRESETS.includes(reminderMinutes) ? String(reminderMinutes) : 'custom');
+      setCustomReminderMinutes(reminderMinutes);
       setTests({});
     }
     wasOpen.current = open;
@@ -59,6 +67,21 @@ export function SettingsModal({ open, settings, proxyPool, initialTab = 'notific
   const resendState = useMemo(() => readiness('resend', form), [form]);
   const feishuState = useMemo(() => readiness('feishu', form), [form]);
   const set = (key, value) => setForm((current) => ({ ...current, [key]: value }));
+  const changeReminderMode = (value) => {
+    if (reminderMode === 'custom') {
+      const currentMinutes = Number(form.reminderMinutes);
+      if (Number.isInteger(currentMinutes) && currentMinutes >= 1 && currentMinutes <= 10080) {
+        setCustomReminderMinutes(currentMinutes);
+      }
+    }
+    setReminderMode(value);
+    set('reminderMinutes', value === 'custom' ? customReminderMinutes : Number(value));
+  };
+  const changeCustomReminder = (value) => {
+    const minutes = value === '' ? '' : Number(value);
+    setCustomReminderMinutes(minutes);
+    set('reminderMinutes', minutes);
+  };
 
   const save = async (event) => {
     event.preventDefault();
@@ -115,7 +138,7 @@ export function SettingsModal({ open, settings, proxyPool, initialTab = 'notific
 
         <section className="notification-section compact">
           <header><CheckCircle size={21} /><div><h3>提醒与恢复闭环</h3><p>低余额持续未恢复会节流提醒；充值后连续检测达标再自动结单。</p></div></header>
-          <div className="form-grid two"><label><span>恢复确认次数</span><select value={form.recoveryConfirmations || 2} onChange={(event) => set('recoveryConfirmations', Number(event.target.value))}><option value="1">连续 1 次</option><option value="2">连续 2 次</option><option value="3">连续 3 次</option></select></label><label><span>未恢复重复提醒</span><select value={form.reminderHours || 6} onChange={(event) => set('reminderHours', Number(event.target.value))}><option value="3">每 3 小时</option><option value="6">每 6 小时</option><option value="12">每 12 小时</option><option value="24">每 24 小时</option></select></label></div>
+          <div className="form-grid two"><label><span>恢复确认次数</span><select value={form.recoveryConfirmations || 2} onChange={(event) => set('recoveryConfirmations', Number(event.target.value))}><option value="1">连续 1 次</option><option value="2">连续 2 次</option><option value="3">连续 3 次</option></select></label><div className="reminder-field"><span className="field-label">未恢复重复提醒</span><div className={`reminder-interval-control ${reminderMode === 'custom' ? 'custom' : ''}`}><select aria-label="未恢复重复提醒周期" value={reminderMode} onChange={(event) => changeReminderMode(event.target.value)}><option value="180">每 3 小时</option><option value="360">每 6 小时</option><option value="720">每 12 小时</option><option value="1440">每 24 小时</option><option value="custom">自定义分钟</option></select>{reminderMode === 'custom' && <div className="reminder-custom-input"><input aria-label="自定义提醒周期，单位分钟，范围 1 到 10080" type="number" min="1" max="10080" step="1" required value={form.reminderMinutes ?? ''} onChange={(event) => changeCustomReminder(event.target.value)} /><span aria-hidden="true">分钟</span></div>}</div></div></div>
           <div className="closure-flow"><span>低于阈值</span><i>→</i><span>双渠道告警</span><i>→</i><span>手动充值</span><i>→</i><span>连续检测恢复</span><i>→</i><span>恢复通知并结单</span></div>
         </section>
         <footer className="modal-actions"><span className="settings-save-note">启用渠道前建议先完成单独测试。</span><div><button type="button" className="ghost-button" onClick={onClose}>取消</button><button className="primary-button" disabled={Boolean(busy)}>{busy === 'save' && <SpinnerGap className="spin" />} 保存设置</button></div></footer>

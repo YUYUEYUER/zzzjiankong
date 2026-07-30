@@ -20,7 +20,7 @@ function defaults(type = 'newapi', upstreamId = '', upstreamName = '') {
     formula: type === 'sub2api' ? sub2Defaults.formula : type === 'newapi' ? 'x / 500000 * 1' : 'x',
     rawUnit: type === 'sub2api' ? sub2Defaults.rawUnit : type === 'newapi' ? 'quota' : 'CNY',
     turnstileSiteKey: '',
-    thresholdLow: 10, thresholdRecover: 15, pollIntervalMinutes: 5, enabled: true,
+    thresholdLow: 3, thresholdRecover: 5, pollIntervalMinutes: 5, enabled: true,
     notifications: { resend: true, feishu: true },
     credentials: {
       apiToken: '', accessToken: '', refreshToken: '', password: '', turnstileToken: '',

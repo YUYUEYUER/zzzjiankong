@@ -255,8 +255,14 @@ const settingsSchema = z.object({
   feishuEnabled: z.boolean(),
   feishuWebhook: z.string().optional(),
   recoveryConfirmations: z.coerce.number().int().min(1).max(5),
-  reminderHours: z.coerce.number().int().min(1).max(168),
+  reminderMinutes: z.coerce.number().int().min(1).max(10080).optional(),
+  reminderHours: z.coerce.number().int().min(1).max(168).optional(),
 });
+
+const saveSettingsSchema = settingsSchema.refine(
+  (input) => input.reminderMinutes !== undefined || input.reminderHours !== undefined,
+  { message: '提醒周期不能为空', path: ['reminderMinutes'] },
+);
 
 const notificationTestSchema = z.object({
   channel: z.enum(['resend', 'feishu']),
@@ -1282,7 +1288,7 @@ app.post('/api/incidents/:id/acknowledge', asyncRoute(async (req, res) => {
 }));
 
 app.put('/api/settings', asyncRoute(async (req, res) => {
-  const input = settingsSchema.parse(req.body);
+  const input = saveSettingsSchema.parse(req.body);
   await store.mutate((data) => {
     data.settings = {
       ...data.settings,
@@ -1291,7 +1297,7 @@ app.put('/api/settings', asyncRoute(async (req, res) => {
       resendTo: input.resendTo,
       feishuEnabled: input.feishuEnabled,
       recoveryConfirmations: input.recoveryConfirmations,
-      reminderHours: input.reminderHours,
+      reminderMinutes: input.reminderHours !== undefined ? input.reminderHours * 60 : input.reminderMinutes,
       resendApiKeyEncrypted: input.resendApiKey ? encryptSecret({ value: input.resendApiKey }) : data.settings.resendApiKeyEncrypted,
       feishuWebhookEncrypted: input.feishuWebhook ? encryptSecret({ value: input.feishuWebhook }) : data.settings.feishuWebhookEncrypted,
     };

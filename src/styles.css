@@ -414,6 +414,12 @@ td { height: 46px; color: #526177; border-bottom: 1px solid rgba(117,139,168,.14
 .account-form textarea.masked-textarea { -webkit-text-security: disc; }
 .upstream-form label small { display: block; margin-top: 7px; color: #7b899b; font-size: 11px; line-height: 1.45; }
 .account-form input::placeholder, .settings-form input::placeholder { color: #a3adba; }
+.reminder-field { min-width: 0; margin-bottom: 10px; }
+.reminder-interval-control { display: grid; grid-template-columns: minmax(0,1fr); gap: 8px; }
+.reminder-interval-control.custom { grid-template-columns: minmax(0,1fr) minmax(112px,.72fr); }
+.reminder-custom-input { display: grid; grid-template-columns: minmax(0,1fr) max-content; align-items: center; gap: 8px; min-width: 0; }
+.reminder-custom-input input { min-width: 0; font-variant-numeric: tabular-nums; }
+.reminder-custom-input > span { color: #7c8999; font-size: 11px; pointer-events: none; }
 .auth-row { display: grid; grid-template-columns: 150px repeat(2,minmax(0,1fr)); gap: 10px; }
 .secret-input { position: relative; }
 .secret-input input { padding-right: 38px; }
@@ -668,7 +674,7 @@ td { height: 46px; color: #526177; border-bottom: 1px solid rgba(117,139,168,.14
   .metric-block { padding: 15px 2px; }
   .workspace { min-height: 900px; }
   .chart-wrap { min-height: 240px; }
-  .tester-grid, .form-grid.two, .form-grid.three, .form-grid.formula-grid, .auth-row { grid-template-columns: 1fr; }
+  .tester-grid, .form-grid.two, .form-grid.three, .form-grid.formula-grid, .auth-row, .reminder-interval-control.custom { grid-template-columns: 1fr; }
   .formula-test-button { width: 100%; }
   .modal-backdrop { padding: 8px; }
   .modal-panel { max-height: 96vh; }
@@ -677,6 +683,9 @@ td { height: 46px; color: #526177; border-bottom: 1px solid rgba(117,139,168,.14
   .account-form .modal-actions { position: static; }
   .settings-tabs button { min-width: 0; flex: 1; }
   .settings-tabs button { font-size: 10px; }
+  .closure-flow { display: grid; grid-template-columns: repeat(5,max-content); justify-content: space-between; gap: 0; padding-inline: 6px; font-size: 8px; }
+  .closure-flow span { white-space: nowrap; }
+  .closure-flow i { display: none; }
   .proxy-import-row { grid-template-columns: 1fr; align-items: stretch; }
   .proxy-import-row .primary-button, .proxy-import-row .secondary-button { width: 100%; }
   .proxy-summary-strip { grid-template-columns: repeat(2,1fr); }

@@ -67,18 +67,47 @@ export class Monitor {
   async tick() {
     const data = this.store.snapshot();
     const current = Date.now();
+    const reminderTransitions = await this.queueDueReminders(data, current);
     const due = data.accounts.filter((account) => {
       if (!account.enabled || this.running.has(account.id)) return false;
       const last = account.lastSyncAt ? new Date(account.lastSyncAt).getTime() : 0;
       return current - last >= Number(account.pollIntervalMinutes || 5) * 60000;
     });
-    await Promise.allSettled(due.map((account) => this.poll(account.id)));
+    await Promise.allSettled([
+      ...reminderTransitions.map((transition) => this.sendTransition(transition)),
+      ...due.map((account) => this.poll(account.id)),
+    ]);
   }
 
   reminderDue(incident, settings, current = Date.now()) {
     const previous = incident.lastReminderQueuedAt || incident.lastReminderAt || incident.lastNotificationAt || incident.openedAt;
     const previousTime = new Date(previous || 0).getTime();
-    return current - previousTime >= Number(settings.reminderHours || 6) * 3600000;
+    return current - previousTime >= Number(settings.reminderMinutes || 360) * 60000;
+  }
+
+  async queueDueReminders(snapshot, current = Date.now()) {
+    const accountById = new Map(snapshot.accounts.map((account) => [account.id, account]));
+    const hasDueReminder = snapshot.incidents.some((incident) => (
+      incident.state === 'open'
+      && accountById.get(incident.accountId)?.enabled
+      && this.reminderDue(incident, snapshot.settings, current)
+    ));
+    if (!hasDueReminder) return [];
+
+    return this.store.mutate((data) => {
+      const transitions = [];
+      const queuedAt = new Date(current).toISOString();
+      for (const incident of data.incidents) {
+        if (incident.state !== 'open') continue;
+        const account = data.accounts.find((item) => item.id === incident.accountId);
+        if (!account?.enabled || !this.reminderDue(incident, data.settings, current)) continue;
+        incident.lastReminderQueuedAt = queuedAt;
+        const event = createNotificationOutboxEvent('reminder', account, incident, current);
+        data.notificationOutbox.push(event);
+        transitions.push({ eventId: event.id });
+      }
+      return transitions;
+    });
   }
 
   async poll(accountId, options = {}) {

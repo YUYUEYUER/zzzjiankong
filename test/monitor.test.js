@@ -56,9 +56,9 @@ test('an unresolved incident is reminded once per configured interval', async ()
   const monitor = new Monitor(store);
 
   await store.mutate((data) => {
-    data.settings.reminderHours = 1;
+    data.settings.reminderMinutes = 1;
     const incident = data.incidents.find((item) => item.id === 'inc-hk');
-    incident.openedAt = new Date(Date.now() - 2 * 3600000).toISOString();
+    incident.openedAt = new Date(Date.now() - 2 * 60000).toISOString();
     delete incident.lastNotificationAt;
     delete incident.lastReminderAt;
   });
@@ -71,6 +71,50 @@ test('an unresolved incident is reminded once per configured interval', async ()
   await monitor.poll('acct-hk-backup');
   incident = store.snapshot().incidents.find((item) => item.id === 'inc-hk');
   assert.equal(incident.notifications.reminders.length, 1);
+
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test('minute reminder interval triggers exactly at its configured boundary', () => {
+  const monitor = new Monitor({});
+  const current = Date.UTC(2026, 6, 30, 12, 0, 0);
+  const incident = { openedAt: new Date(current - 7 * 60000).toISOString() };
+  const settings = { reminderMinutes: 7 };
+
+  assert.equal(monitor.reminderDue(incident, settings, current - 1), false);
+  assert.equal(monitor.reminderDue(incident, settings, current), true);
+});
+
+test('tick sends due reminders without waiting for the next account poll', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'frosted-reminder-tick-'));
+  const store = await new JsonStore(path.join(dir, 'db.json')).init();
+  const monitor = new Monitor(store);
+  const current = Date.now();
+
+  await store.mutate((data) => {
+    data.settings.reminderMinutes = 1;
+    for (const account of data.accounts) {
+      account.lastSyncAt = new Date(current).toISOString();
+      account.pollIntervalMinutes = 60;
+    }
+    for (const incident of data.incidents) {
+      if (incident.id !== 'inc-hk') incident.state = 'resolved';
+    }
+    const incident = data.incidents.find((item) => item.id === 'inc-hk');
+    incident.openedAt = new Date(current - 2 * 60000).toISOString();
+    delete incident.lastNotificationAt;
+    delete incident.lastReminderAt;
+    delete incident.lastReminderQueuedAt;
+  });
+
+  const snapshotsBefore = store.snapshot().snapshots.length;
+  await monitor.tick();
+  await monitor.tick();
+
+  const incident = store.snapshot().incidents.find((item) => item.id === 'inc-hk');
+  assert.equal(store.snapshot().snapshots.length, snapshotsBefore);
+  assert.equal(incident.notifications.reminders.length, 1);
+  assert.ok(incident.lastReminderAt);
 
   await fs.rm(dir, { recursive: true, force: true });
 });

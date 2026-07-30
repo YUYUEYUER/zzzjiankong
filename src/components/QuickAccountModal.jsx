@@ -278,7 +278,7 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, browserW
           {usingSub2BrowserLogin && <button type="button" className="quick-browser-login-clear" onClick={cancelBrowserLogin} aria-label="取消内置浏览器登录" title="取消登录"><X size={17} /></button>}
         </div>}
 
-        <div className="quick-defaults"><span>默认配置</span><strong>低于 ¥10 报警 · 5 分钟检测 · Resend 与飞书通知</strong></div>
+        <div className="quick-defaults"><span>默认配置</span><strong>低于 ¥3 报警 · 5 分钟检测 · Resend 与飞书通知</strong></div>
         {preview && <div className="quick-preview"><span>连接正常</span><strong>{money(preview.convertedCny)}</strong></div>}
 
         <div className="modal-actions quick-actions">

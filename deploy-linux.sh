@@ -27,9 +27,11 @@ command -v docker >/dev/null || { echo "请先安装 Docker Engine 与 Compose �
 docker compose version >/dev/null
 command -v openssl >/dev/null || { echo "请先安装 openssl" >&2; exit 1; }
 
+env_created=false
 if [[ ! -f .env ]]; then
   umask 077
   cp .env.example .env
+  env_created=true
 fi
 
 upsert_env() {
@@ -69,6 +71,31 @@ upsert_env TURNSTILE_HEADLESS "false"
 upsert_env NOVNC_ENABLED "true"
 upsert_env BROWSER_WORKSPACE_URL "/browser/vnc.html?autoconnect=true&resize=remote&reconnect=true&path=browser%2Fwebsockify"
 upsert_env SEED_DEMO "false"
+
+meminfo_file="${FROSTED_MEMINFO_FILE:-/proc/meminfo}"
+if [[ "$env_created" == "true" && -r "$meminfo_file" ]]; then
+  memory_kb="$(awk '/^MemTotal:/ { print $2; exit }' "$meminfo_file")"
+  if [[ "$memory_kb" =~ ^[0-9]+$ ]] && (( memory_kb < 6 * 1024 * 1024 )); then
+    upsert_env APP_MEMORY_LIMIT "2560m"
+    upsert_env MIHOMO_MEMORY_LIMIT "256m"
+    upsert_env TURNSTILE_BROWSER_CONCURRENCY "1"
+    upsert_env TURNSTILE_BROWSER_QUEUE_LIMIT "5"
+    upsert_env UPSTREAM_BROWSER_MAX_ACTIVE "1"
+    upsert_env BROWSER_GATEWAY_MAX_CONNECTIONS "2"
+    upsert_env BROWSER_GATEWAY_IDLE_TTL_MINUTES "10"
+    upsert_env NOVNC_GEOMETRY "1280x720x24"
+    upsert_env MONITOR_TICK_MS "30000"
+    echo "检测到内存少于 6 GB：自动验证池与人工浏览器池各限 1 个，最多同时运行 2 个浏览器。"
+    swap_kb="$(awk '/^SwapTotal:/ { print $2; exit }' "$meminfo_file")"
+    if [[ ! "$swap_kb" =~ ^[0-9]+$ ]] || (( swap_kb < 1024 * 1024 )); then
+      echo "提示：当前 Swap 少于 1 GB，建议配置 2 GB Swap 后再长期运行。" >&2
+    fi
+  fi
+fi
+
+if [[ "${FROSTED_PREPARE_ONLY:-false}" == "true" ]]; then
+  exit 0
+fi
 
 compose=(docker compose -f docker-compose.yml -f docker-compose.server.yml)
 "${compose[@]}" config --quiet

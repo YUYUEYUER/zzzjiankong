@@ -67,6 +67,8 @@ test('Sub2API quick form keeps the existing API-key payload when no session file
   assert.equal(payload.profilePath, '/v1/usage');
   assert.equal(payload.balancePath, 'remaining');
   assert.equal(payload.formula, 'x * 7.2');
+  assert.equal(payload.thresholdLow, 3);
+  assert.equal(payload.thresholdRecover, 5);
   assert.deepEqual(payload.credentials, {
     apiToken: 'sk-existing',
     apiTokens: ['sk-existing'],

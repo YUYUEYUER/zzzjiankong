@@ -205,6 +205,21 @@ test('API key detail endpoint is authenticated, converts balances, and never ret
     assert.notEqual(result.body.account.upstreamId, sharedUpstreamId);
     result = await request('/api/dashboard');
     assert.equal(result.body.upstreams.filter((upstream) => upstream.id === movedUpstreamId).length, 1);
+
+    const legacySettings = { ...result.body.settings, reminderHours: 7 };
+    result = await request('/api/settings', {
+      method: 'PUT',
+      body: JSON.stringify(legacySettings),
+    });
+    assert.equal(result.response.status, 200);
+    assert.equal(result.body.settings.reminderMinutes, 420);
+
+    result = await request('/api/settings', {
+      method: 'PUT',
+      body: JSON.stringify({ ...result.body.settings, reminderMinutes: 7 }),
+    });
+    assert.equal(result.response.status, 200);
+    assert.equal(result.body.settings.reminderMinutes, 7);
   } finally {
     await stopTestServer(child);
     upstream.close();

@@ -4,7 +4,7 @@ import crypto from "node:crypto";
 import { config } from "./config.js";
 
 const iso = (offsetMinutes = 0) => new Date(Date.now() + offsetMinutes * 60000).toISOString();
-const STORE_VERSION = 3;
+const STORE_VERSION = 4;
 
 function defaultProxyPool() {
   return {
@@ -35,8 +35,19 @@ function defaultSettings() {
     feishuEnabled: false,
     feishuWebhookEncrypted: "",
     recoveryConfirmations: 2,
-    reminderHours: 6,
+    reminderMinutes: 360,
   };
+}
+
+function migrateReminderSettings(settings) {
+  const configuredMinutes = Number(settings.reminderMinutes);
+  const legacyHours = Number(settings.reminderHours);
+  settings.reminderMinutes = Number.isInteger(configuredMinutes) && configuredMinutes >= 1 && configuredMinutes <= 10080
+    ? configuredMinutes
+    : Number.isFinite(legacyHours) && legacyHours > 0
+      ? Math.min(10080, Math.max(1, Math.round(legacyHours * 60)))
+      : 360;
+  delete settings.reminderHours;
 }
 
 function defaultAuth() {
@@ -158,6 +169,9 @@ export function validateDataGraph(data) {
     if (!Array.isArray(data[key])) throw new Error(`数据文件缺少 ${key} 数组`);
   }
   assertObject(data.settings, 'settings');
+  if (!Number.isInteger(data.settings.reminderMinutes) || data.settings.reminderMinutes < 1 || data.settings.reminderMinutes > 10080) {
+    throw new Error('settings.reminderMinutes 必须是 1–10080 的整数');
+  }
   assertObject(data.auth, 'auth');
   assertObject(data.proxyPool, 'proxyPool');
   if (!Array.isArray(data.proxyPool.nodes)) throw new Error('proxyPool 缺少 nodes 数组');
@@ -216,7 +230,7 @@ export function migrateData(source, idFactory = () => crypto.randomUUID()) {
   if (fromVersion > STORE_VERSION) throw new Error(`数据版本 ${fromVersion} 高于当前支持版本 ${STORE_VERSION}`);
 
   if (fromVersion === STORE_VERSION) {
-    if (!Array.isArray(data.upstreams)) throw new Error('版本 3 数据缺少 upstreams 数组');
+    if (!Array.isArray(data.upstreams)) throw new Error(`版本 ${STORE_VERSION} 数据缺少 upstreams 数组`);
     data.upstreams = data.upstreams.map(withProxyDefaults);
     validateDataGraph(data);
     return { data, changed: false, fromVersion };
@@ -235,6 +249,7 @@ export function migrateData(source, idFactory = () => crypto.randomUUID()) {
   data.upstreams = data.upstreams.map(withProxyDefaults);
   data.proxyPool = { ...defaultProxyPool(), ...(data.proxyPool || {}) };
   if (!Array.isArray(data.proxyPool.nodes)) data.proxyPool.nodes = [];
+  migrateReminderSettings(data.settings);
   data.version = STORE_VERSION;
   validateDataGraph(data);
   return { data, changed: true, fromVersion };

@@ -49,9 +49,9 @@ Sub2API 提供三种接入方式：直接填写 API Key、导入登录态 JSON�
 
 点击 **测试连接** 确认余额能够读取，再点击 **添加账号**。快速添加默认使用以下配置：
 
-- 余额低于 `¥10` 建立告警。
+- 余额低于 `¥3` 建立告警。
 - 每 `5` 分钟检测一次。
-- 余额恢复到 `¥15` 后开始恢复确认。
+- 余额恢复到 `¥5` 后开始恢复确认。
 - Resend 与飞书按各自启用状态发送通知。
 
 需要修改接口路径、余额字段、换算公式或阈值时，点击 **高级设置**。
@@ -78,7 +78,7 @@ Sub2API 提供三种接入方式：直接填写 API Key、导入登录态 JSON�
 
 1. 配置 Resend 发件人、收件人和 API Key，然后单独测试邮件链路。
 2. 配置飞书群机器人 Webhook，然后单独测试飞书链路。
-3. 保存恢复确认次数和未恢复重复提醒周期。
+3. 保存恢复确认次数和未恢复重复提醒周期；提醒周期可选常用小时值，也可自定义 `1–10080` 分钟。
 4. 余额低于阈值时系统自动建单；手动充值后，连续检测达到恢复阈值便发送恢复通知并结单。
 
 ![配置 Resend、飞书与自动结单](docs/images/05-notifications.png)
@@ -155,6 +155,8 @@ Caddy 会自动申请和续期 HTTPS 证书。脚本成功后访问 `https://pan
 | `UPSTREAM_ALLOWED_HOSTS` | 必须访问明确的内网上游 | 只填写精确主机名，多个用逗号分隔 |
 | `TURNSTILE_BROWSER_CONCURRENCY` | 调整自动验证并发 | 默认 `2`，范围 `1-4` |
 | `UPSTREAM_BROWSER_MAX_ACTIVE` | 调整人工有头浏览器并发 | 默认 `2`，按内存容量增加 |
+| `APP_MEMORY_LIMIT`、`MIHOMO_MEMORY_LIMIT` | 2 核 4G 小型服务器 | 分别使用 `2560m`、`256m` |
+| `APP_PIDS_LIMIT` | 8 核 16G 且需要 3 个以上浏览器 | 提高到 `1024`，同时观察内存与负载 |
 | Resend、飞书、Clash 订阅 | 启用通知或代理池 | 登录后直接在页面配置 |
 
 不要手动修改已经投入使用的 `MASTER_KEY`。需要轮换时使用文末的密钥轮换脚本。
@@ -400,7 +402,24 @@ npm run build
 
 ### 生产服务器资源与网络
 
-最低建议：Linux x86_64、Docker Engine 24+ 与 Compose v2、4 vCPU、8 GB 内存、40 GB SSD。启用多个有头 Chromium 会话时，建议 8 vCPU、16 GB 内存；每个并行浏览器槽位预留约 1.5-2 GB 内存。服务器需能访问 Docker Hub、上游站点、`challenges.cloudflare.com` 以及你启用的通知服务；DNS 的 A/AAAA 记录指向服务器，防火墙放行 TCP 80/443 和 UDP 443。
+最低可用配置为 Linux x86_64、Docker Engine 24+ 与 Compose v2、2 vCPU、4 GB 内存、20 GB SSD，并建议增加 2 GB Swap；适合单用户、几十个以内账号和 1 个常用有头浏览器。长期运行或需要 2 个持续浏览器时建议 4 vCPU、8 GB 内存、40 GB SSD；3 个以上浏览器或多用户使用建议 8 vCPU、16 GB 内存，并把 `APP_PIDS_LIMIT` 提高到 `1024`。
+
+发布镜像实测：空闲应用约 `291 MiB`，1 个较重登录页约 `714 MiB`，2 个较重有头浏览器约 `851 MiB–1.10 GiB`，含可回收缓存峰值约 `1.40 GiB`。镜像解包约 `3.77 GB`。一键脚本首次创建 `.env` 时会检测主机内存；少于 6 GB 会把自动验证池和人工浏览器池分别限制为 1，因此正常使用 1 个、极端情况下最多同时 2 个 Chromium，并采用 `1280x720` 桌面、较小队列、应用 `2560m` 与 Mihomo `256m` 上限。已有 `.env` 不会被自动覆盖，可手动使用以下值：
+
+```dotenv
+APP_MEMORY_LIMIT=2560m
+MIHOMO_MEMORY_LIMIT=256m
+APP_PIDS_LIMIT=512
+TURNSTILE_BROWSER_CONCURRENCY=1
+TURNSTILE_BROWSER_QUEUE_LIMIT=5
+UPSTREAM_BROWSER_MAX_ACTIVE=1
+BROWSER_GATEWAY_MAX_CONNECTIONS=2
+BROWSER_GATEWAY_IDLE_TTL_MINUTES=10
+NOVNC_GEOMETRY=1280x720x24
+MONITOR_TICK_MS=30000
+```
+
+服务器需能访问 Docker Hub、GHCR、`mcr.microsoft.com`、npm Registry、Ubuntu 软件源、ACME 证书机构、上游站点、`challenges.cloudflare.com` 以及启用的通知服务；DNS 的 A/AAAA 记录指向服务器，防火墙放行 TCP 80/443 和 UDP 443。
 
 生产部署会启动应用、Mihomo、Caddy 和带 Xvfb/noVNC 的有头浏览器工作区。应用端口 `8787`、工作区端口 `6080`、Mihomo 控制端口与代理监听端口不应暴露到公网；域名访问只经过 Caddy 的 HTTPS。持久化卷必须保留 `frosted-data`、`frosted-backups`、`frosted-proxy`、`frosted-caddy-data` 和 `frosted-caddy-config`。
 

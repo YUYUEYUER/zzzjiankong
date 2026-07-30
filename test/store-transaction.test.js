@@ -7,12 +7,12 @@ import { JsonStore } from '../server/store.js';
 
 function fixtureData() {
   return {
-    version: 3,
+    version: 4,
     upstreams: [{ id: 'upstream-1', name: 'Primary' }],
     accounts: [{ id: 'account-1', upstreamId: 'upstream-1', name: 'Account' }],
     snapshots: [{ id: 'snapshot-1', accountId: 'account-1' }],
     incidents: [{ id: 'incident-1', accountId: 'account-1', state: 'open' }],
-    settings: { reminderHours: 6 },
+    settings: { reminderMinutes: 360 },
     proxyPool: { nodes: [] },
     auth: { recoveryCodeHashes: [] },
     audit: [],
@@ -33,7 +33,7 @@ test('a failed mutator leaves live state untouched and does not poison later wri
   const diskBefore = await fs.readFile(file, 'utf8');
 
   await assert.rejects(store.mutate((data) => {
-    data.settings.reminderHours = 99;
+    data.settings.reminderMinutes = 99;
     throw new Error('business rule failed');
   }), /business rule failed/);
 
@@ -42,10 +42,10 @@ test('a failed mutator leaves live state untouched and does not poison later wri
   assert.equal(store.health().status, 'healthy');
 
   await store.mutate((data) => {
-    data.settings.reminderHours = 12;
+    data.settings.reminderMinutes = 12;
   });
-  assert.equal(store.snapshot().settings.reminderHours, 12);
-  assert.equal(JSON.parse(await fs.readFile(file, 'utf8')).settings.reminderHours, 12);
+  assert.equal(store.snapshot().settings.reminderMinutes, 12);
+  assert.equal(JSON.parse(await fs.readFile(file, 'utf8')).settings.reminderMinutes, 12);
 });
 
 test('a persistence failure keeps memory and disk at the previous commit and can recover', async (t) => {
@@ -57,7 +57,7 @@ test('a persistence failure keeps memory and disk at the previous commit and can
   store.persist = async () => { throw persistenceError; };
 
   await assert.rejects(store.mutate((data) => {
-    data.settings.reminderHours = 24;
+    data.settings.reminderMinutes = 24;
   }), (error) => error === persistenceError);
   await store.flush();
 
@@ -71,9 +71,9 @@ test('a persistence failure keeps memory and disk at the previous commit and can
 
   store.persist = originalPersist;
   await store.mutate((data) => {
-    data.settings.reminderHours = 48;
+    data.settings.reminderMinutes = 48;
   });
-  assert.equal(store.snapshot().settings.reminderHours, 48);
+  assert.equal(store.snapshot().settings.reminderMinutes, 48);
   assert.equal(store.health().status, 'healthy');
   assert.ok(store.health().lastSuccessfulWriteAt);
 });

@@ -37,6 +37,11 @@ function rateMultiplierLabel(metadata = {}) {
   }[metadata.rateMultiplierStatus] || '等待首次采集';
 }
 
+function reminderIntervalLabel(settings) {
+  const minutes = Number(settings.reminderMinutes || 360);
+  return minutes % 60 === 0 ? `每 ${minutes / 60} 小时` : `每 ${minutes} 分钟`;
+}
+
 export function Inspector({ account, incidents, settings, onOpenIncidents }) {
   const [tab, setTab] = useState('connection');
   const incident = useMemo(() => {
@@ -120,7 +125,7 @@ export function Inspector({ account, incidents, settings, onOpenIncidents }) {
 
       {tab === 'conversion' && account && <div className="inspector-content inspector-detail"><h2>转换详情</h2><dl><div><dt>原始字段</dt><dd>{account.balancePath}</dd></div><div><dt>原始单位</dt><dd>{account.rawUnit}</dd></div><div><dt>原始余额</dt><dd>{account.rawBalance}</dd></div><div><dt>转换公式</dt><dd><code>{account.formula}</code></dd></div><div className="strong"><dt>人民币余额</dt><dd>{money(account.convertedCny)}</dd></div></dl><div className="formula-rule"><CheckCircle size={18} weight="fill" /><p>公式仅允许变量 x、数字、括号和四则运算。</p></div></div>}
 
-      {tab === 'alert' && account && <div className="inspector-content inspector-detail"><h2>通知链路</h2><dl><div><dt>低余额阈值</dt><dd>{money(account.thresholdLow)}</dd></div><div><dt>恢复阈值</dt><dd>{money(account.thresholdRecover)}</dd></div><div><dt>恢复确认</dt><dd>连续 {settings.recoveryConfirmations || 2} 次</dd></div><div><dt>重复提醒</dt><dd>每 {settings.reminderHours || 6} 小时</dd></div></dl><div className="channel-list">{[['resend', EnvelopeSimple, 'Resend 邮件'], ['feishu', PaperPlaneTilt, '飞书机器人']].map(([channel, Icon, label]) => { const state = channelReadiness(account, settings, channel); return <div key={channel}><Icon size={18} /><span>{label}</span><b className={state.tone}>{state.label}</b></div>; })}</div><p className="channel-scope-note">渠道需要同时满足“全局启用、凭据完整、该账号启用”才会发送。</p></div>}
+      {tab === 'alert' && account && <div className="inspector-content inspector-detail"><h2>通知链路</h2><dl><div><dt>低余额阈值</dt><dd>{money(account.thresholdLow)}</dd></div><div><dt>恢复阈值</dt><dd>{money(account.thresholdRecover)}</dd></div><div><dt>恢复确认</dt><dd>连续 {settings.recoveryConfirmations || 2} 次</dd></div><div><dt>重复提醒</dt><dd>{reminderIntervalLabel(settings)}</dd></div></dl><div className="channel-list">{[['resend', EnvelopeSimple, 'Resend 邮件'], ['feishu', PaperPlaneTilt, '飞书机器人']].map(([channel, Icon, label]) => { const state = channelReadiness(account, settings, channel); return <div key={channel}><Icon size={18} /><span>{label}</span><b className={state.tone}>{state.label}</b></div>; })}</div><p className="channel-scope-note">渠道需要同时满足“全局启用、凭据完整、该账号启用”才会发送。</p></div>}
       <button className="inspector-history" onClick={onOpenIncidents}><Link size={16} /> 查看事件记录</button>
     </aside>
   );

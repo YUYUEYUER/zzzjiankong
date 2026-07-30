@@ -25,7 +25,8 @@ test('v1 migration adds one upstream per account without touching credentials or
   const result = migrateData(source, () => ids.shift());
 
   assert.equal(result.changed, true);
-  assert.equal(result.data.version, 3);
+  assert.equal(result.data.version, 4);
+  assert.equal(result.data.settings.reminderMinutes, 360);
   assert.deepEqual(result.data.upstreams.map((upstream) => upstream.id), ['upstream-real', 'upstream-demo']);
   assert.deepEqual(result.data.accounts.map((account) => account.upstreamId), ['upstream-real', 'upstream-demo']);
   assert.equal(result.data.accounts[0].encryptedSecret, source.accounts[0].encryptedSecret);
@@ -49,7 +50,7 @@ test('JsonStore writes an exact v1 backup before persisting migration', async ()
   const store = await new JsonStore(file).init();
   const backup = await fs.readFile(`${file}.v1.bak`, 'utf8');
   assert.equal(backup, raw);
-  assert.equal(store.snapshot().version, 3);
+  assert.equal(store.snapshot().version, 4);
   assert.equal(store.snapshot().accounts[0].encryptedSecret, 'ciphertext.must.stay.identical');
 
   await fs.rm(dir, { recursive: true, force: true });
@@ -64,11 +65,27 @@ test('v2 migration adds proxy state without changing encrypted account credentia
   };
   const result = migrateData(source);
   assert.equal(result.changed, true);
-  assert.equal(result.data.version, 3);
+  assert.equal(result.data.version, 4);
   assert.equal(result.data.accounts[0].encryptedSecret, source.accounts[0].encryptedSecret);
   assert.equal(result.data.upstreams[0].proxyMode, 'direct');
   assert.equal(result.data.upstreams[0].proxyPort, null);
   assert.deepEqual(result.data.proxyPool.nodes, []);
+});
+
+test('v3 migration converts legacy reminder hours to integer minutes', () => {
+  const source = {
+    ...v1Data(),
+    version: 3,
+    upstreams: [{ id: 'upstream-existing', name: 'Existing' }],
+    accounts: [{ id: 'acct-real', upstreamId: 'upstream-existing', encryptedSecret: 'ciphertext.must.stay.identical' }],
+    settings: { recoveryConfirmations: 2, reminderHours: 7 },
+  };
+  const result = migrateData(source);
+
+  assert.equal(result.changed, true);
+  assert.equal(result.data.version, 4);
+  assert.equal(result.data.settings.reminderMinutes, 420);
+  assert.equal('reminderHours' in result.data.settings, false);
 });
 
 test('migration rejects unknown future versions', () => {
