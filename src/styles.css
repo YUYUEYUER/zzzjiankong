@@ -493,9 +493,22 @@ td { height: 46px; color: #526177; border-bottom: 1px solid rgba(117,139,168,.14
 .proxy-import-row label { min-width: 0; }
 .proxy-import-row label > span { display: block; margin-bottom: 6px; color: #5f6f84; font-size: 11px; font-weight: 650; }
 .proxy-url-input { position: relative; }
-.proxy-url-input > svg { position: absolute; left: 10px; top: 11px; color: #8794a5; }
-.proxy-url-input input { padding-left: 34px; }
-.proxy-pool-error { min-height: 34px; margin-top: 9px; padding: 8px 10px; display: flex; align-items: center; gap: 7px; border-radius: 6px; background: #fff0ef; color: #c54841; font-size: 10px; }
+.proxy-url-input > svg { position: absolute; left: 10px; top: 11px; color: #8794a5; pointer-events: none; }
+.proxy-url-input input { padding-left: 34px; padding-right: 40px; }
+.proxy-url-input input[aria-invalid="true"] { border-color: #d84c4c; box-shadow: 0 0 0 3px rgba(216,76,76,.1); }
+.proxy-url-toggle { position: absolute; right: 4px; top: 4px; width: 30px; height: 30px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: #73757d; display: grid; place-items: center; cursor: pointer; }
+.proxy-url-toggle:hover { background: #f3f3f4; color: #202123; }
+.proxy-url-toggle:focus-visible { outline: 2px solid rgba(32,32,33,.45); outline-offset: 1px; }
+.proxy-import-row label small { display: block; margin-top: 6px; color: #858790; font-size: 10px; line-height: 1.4; }
+.proxy-import-row label small.proxy-field-error { color: #bd3f38; }
+.proxy-pool-error { min-height: 42px; margin-top: 9px; padding: 8px 10px; display: flex; align-items: center; gap: 8px; border-radius: 6px; background: #fff0ef; color: #c54841; font-size: 10px; }
+.proxy-pool-error > svg { flex: 0 0 auto; }
+.proxy-pool-error > div { min-width: 0; flex: 1; display: grid; gap: 3px; }
+.proxy-pool-error strong { color: #a93933; font-size: 10px; font-weight: 700; }
+.proxy-pool-error span { color: #bd4b44; line-height: 1.45; overflow-wrap: anywhere; }
+.proxy-pool-error .secondary-button { flex: 0 0 auto; min-height: 30px; padding-inline: 10px; font-size: 10px; }
+.proxy-pool-status { min-height: 18px; padding-top: 7px; color: #73757d; font-size: 10px; line-height: 1.4; }
+.proxy-node-table caption { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .proxy-summary-strip { min-height: 66px; display: grid; grid-template-columns: repeat(4,1fr); margin-top: 10px; border: 1px solid var(--line); border-radius: 7px; background: rgba(242,247,252,.76); }
 .proxy-summary-strip > div { min-width: 0; display: flex; flex-direction: column; justify-content: center; padding: 10px 13px; border-right: 1px solid var(--line); }
 .proxy-summary-strip > div:last-child { border-right: 0; }
@@ -688,6 +701,9 @@ td { height: 46px; color: #526177; border-bottom: 1px solid rgba(117,139,168,.14
   .closure-flow i { display: none; }
   .proxy-import-row { grid-template-columns: 1fr; align-items: stretch; }
   .proxy-import-row .primary-button, .proxy-import-row .secondary-button { width: 100%; }
+  .proxy-pool-error { align-items: flex-start; flex-wrap: wrap; }
+  .proxy-pool-error .secondary-button { margin-left: 25px; }
+  .proxy-pool-status { min-height: 24px; }
   .proxy-summary-strip { grid-template-columns: repeat(2,1fr); }
   .proxy-summary-strip > div:nth-child(2) { border-right: 0; }
   .proxy-summary-strip > div:nth-child(-n+2) { border-bottom: 1px solid var(--line); }

@@ -13,6 +13,8 @@ const PROVIDER_NAME = 'frosted-subscription';
 const PROVIDER_FILE = path.join('providers', 'subscription.txt');
 const MAX_REDIRECTS = 3;
 const DOWNLOAD_TIMEOUT_MS = 12000;
+const PROVIDER_READY_TIMEOUT_MS = 10000;
+const PROVIDER_POLL_INTERVAL_MS = 400;
 const HEALTH_URL = 'https://www.gstatic.com/generate_204';
 
 const blockedAddresses = new net.BlockList();
@@ -56,8 +58,233 @@ function median(values) {
   return sorted.length % 2 ? sorted[middle] : Math.round((sorted[middle - 1] + sorted[middle]) / 2);
 }
 
-function errorWithStatus(message, statusCode = 400, code = 'PROXY_POOL_ERROR') {
-  return Object.assign(new Error(message), { statusCode, code });
+function errorWithStatus(message, statusCode = 400, code = 'PROXY_POOL_ERROR', extra = {}) {
+  return Object.assign(new Error(message), { statusCode, code, ...extra });
+}
+
+function decodeBase64Text(value) {
+  const compact = String(value || '').replace(/\s+/g, '');
+  if (compact.length < 8 || compact.length % 4 === 1 || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(compact)) return null;
+  try {
+    const decoded = Buffer.from(compact.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8').trim();
+    return decoded && !decoded.includes('\ufffd') ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function decodeFragment(value) {
+  try { return decodeURIComponent(String(value || '').replace(/^#/, '').replace(/\+/g, ' ')); } catch { return ''; }
+}
+
+function decodeUriCredentials(value) {
+  const decoded = decodeBase64Text(value);
+  if (!decoded || !decoded.includes(':')) return null;
+  const separator = decoded.indexOf(':');
+  return { first: decoded.slice(0, separator), second: decoded.slice(separator + 1) };
+}
+
+function proxyName(url, fallback) {
+  return decodeFragment(url.hash) || fallback || `${url.hostname}:${url.port}`;
+}
+
+function validPort(port) {
+  const value = Number(port);
+  return Number.isInteger(value) && value >= 1 && value <= 65535 ? value : null;
+}
+
+function parseProxyUriUnsafe(line) {
+  const value = String(line || '').trim();
+  if (/^ssr:\/\//i.test(value)) {
+    const decoded = decodeBase64Text(value.slice(6).split('#', 1)[0]);
+    const match = decoded?.match(/^(.*):(\d+):([^:]+):([^:]+):([^:]+):([^/]+)\/?(?:\?(.*))?$/);
+    if (!match) return null;
+    const [, server, rawPort, protocol, cipher, obfs, encodedPassword, rawQuery = ''] = match;
+    const port = validPort(rawPort);
+    const password = decodeBase64Text(encodedPassword);
+    if (!server || !port || !password) return null;
+    const query = new URLSearchParams(rawQuery);
+    const remarks = decodeBase64Text(query.get('remarks'));
+    return {
+      name: remarks || `${server}:${port}`, type: 'ssr', server, port, cipher, password, obfs, protocol,
+      ...(decodeBase64Text(query.get('obfsparam')) ? { 'obfs-param': decodeBase64Text(query.get('obfsparam')) } : {}),
+      ...(decodeBase64Text(query.get('protoparam')) ? { 'protocol-param': decodeBase64Text(query.get('protoparam')) } : {}),
+    };
+  }
+  let url;
+  try { url = new URL(value); } catch { return null; }
+  const scheme = url.protocol.slice(0, -1).toLowerCase();
+  const name = proxyName(url, '');
+  if (scheme === 'ss') {
+    if (url.searchParams.has('plugin')) return null;
+    let endpoint = url;
+    let credentials = url.username && url.password
+      ? { first: decodeURIComponent(url.username), second: decodeURIComponent(url.password) }
+      : url.username ? decodeUriCredentials(decodeURIComponent(url.username)) : null;
+    if (!credentials || !validPort(endpoint.port)) {
+      const decoded = decodeBase64Text(value.slice(5).split('#', 1)[0]);
+      const separator = decoded?.lastIndexOf('@');
+      if (separator <= 0) return null;
+      credentials = decodeUriCredentials(Buffer.from(decoded.slice(0, separator)).toString('base64'));
+      try { endpoint = new URL(`ss://${decoded.slice(separator + 1)}`); } catch { return null; }
+    }
+    const port = validPort(endpoint.port);
+    if (!credentials || !endpoint.hostname || !port) return null;
+    return { name, type: 'ss', server: endpoint.hostname, port, cipher: credentials.first, password: credentials.second };
+  }
+  if (scheme === 'vmess') {
+    const decoded = decodeBase64Text(value.slice(8).split('#', 1)[0]);
+    let data;
+    try { data = decoded ? JSON.parse(decoded) : null; } catch { data = null; }
+    const server = String(data?.add || data?.address || '').trim();
+    const port = validPort(data?.port);
+    if (!server || !port || !data?.id) return null;
+    const proxy = {
+      name: decodeFragment(url.hash) || String(data.ps || server), type: 'vmess', server, port,
+      uuid: String(data.id), alterId: Number(data.aid || 0), cipher: String(data.scy || 'auto'),
+      tls: String(data.tls || '').toLowerCase() === 'tls',
+    };
+    const network = String(data.net || '').toLowerCase();
+    if (network) proxy.network = network;
+    if (network === 'ws') proxy['ws-opts'] = { path: data.path || '/', ...(data.host ? { headers: { Host: String(data.host) } } : {}) };
+    if (network === 'grpc') proxy['grpc-opts'] = { 'grpc-service-name': String(data.path || '') };
+    if (data.sni) proxy.servername = String(data.sni);
+    return proxy;
+  }
+  const port = validPort(url.port || (scheme === 'http' ? 80 : scheme === 'https' ? 443 : null));
+  if (!url.hostname || !port) return null;
+  if (scheme === 'vless') {
+    if (!url.username) return null;
+    const proxy = { name, type: 'vless', server: url.hostname, port, uuid: decodeURIComponent(url.username) };
+    const query = url.searchParams;
+    const network = query.get('type') || query.get('network');
+    if (network && !['tcp', 'ws', 'grpc'].includes(network)) return null;
+    if (network) proxy.network = network;
+    if (query.get('security')) proxy.tls = query.get('security') !== 'none';
+    for (const [key, target] of [['sni', 'servername'], ['flow', 'flow'], ['fp', 'client-fingerprint']]) if (query.get(key)) proxy[target] = query.get(key);
+    if (query.get('pbk') || query.get('sid')) proxy['reality-opts'] = { ...(query.get('pbk') ? { 'public-key': query.get('pbk') } : {}), ...(query.get('sid') ? { 'short-id': query.get('sid') } : {}) };
+    if (network === 'ws') proxy['ws-opts'] = { path: query.get('path') || '/', ...(query.get('host') ? { headers: { Host: query.get('host') } } : {}) };
+    if (network === 'grpc') proxy['grpc-opts'] = { 'grpc-service-name': query.get('serviceName') || '' };
+    return proxy;
+  }
+  if (scheme === 'trojan') {
+    const password = decodeURIComponent(url.password || url.username || '');
+    const network = url.searchParams.get('type') || url.searchParams.get('network');
+    if (!password || (network && !['tcp', 'ws', 'grpc'].includes(network))) return null;
+    const proxy = {
+      name, type: 'trojan', server: url.hostname, port, password,
+      ...(url.searchParams.get('sni') ? { sni: url.searchParams.get('sni') } : {}),
+      'skip-cert-verify': ['1', 'true'].includes(url.searchParams.get('allowInsecure')),
+    };
+    if (network) proxy.network = network;
+    if (network === 'ws') proxy['ws-opts'] = { path: url.searchParams.get('path') || '/', ...(url.searchParams.get('host') ? { headers: { Host: url.searchParams.get('host') } } : {}) };
+    if (network === 'grpc') proxy['grpc-opts'] = { 'grpc-service-name': url.searchParams.get('serviceName') || '' };
+    return proxy;
+  }
+  if (scheme === 'hysteria2' || scheme === 'hy2') {
+    const password = decodeURIComponent(url.password || url.username || '');
+    if (!password) return null;
+    return {
+      name, type: 'hysteria2', server: url.hostname, port, password,
+      ...(url.searchParams.get('sni') ? { sni: url.searchParams.get('sni') } : {}),
+      ...(['1', 'true'].includes(url.searchParams.get('insecure')) ? { 'skip-cert-verify': true } : {}),
+      ...(url.searchParams.get('obfs') ? { obfs: url.searchParams.get('obfs') } : {}),
+      ...(url.searchParams.get('obfs-password') ? { 'obfs-password': url.searchParams.get('obfs-password') } : {}),
+      ...(validPort(url.searchParams.get('upmbps')) ? { up: `${validPort(url.searchParams.get('upmbps'))} Mbps` } : {}),
+      ...(validPort(url.searchParams.get('downmbps')) ? { down: `${validPort(url.searchParams.get('downmbps'))} Mbps` } : {}),
+    };
+  }
+  if (scheme === 'tuic') {
+    if (!url.username || !url.password) return null;
+    return {
+      name, type: 'tuic', server: url.hostname, port, uuid: decodeURIComponent(url.username), password: decodeURIComponent(url.password),
+      ...(url.searchParams.get('sni') ? { sni: url.searchParams.get('sni') } : {}),
+      ...(url.searchParams.get('congestion_control') ? { 'congestion-controller': url.searchParams.get('congestion_control') } : {}),
+      ...(url.searchParams.get('udp_relay_mode') ? { 'udp-relay-mode': url.searchParams.get('udp_relay_mode') } : {}),
+      ...(['1', 'true'].includes(url.searchParams.get('allow_insecure')) ? { 'skip-cert-verify': true } : {}),
+    };
+  }
+  if (['http', 'https', 'socks', 'socks5'].includes(scheme)) {
+    return {
+      name, type: ['http', 'https'].includes(scheme) ? 'http' : 'socks5', server: url.hostname, port,
+      ...(scheme === 'https' ? { tls: true } : {}),
+      ...(url.username ? { username: decodeURIComponent(url.username) } : {}), ...(url.password ? { password: decodeURIComponent(url.password) } : {}),
+    };
+  }
+  return null;
+}
+
+function parseProxyUri(line) {
+  try { return parseProxyUriUnsafe(line); } catch { return null; }
+}
+
+function proxyUriListToYaml(content) {
+  const lines = String(content || '').split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#'));
+  if (!lines.length || !lines.every((line) => /^(?:ss|ssr|vmess|vless|trojan|hysteria2|hy2|tuic|socks5?|https?):\/\//i.test(line))) return null;
+  const proxies = lines.map(parseProxyUri);
+  return proxies.every(Boolean) ? YAML.stringify({ proxies }) : null;
+}
+
+function isValidProxyDefinition(proxy) {
+  if (!proxy || typeof proxy !== 'object' || Array.isArray(proxy)) return false;
+  const type = String(proxy.type || '').trim().toLowerCase();
+  if (!String(proxy.name || '').trim() || !String(proxy.server || '').trim() || !validPort(proxy.port)) return false;
+  const requiredFields = {
+    ss: ['cipher', 'password'],
+    ssr: ['cipher', 'password', 'protocol', 'obfs'],
+    vmess: ['uuid'],
+    vless: ['uuid'],
+    trojan: ['password'],
+    hysteria: ['auth-str'],
+    hysteria2: ['password'],
+    tuic: ['uuid', 'password'],
+    socks5: [],
+    http: [],
+    snell: ['psk'],
+    wireguard: ['private-key', 'public-key'],
+    mieru: ['username', 'password'],
+    ssh: ['username'],
+    shadowtls: ['password', 'version'],
+    anytls: ['password'],
+  };
+  if (!Object.hasOwn(requiredFields, type)) return false;
+  return requiredFields[type].every((field) => proxy[field] !== undefined && proxy[field] !== null && String(proxy[field]).trim());
+}
+
+export function validateSubscriptionContent(content, depth = 0) {
+  const value = String(content || '').trim();
+  if (!value || value.includes('\0')) {
+    throw errorWithStatus('Clash 订阅内容为空或包含无效字符', 502, 'PROXY_SUBSCRIPTION_EMPTY', { retryable: false });
+  }
+  const preview = value.slice(0, 512);
+  if (/^<!doctype\s+html|^<html[\s>]|<body[\s>]|<title[\s>]/i.test(preview)) {
+    throw errorWithStatus('订阅地址返回了网页而不是 Clash 配置，可能是登录失效或链接已过期', 502, 'PROXY_SUBSCRIPTION_HTML', { retryable: false });
+  }
+
+  let parsed;
+  try { parsed = YAML.parse(value); } catch { parsed = null; }
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    if (!Array.isArray(parsed.proxies)) {
+      if (depth < 1) {
+        const decoded = decodeBase64Text(value);
+        if (decoded && decoded !== value) return validateSubscriptionContent(decoded, depth + 1);
+      }
+      throw errorWithStatus('订阅配置缺少 proxies 节点，请确认这是 Clash/Mihomo 订阅链接', 502, 'PROXY_SUBSCRIPTION_INVALID_FORMAT', { retryable: false });
+    }
+    if (!parsed.proxies.length) throw errorWithStatus('Clash 订阅中没有代理节点', 502, 'PROXY_SUBSCRIPTION_NO_NODES', { retryable: false });
+    if (!parsed.proxies.every(isValidProxyDefinition)) {
+      throw errorWithStatus('Clash 订阅包含格式不完整的节点，请检查节点名称、协议、服务器和端口', 502, 'PROXY_SUBSCRIPTION_INVALID_FORMAT', { retryable: false });
+    }
+    return value;
+  }
+
+  const converted = proxyUriListToYaml(value);
+  if (converted) return converted;
+  if (depth < 1) {
+    const decoded = decodeBase64Text(value);
+    if (decoded && decoded !== value) return validateSubscriptionContent(decoded, depth + 1);
+  }
+  throw errorWithStatus('订阅内容不是有效的 YAML/Clash 配置，请检查订阅链接是否正确', 502, 'PROXY_SUBSCRIPTION_INVALID_FORMAT', { retryable: false });
 }
 
 async function lookupWithDnsOverHttps(hostname) {
@@ -100,39 +327,39 @@ async function resolveSubscriptionUrl(value, lookup = dns.lookup, fallbackLookup
   try {
     url = new URL(String(value || '').trim());
   } catch {
-    throw errorWithStatus('Clash 订阅地址无效');
+    throw errorWithStatus('Clash 订阅地址无效', 400, 'PROXY_SUBSCRIPTION_URL_INVALID');
   }
-  if (url.protocol !== 'https:') throw errorWithStatus('Clash 订阅仅允许 HTTPS 地址');
-  if (url.username || url.password) throw errorWithStatus('订阅地址不能在 URL 中携带用户名或密码');
-  if (!url.hostname || url.hostname.toLowerCase() === 'localhost') throw errorWithStatus('订阅地址不能指向本机或内网');
+  if (url.protocol !== 'https:') throw errorWithStatus('Clash 订阅仅允许 HTTPS 地址', 400, 'PROXY_SUBSCRIPTION_HTTPS_REQUIRED');
+  if (url.username || url.password) throw errorWithStatus('订阅地址不能在 URL 中携带用户名或密码', 400, 'PROXY_SUBSCRIPTION_CREDENTIALS_IN_URL');
+  if (!url.hostname || url.hostname.toLowerCase() === 'localhost') throw errorWithStatus('订阅地址不能指向本机或内网', 400, 'PROXY_SUBSCRIPTION_PRIVATE_HOST');
 
   let resolved;
   try {
     resolved = await lookup(url.hostname, { all: true, verbatim: true });
   } catch {
     if (fallbackLookup === null || (fallbackLookup === undefined && lookup !== dns.lookup)) {
-      throw errorWithStatus('无法解析 Clash 订阅域名');
+      throw errorWithStatus('无法解析 Clash 订阅域名，请检查域名或服务器 DNS', 502, 'PROXY_SUBSCRIPTION_DNS_FAILED', { retryable: true });
     }
     try {
       resolved = await (fallbackLookup || lookupWithDnsOverHttps)(url.hostname);
     } catch {
-      throw errorWithStatus('无法解析 Clash 订阅域名');
+      throw errorWithStatus('无法解析 Clash 订阅域名，请检查域名或服务器 DNS', 502, 'PROXY_SUBSCRIPTION_DNS_FAILED', { retryable: true });
     }
   }
   let addresses = Array.isArray(resolved) ? resolved : [resolved];
   if (addresses.length && addresses.every((entry) => isFakeIpAddress(entry.address))) {
     if (fallbackLookup === null || (fallbackLookup === undefined && lookup !== dns.lookup)) {
-      throw errorWithStatus('订阅地址解析到了本机、内网或保留地址');
+      throw errorWithStatus('订阅地址解析到了本机、内网或保留地址', 400, 'PROXY_SUBSCRIPTION_PRIVATE_HOST');
     }
     try {
       const fallback = await (fallbackLookup || lookupWithDnsOverHttps)(url.hostname);
       addresses = Array.isArray(fallback) ? fallback : [fallback];
     } catch {
-      throw errorWithStatus('Clash Fake-IP DNS 回退解析失败');
+      throw errorWithStatus('Clash Fake-IP DNS 回退解析失败', 502, 'PROXY_SUBSCRIPTION_DNS_FAILED', { retryable: true });
     }
   }
   if (!addresses.length || addresses.some((entry) => !isPublicAddress(entry.address))) {
-    throw errorWithStatus('订阅地址解析到了本机、内网或保留地址');
+    throw errorWithStatus('订阅地址解析到了本机、内网或保留地址', 400, 'PROXY_SUBSCRIPTION_PRIVATE_HOST');
   }
   return { url, addresses, connectionAddresses: addresses };
 }
@@ -179,45 +406,61 @@ export async function downloadSubscription(value, {
     try {
       const response = await fetchImpl(resolved.url, {
         redirect: 'manual',
-        headers: { Accept: 'text/yaml,text/plain,application/yaml;q=0.9,*/*;q=0.5' },
+        headers: {
+          Accept: 'text/yaml,text/plain,application/yaml;q=0.9,*/*;q=0.5',
+          'User-Agent': 'clash.meta',
+        },
         signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
         ...(dispatcher ? { dispatcher } : {}),
-      }).catch(() => { throw errorWithStatus('下载 Clash 订阅失败', 502); });
+      }).catch((error) => {
+        if (error?.statusCode) throw error;
+        throw errorWithStatus('下载 Clash 订阅失败，请检查链接是否可访问或稍后重试', 502, 'PROXY_SUBSCRIPTION_DOWNLOAD_FAILED', { retryable: true });
+      });
 
       if ([301, 302, 303, 307, 308].includes(response.status)) {
-        if (redirect === MAX_REDIRECTS) throw errorWithStatus('Clash 订阅重定向次数过多', 502);
+        if (redirect === MAX_REDIRECTS) throw errorWithStatus('Clash 订阅重定向次数过多，请检查订阅服务配置', 502, 'PROXY_SUBSCRIPTION_REDIRECT_LIMIT', { retryable: false });
         const location = response.headers.get('location');
-        if (!location) throw errorWithStatus('Clash 订阅返回了无效重定向', 502);
+        if (!location) throw errorWithStatus('Clash 订阅返回了无效重定向', 502, 'PROXY_SUBSCRIPTION_REDIRECT_INVALID', { retryable: false });
+        let nextUrl;
+        try { nextUrl = new URL(location, resolved.url).toString(); } catch { throw errorWithStatus('Clash 订阅返回了无效重定向地址', 502, 'PROXY_SUBSCRIPTION_REDIRECT_INVALID', { retryable: false }); }
         await response.body?.cancel().catch(() => {});
-        current = new URL(location, resolved.url).toString();
+        current = nextUrl;
         continue;
       }
       if (!response.ok) {
         await response.body?.cancel().catch(() => {});
-        throw errorWithStatus(`Clash 订阅下载失败 (${response.status})`, 502);
+        const status = response.status;
+        const hint = status === 401 || status === 403 ? '，可能是订阅权限或链接已过期' : '';
+        throw errorWithStatus(`Clash 订阅下载失败 (${status})${hint}`, 502, 'PROXY_SUBSCRIPTION_HTTP_FAILED', { upstreamStatus: status, retryable: ![401, 403, 404].includes(status) });
       }
 
       const declared = Number(response.headers.get('content-length') || 0);
       if (declared > maxBytes) {
         await response.body?.cancel().catch(() => {});
-        throw errorWithStatus('Clash 订阅文件超过大小限制', 413);
+        throw errorWithStatus('Clash 订阅文件超过大小限制', 413, 'PROXY_SUBSCRIPTION_TOO_LARGE', { retryable: false });
       }
       const chunks = [];
       let size = 0;
       const reader = response.body?.getReader();
-      if (!reader) throw errorWithStatus('Clash 订阅响应为空', 502);
-      while (true) {
-        const { done, value: chunk } = await reader.read();
-        if (done) break;
-        size += chunk.byteLength;
-        if (size > maxBytes) {
-          await reader.cancel().catch(() => {});
-          throw errorWithStatus('Clash 订阅文件超过大小限制', 413);
+      if (!reader) throw errorWithStatus('Clash 订阅响应为空', 502, 'PROXY_SUBSCRIPTION_EMPTY', { retryable: true });
+      try {
+        while (true) {
+          const { done, value: chunk } = await reader.read();
+          if (done) break;
+          if (!chunk) continue;
+          size += chunk.byteLength;
+          if (size > maxBytes) {
+            await reader.cancel().catch(() => {});
+            throw errorWithStatus('Clash 订阅文件超过大小限制', 413, 'PROXY_SUBSCRIPTION_TOO_LARGE', { retryable: false });
+          }
+          chunks.push(Buffer.from(chunk));
         }
-        chunks.push(Buffer.from(chunk));
+      } catch (error) {
+        if (error?.statusCode) throw error;
+        throw errorWithStatus('读取 Clash 订阅响应失败，请稍后重试', 502, 'PROXY_SUBSCRIPTION_DOWNLOAD_FAILED', { retryable: true });
       }
       const content = Buffer.concat(chunks).toString('utf8').trim();
-      if (!content || content.includes('\0')) throw errorWithStatus('Clash 订阅内容为空或格式无效');
+      if (!content || content.includes('\0')) throw errorWithStatus('Clash 订阅内容为空或包含无效字符', 502, 'PROXY_SUBSCRIPTION_EMPTY', { retryable: false });
       return content;
     } finally {
       await dispatcher?.close?.().catch(() => {});
@@ -468,9 +711,11 @@ export class ProxyPoolManager {
       },
       signal: options.signal || AbortSignal.timeout(10000),
     }).catch(() => { throw errorWithStatus('Mihomo 服务不可用，请检查代理服务是否启动', 503, 'MIHOMO_UNAVAILABLE'); });
-    if (!response.ok) throw errorWithStatus(`Mihomo 控制接口失败 (${response.status})`, 502, 'MIHOMO_CONTROL_FAILED');
+    if (!response.ok) throw errorWithStatus(`Mihomo 控制接口失败 (${response.status})`, 502, 'MIHOMO_CONTROL_FAILED', { controllerStatus: response.status, retryable: response.status >= 500 });
     if (response.status === 204) return {};
-    return response.json().catch(() => ({}));
+    return response.json().catch(() => {
+      throw errorWithStatus('Mihomo 控制接口返回了无效响应', 502, 'MIHOMO_INVALID_RESPONSE', { retryable: true });
+    });
   }
 
   async reload() {
@@ -589,11 +834,19 @@ export class ProxyPoolManager {
 
   async probeNodes(checkedAt = new Date().toISOString()) {
     await this.controllerRequest(`/providers/proxies/${encodeURIComponent(PROVIDER_NAME)}/healthcheck`);
-    await new Promise((resolve) => setTimeout(resolve, 600));
-    const payload = await this.controllerRequest(`/providers/proxies/${encodeURIComponent(PROVIDER_NAME)}`);
-    const nodes = normalizeProviderNodes(payload, checkedAt);
-    if (!nodes.length) throw errorWithStatus('Mihomo 未从订阅中加载到代理节点', 502, 'EMPTY_PROXY_POOL');
-    return nodes;
+    const deadline = Date.now() + PROVIDER_READY_TIMEOUT_MS;
+    let lastNodes = [];
+    while (Date.now() <= deadline) {
+      const payload = await this.controllerRequest(`/providers/proxies/${encodeURIComponent(PROVIDER_NAME)}`);
+      lastNodes = normalizeProviderNodes(payload, checkedAt);
+      const healthCheckFinished = lastNodes.length > 0 && lastNodes.every((node) => node.status !== 'unchecked');
+      if (healthCheckFinished) return lastNodes;
+      await new Promise((resolve) => setTimeout(resolve, PROVIDER_POLL_INTERVAL_MS));
+    }
+    if (lastNodes.length) {
+      throw errorWithStatus('节点健康检查超时，部分节点尚未完成检测，请稍后重试', 504, 'PROXY_HEALTHCHECK_TIMEOUT', { retryable: true, nodeCount: lastNodes.length });
+    }
+    throw errorWithStatus('Mihomo 未从订阅中加载到代理节点，请确认订阅格式正确且包含代理节点', 502, 'EMPTY_PROXY_POOL', { retryable: false, nodeCount: 0 });
   }
 
   async checkUnlocked({ forceUpstreamId = '' } = {}) {
@@ -629,10 +882,13 @@ export class ProxyPoolManager {
       const oldRuntime = await readOptionalFile(this.runtimePath);
       const candidateFile = path.join('providers', `subscription.${crypto.randomUUID()}.candidate`);
       const candidatePath = path.join(this.sharedDir, candidateFile);
+      let configurationTouched = false;
       let rollbackReady = false;
       try {
-        const content = await downloadSubscription(url, { fetchImpl: this.fetch, lookup: this.lookup });
+        const downloaded = await downloadSubscription(url, { fetchImpl: this.fetch, lookup: this.lookup });
+        const content = validateSubscriptionContent(downloaded);
         await replaceFile(candidatePath, content);
+        configurationTouched = true;
         await this.ensurePorts();
 
         await this.writeRuntimeConfig({ providerFile: candidateFile });
@@ -659,6 +915,10 @@ export class ProxyPoolManager {
         this.stopSyncRetry();
         return this.publicState();
       } catch (error) {
+        if (!configurationTouched) {
+          await this.restoreProxyState(before, error.message);
+          throw error;
+        }
         let providerRestored = false;
         try {
           if (oldProvider == null) await fs.rm(this.providerPath(), { force: true });

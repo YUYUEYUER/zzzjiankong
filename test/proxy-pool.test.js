@@ -5,9 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   ProxyPoolManager,
+  configureProxyRoutes,
   downloadSubscription,
   isPublicAddress,
   normalizeProviderNodes,
+  validateSubscriptionContent,
   validateSubscriptionUrl,
   withUpstreamProxyContext,
 } from '../server/proxy-pool.js';
@@ -109,6 +111,95 @@ test('subscription downloader validates every redirect and enforces decoded size
     maxBytes: 8,
     fetchImpl: async () => new Response('0123456789', { status: 200 }),
   }), /大小限制/);
+});
+
+test('subscription downloader preserves actionable HTTP failure metadata', async () => {
+  await assert.rejects(() => downloadSubscription('https://sub.example.com/expired', {
+    lookup: publicLookup,
+    fetchImpl: async () => new Response('expired', { status: 403 }),
+  }), (error) => (
+    error.code === 'PROXY_SUBSCRIPTION_HTTP_FAILED'
+    && error.upstreamStatus === 403
+    && error.retryable === false
+    && /链接已过期/.test(error.message)
+  ));
+});
+
+test('subscription content validation accepts YAML, base64 YAML, and common URI lists', () => {
+  const yaml = 'proxies:\n  - {name: Tokyo, type: ss, server: proxy.example.com, port: 443, cipher: aes-128-gcm, password: test}';
+  assert.equal(validateSubscriptionContent(yaml), yaml);
+  const encoded = Buffer.from(yaml).toString('base64');
+  assert.match(validateSubscriptionContent(encoded), /^proxies:/);
+  assert.match(validateSubscriptionContent('ss://YWVzLTEyOC1nY206dGVzdA==@proxy.example.com:443#Tokyo'), /proxies:/);
+  const httpsProxy = validateSubscriptionContent('https://user:pass@proxy.example.com:443#Secure%20HTTP');
+  assert.match(httpsProxy, /type: http/);
+  assert.match(httpsProxy, /tls: true/);
+  const hysteria = validateSubscriptionContent('hy2://secret@proxy.example.com:8443?sni=edge.example.com&upmbps=50&downmbps=100#Fast');
+  assert.match(hysteria, /type: hysteria2/);
+  assert.match(hysteria, /up: 50 Mbps/);
+  assert.match(hysteria, /down: 100 Mbps/);
+});
+
+test('subscription content validation explains expired HTML and malformed responses', () => {
+  assert.throws(() => validateSubscriptionContent('<html><title>Login</title></html>'), (error) => (
+    error.code === 'PROXY_SUBSCRIPTION_HTML' && error.retryable === false
+  ));
+  assert.throws(() => validateSubscriptionContent('not-a-clash-subscription'), (error) => (
+    error.code === 'PROXY_SUBSCRIPTION_INVALID_FORMAT' && error.retryable === false
+  ));
+  assert.throws(() => validateSubscriptionContent('proxies: []'), (error) => error.code === 'PROXY_SUBSCRIPTION_NO_NODES');
+  assert.throws(() => validateSubscriptionContent('proxies:\n  - null'), (error) => error.code === 'PROXY_SUBSCRIPTION_INVALID_FORMAT');
+  assert.throws(() => validateSubscriptionContent('proxies:\n  - {name: Broken, type: unknown, server: proxy.example.com, port: 443}'), (error) => error.code === 'PROXY_SUBSCRIPTION_INVALID_FORMAT');
+  assert.throws(() => validateSubscriptionContent('proxies:\n  - {name: Broken SS, type: ss, server: proxy.example.com, port: 443}'), (error) => error.code === 'PROXY_SUBSCRIPTION_INVALID_FORMAT');
+  assert.throws(() => validateSubscriptionContent('ss://definitely-invalid'), (error) => error.code === 'PROXY_SUBSCRIPTION_INVALID_FORMAT');
+});
+
+test('provider readiness waits until every node has completed its health result', async () => {
+  const store = new MemoryStore();
+  let providerCalls = 0;
+  const manager = new ProxyPoolManager(store, {
+    fetchImpl: async (url) => {
+      if (String(url).endsWith('/healthcheck')) return new Response(null, { status: 204 });
+      providerCalls += 1;
+      return Response.json({
+        proxies: [
+          { name: 'Tokyo', type: 'Shadowsocks', alive: true, history: [{ delay: 80 }] },
+          { name: 'Osaka', type: 'Shadowsocks', alive: true, history: providerCalls === 1 ? [] : [{ delay: 95 }] },
+        ],
+      });
+    },
+    lookup: publicLookup,
+    controllerUrl: 'http://mihomo.test:9090',
+  });
+  const nodes = await manager.probeNodes();
+  assert.equal(providerCalls, 2);
+  assert.deepEqual(nodes.map((node) => node.status), ['available', 'available']);
+});
+
+test('malformed subscription content is rejected before Mihomo is reloaded', async () => {
+  await withTemporaryDirectory(async (directory) => {
+    const store = new MemoryStore();
+    let controllerCalls = 0;
+    const manager = new ProxyPoolManager(store, {
+      fetchImpl: async (url) => {
+        if (String(url).startsWith('https://sub.example.com/')) return new Response('<html><title>Expired</title></html>', { status: 200 });
+        controllerCalls += 1;
+        return new Response(null, { status: 204 });
+      },
+      lookup: publicLookup,
+      sharedDir: directory,
+      runtimePath: path.join(directory, 'config.yaml'),
+      controllerUrl: 'http://mihomo.test:9090',
+    });
+    try {
+      await assert.rejects(() => manager.importSubscription('https://sub.example.com/expired'), (error) => error.code === 'PROXY_SUBSCRIPTION_HTML');
+      assert.equal(controllerCalls, 0, 'invalid content never reloads or contacts Mihomo');
+      assert.equal(store.snapshot().proxyPool.subscriptionUrlEncrypted, '');
+      await assert.rejects(() => fs.access(path.join(directory, 'providers', 'subscription.txt')), (error) => error.code === 'ENOENT');
+    } finally {
+      configureProxyRoutes([]);
+    }
+  });
 });
 
 test('provider nodes are ranked by availability and recent median latency', () => {

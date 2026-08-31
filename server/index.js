@@ -1352,7 +1352,12 @@ app.use((error, req, res, next) => {
   if (error instanceof z.ZodError) return res.status(400).json({ message: error.issues[0]?.message || '参数错误', issues: error.issues });
   if (error.statusCode) {
     if (error.retryAfter) res.set('Retry-After', String(error.retryAfter));
-    return res.status(error.statusCode).json({ message: error.message });
+    return res.status(error.statusCode).json({
+      message: error.message,
+      ...(error.code ? { code: error.code } : {}),
+      ...(error.retryable !== undefined ? { retryable: Boolean(error.retryable) } : {}),
+      ...(error.upstreamStatus ? { upstreamStatus: error.upstreamStatus } : {}),
+    });
   }
   res.status(500).json({ message: error.message || '服务器内部错误' });
 });
