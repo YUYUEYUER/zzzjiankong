@@ -21,6 +21,7 @@ import { AnimatePresence, motion } from 'motion/react';
 import { compactNumber, hostname, money, platformLabel, relativeTime } from '../lib.js';
 import { OnboardingGuide } from './OnboardingGuide.jsx';
 import { getOnboardingState } from '../onboarding.js';
+import { BrandMark } from './BrandMark.jsx';
 
 const STATUS_COPY = {
   healthy: '运行正常',
@@ -328,7 +329,7 @@ export function StatusDashboard({
     <main className="status-page">
       <div className="status-container">
         <header className="status-topbar">
-          <div className="status-brand"><span className="status-brand-mark">霜</span><div><strong>霜镜</strong><small>上游余额与告警监控</small></div></div>
+          <div className="status-brand"><span className="status-brand-mark"><BrandMark alt="" /></span><div><strong>霜镜</strong><small>上游余额与告警监控</small></div></div>
           <div className="status-top-actions">
             <button className="first-use-command" type="button" onClick={() => setOnboardingOpen(true)}><ListChecks size={17} />首次设置</button>
             <button className="quiet-icon-button large" type="button" onClick={onSettings} title="通知与安全设置" aria-label="通知与安全设置"><Gear size={20} /></button>

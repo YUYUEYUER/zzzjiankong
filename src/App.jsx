@@ -8,6 +8,7 @@ import { QuickAccountModal } from './components/QuickAccountModal.jsx';
 import { SettingsModal } from './components/SettingsModal.jsx';
 import { StatusDashboard } from './components/StatusDashboard.jsx';
 import { UpstreamModal } from './components/UpstreamModal.jsx';
+import { BrandMark } from './components/BrandMark.jsx';
 
 function Toasts({ toasts, dismiss }) {
   const icons = { success: CheckCircle, warning: WarningCircle, error: WarningCircle, info: Info };
@@ -28,7 +29,7 @@ function Toasts({ toasts, dismiss }) {
 }
 
 function LoadingScreen() {
-  return <main className="loading-screen"><div className="status-brand-mark loading-mark">上</div><div className="loading-line"><i /></div><p>正在打开上游余额面板</p></main>;
+  return <main className="loading-screen"><div className="status-brand-mark loading-mark"><BrandMark /></div><div className="loading-line"><i /></div><p>正在打开上游余额面板</p></main>;
 }
 
 export function App() {

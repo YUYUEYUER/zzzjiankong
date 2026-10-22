@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">North — minimal geometric logo</title>
+  <desc id="desc">An abstract upward peak inside an open circular orbit, with a blue accent dot.</desc>
+  <path d="M382 143a174 174 0 1 0 48 113" stroke="#161B2A" stroke-width="39" stroke-linecap="round"/>
+  <path d="m173 319 83-144 83 144" stroke="#161B2A" stroke-width="43" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="408" cy="101" r="25" fill="#5378F6"/>
+</svg>

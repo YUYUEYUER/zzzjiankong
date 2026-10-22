@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowRight, Eye, EyeSlash, Key, LockKey, ShieldCheck, UserCircle } from '@phosphor-icons/react';
 import { Turnstile } from '@marsidev/react-turnstile';
+import { BrandMark } from './BrandMark.jsx';
 import './onboarding-login.css';
 
 function generateStrongPassword() {
@@ -97,7 +98,7 @@ export function LoginScreen({ session, onSetup, onLogin, onVerifyTwoFactor, busy
   return (
     <main className="login-screen login-accessible-screen">
       <section className={`login-glass ${setup ? 'setup' : ''}`}>
-        <div className="brand-mark large"><span>霜</span></div>
+        <div className="brand-mark large"><BrandMark /></div>
         <p className="eyebrow">PRIVATE OPERATIONS</p>
         <h1>{challengeToken ? '两步验证' : setup ? '欢迎使用霜镜' : '霜镜'}</h1>
         <p className="login-copy">{challengeToken ? '输入验证器中的 6 位动态码，也可使用一条恢复码。' : setup ? '先创建管理员账号，用于登录霜镜。上游账号和令牌会在进入后单独接入。' : '验证身份后进入上游余额控制台。'}</p>

@@ -32,6 +32,7 @@ When implementing from a selected generated mock, treat that image as the source
 - Let users pause and resume onboarding, keep errors visible with a recovery action, and retain access to the normal monitoring workspace.
 - Keep the dashboard's overall status banner compact: modest height, tighter vertical padding and text spacing, leaving room for the upstream list.
 - Offer examples only before the first real upstream is configured. Once real setup begins, hide both example data and the example toggle from everyday use.
-- Preserve the existing centered login/admin setup layout. The user only wants its blue “霜” logo tile and blue glow changed to neutral dark grey; do not add illustrations or redesign it as a split layout.
+- Preserve the existing centered login/admin setup layout; do not add illustrations or redesign it as a split layout.
+- Use the user-supplied `public/brand/minimal-mark.svg` as the product mark across login, navigation, loading and favicon. Preserve its original colours and proportions, including its small blue accent; display it without a coloured tile or glow.
 - Unify dropdowns across the app with compact white menus, subtle grey borders and grey selection highlights. Keep native keyboard operation, disabled options and required-field validation; avoid the large blue system popup in supported browsers.
 - Recovery confirmation counts support common presets and a custom positive integer; retain the existing default of two consecutive healthy polls.

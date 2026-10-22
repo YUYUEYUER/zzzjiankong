@@ -10,6 +10,7 @@ import {
   Stack,
 } from '@phosphor-icons/react';
 import { relativeTime } from '../lib.js';
+import { BrandMark } from './BrandMark.jsx';
 
 export function IconRail({ active, onNavigate }) {
   const items = [
@@ -19,7 +20,7 @@ export function IconRail({ active, onNavigate }) {
   ];
   return (
     <aside className="icon-rail" aria-label="主导航">
-      <button className="brand-mark" title="霜镜" onClick={() => onNavigate('overview')}><span>霜</span></button>
+      <button type="button" className="brand-mark" title="霜镜" aria-label="霜镜 · 上游总览" onClick={() => onNavigate('overview')}><BrandMark alt="" /></button>
       <nav>
         {items.map(([id, Icon, label]) => (
           <button key={id} className={active === id ? 'active' : ''} onClick={() => onNavigate(id)} title={label} aria-label={label}>

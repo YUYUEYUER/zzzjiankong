@@ -14,8 +14,8 @@
 }
 
 .login-glass .brand-mark.large {
-  background: #202123;
-  box-shadow: 0 7px 18px rgba(32, 33, 35, .12), inset 0 1px rgba(255, 255, 255, .16);
+  background: transparent;
+  box-shadow: none;
 }
 
 .login-glass.setup .login-copy {
