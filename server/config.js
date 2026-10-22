@@ -26,6 +26,14 @@ function browserWorkspaceUrl(value) {
   }
 }
 
+function trustProxyHops(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'true') return 1;
+  if (!normalized || normalized === 'false') return false;
+  const hops = Number(normalized);
+  return Number.isInteger(hops) && hops >= 1 && hops <= 10 ? hops : false;
+}
+
 const turnstileSolver = String(process.env.TURNSTILE_SOLVER || "browser").toLowerCase();
 
 function commaSeparated(value) {
@@ -56,9 +64,14 @@ if (previousKeys.some(({ id }) => id === masterKeyId) || new Set(previousKeys.ma
 
 export const config = {
   port: Number(process.env.PORT || 8787),
+  /** 默认仅回环；容器镜像通过 ENV HOST=0.0.0.0 放宽，此时强制走密钥/引导校验。 */
+  host: process.env.HOST || '127.0.0.1',
   appOrigin: process.env.APP_ORIGIN || "http://localhost:8787",
   dataFile: path.resolve(root, process.env.DATA_FILE || "./data/frosted-console.json"),
   masterKey: process.env.MASTER_KEY || "frosted-console-development-master-key",
+  /** true when either secret fell back to the repository-shipped development defaults */
+  usingDefaultSecrets: !process.env.MASTER_KEY || !process.env.SESSION_SECRET,
+  novncWebDir: path.resolve(process.env.NOVNC_WEB_DIR || '/usr/share/novnc'),
   masterKeyId,
   previousMasterKeys: previousKeys,
   sessionSecret: process.env.SESSION_SECRET || "frosted-console-development-session-secret",
@@ -66,7 +79,9 @@ export const config = {
   adminUsername: process.env.ADMIN_USERNAME || "admin",
   bootstrapToken: process.env.BOOTSTRAP_TOKEN || "",
   authDisabled: process.env.AUTH_DISABLED === "true",
-  trustProxy: process.env.TRUST_PROXY === "true",
+  // true → 仅信任 1 跳（Caddy 追加的最右 XFF，伪造的左值被忽略）；
+  // 前置多层代理时直接填跳数，如 TRUST_PROXY=2。
+  trustProxy: trustProxyHops(process.env.TRUST_PROXY),
   browserWorkspaceUrl: browserWorkspaceUrl(process.env.BROWSER_WORKSPACE_URL),
   dashboardTurnstileSiteKey: process.env.DASHBOARD_TURNSTILE_SITE_KEY || "",
   dashboardTurnstileSecretKey: process.env.DASHBOARD_TURNSTILE_SECRET_KEY || "",

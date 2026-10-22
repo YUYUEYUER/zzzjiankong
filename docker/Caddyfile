@@ -21,7 +21,8 @@
 		}
 	}
 
-	handle_path /browser/* {
+	# 不再剥前缀：noVNC 静态文件现由应用在 /browser 路径下认证托管
+	handle /browser/* {
 		forward_auth {
 			uri /api/browser-access
 			dynamic a frosted-console 8787 {
@@ -31,7 +32,7 @@
 			}
 		}
 		reverse_proxy {
-			dynamic a frosted-console 6080 {
+			dynamic a frosted-console 8787 {
 				refresh 5s
 				resolvers 127.0.0.11
 				versions ipv4

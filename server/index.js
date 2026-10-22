@@ -62,6 +62,27 @@ function sameOrigin(left, right) {
   }
 }
 
+/**
+ * When a browser supplies an Origin header, accept state-changing requests
+ * only from the configured application origin or the exact origin that
+ * served the request.  Comparing the host alone is insufficient: an HTTP
+ * page on the same host must not submit a request to an HTTPS console.
+ */
+function trustedRequestOrigin(req, value) {
+  try {
+    const candidate = new URL(String(value || '')).origin;
+    if (sameOrigin(candidate, config.appOrigin)) return true;
+    const requestHost = String(req.get('host') || '').trim().toLowerCase();
+    const requestProtocol = `${String(req.protocol || '').toLowerCase()}:`;
+    const parsed = new URL(candidate);
+    return Boolean(requestHost)
+      && parsed.host.toLowerCase() === requestHost
+      && parsed.protocol === requestProtocol;
+  } catch {
+    return false;
+  }
+}
+
 const store = await new JsonStore().init();
 if (
   config.production
@@ -71,6 +92,38 @@ if (
   && config.bootstrapToken.length < 32
 ) {
   throw new Error('生产环境首次初始化必须配置至少 32 个字符的 BOOTSTRAP_TOKEN');
+}
+
+// 非回环监听时必须拒绝静默不安全的默认状态：公开的开发密钥会让会话令牌可伪造，
+// 缺少引导令牌会让首个到达者接管唯一管理员。
+function isLoopbackHost(host) {
+  const normalized = String(host || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return ['127.0.0.1', 'localhost', '::1'].includes(normalized);
+}
+if (!isLoopbackHost(config.host)) {
+  const fatal = [];
+  if (config.usingDefaultSecrets) {
+    fatal.push('MASTER_KEY/SESSION_SECRET 仍是仓库内置的开发默认值，任何知道默认值的人都可伪造会话');
+  }
+  if (
+    !config.production
+    && !config.authDisabled
+    && !store.snapshot().auth.passwordHash
+    && !config.adminPassword
+    && config.bootstrapToken.length < 32
+  ) {
+    fatal.push('未配置至少 32 个字符的 BOOTSTRAP_TOKEN，初始化接口将对网络开放');
+  }
+  if (fatal.length) {
+    throw new Error(
+      `拒绝在非回环地址 ${config.host} 上启动：${fatal.join('；')}。`
+      + '生产部署请使用 deploy-linux.sh 或 Docker（NODE_ENV=production 并显式配置密钥），'
+      + '本机调试请设置 HOST=127.0.0.1。',
+    );
+  }
+  if (config.authDisabled) {
+    console.warn('[security] AUTH_DISABLED=true 且监听非回环地址；请确认应用位于带认证的反向代理之后。');
+  }
 }
 if (!store.snapshot().auth.passwordHash && config.adminPassword) {
   const issues = passwordIssues(config.adminPassword);
@@ -107,6 +160,10 @@ app.use(helmet({
       defaultSrc: ["'self'"],
       scriptSrc: ["'self'", 'https://challenges.cloudflare.com'],
       frameSrc: ["'self'", 'https://challenges.cloudflare.com'],
+      // The console and its browser workspace are never intended to be
+      // embedded. Keep this explicit because Helmet's default allows same-
+      // origin framing, which still leaves clickjacking room on shared hosts.
+      frameAncestors: ["'none'"],
       connectSrc: ["'self'", 'https://challenges.cloudflare.com'],
       styleSrc: ["'self'", "'unsafe-inline'"],
       imgSrc: ["'self'", 'data:'],
@@ -118,14 +175,14 @@ app.use(helmet({
 app.use(express.json({ limit: '256kb' }));
 app.use(cookieParser());
 app.use('/api', (req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
+app.use('/api', (req, res, next) => {
   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
   const origin = req.get('origin');
   if (!origin) return next();
-  try {
-    if (new URL(origin).host === req.get('host') || origin === config.appOrigin) return next();
-  } catch {
-    // handled below
-  }
+  if (trustedRequestOrigin(req, origin)) return next();
   return res.status(403).json({ message: '请求来源校验失败' });
 });
 
@@ -152,6 +209,19 @@ async function validateUpstreamDestination(value) {
   return { url: parseUpstreamUrl(value, { production: config.production, allowedHosts: config.upstreamAllowedHosts }) };
 }
 
+const accountCredentialsSchema = z.object({
+  accessToken: z.string().max(4096).optional(),
+  accessTokens: z.array(z.string().trim().min(1).max(4096)).max(20).optional(),
+  apiToken: z.string().max(4096).optional(),
+  apiTokens: z.array(z.string().trim().min(1).max(4096)).max(20).optional(),
+  refreshToken: z.string().max(4096).optional(),
+  password: z.string().max(128).optional(),
+  cfAccessClientId: z.string().trim().max(512).optional(),
+  cfAccessClientSecret: z.string().trim().max(4096).optional(),
+  /** One-shot token after manual browser verification; also used as fallback when auto-solve is off */
+  turnstileToken: z.string().max(4096).optional(),
+});
+
 const accountSchema = z.object({
   upstreamId: z.string().trim().min(1, '请选择所属上游').max(80),
   name: z.string().trim().min(1).max(60),
@@ -173,20 +243,9 @@ const accountSchema = z.object({
   thresholdRecover: z.coerce.number().min(0).max(1e12),
   pollIntervalMinutes: z.coerce.number().int().min(1).max(1440).default(5),
   enabled: z.boolean().default(true),
-  notifications: z.object({ resend: z.boolean(), feishu: z.boolean() }).default({ resend: true, feishu: true }),
+  notifications: z.object({ resend: z.boolean().default(true), feishu: z.boolean().default(true), telegram: z.boolean().default(true) }).default({ resend: true, feishu: true, telegram: true }),
   browserLoginId: z.string().uuid().optional(),
-  credentials: z.object({
-    accessToken: z.string().optional(),
-    accessTokens: z.array(z.string().trim().min(1).max(4096)).max(20).optional(),
-    apiToken: z.string().optional(),
-    apiTokens: z.array(z.string().trim().min(1).max(4096)).max(20).optional(),
-    refreshToken: z.string().optional(),
-    password: z.string().optional(),
-    cfAccessClientId: z.string().trim().max(512).optional(),
-    cfAccessClientSecret: z.string().trim().max(4096).optional(),
-    /** One-shot token after manual browser verification; also used as fallback when auto-solve is off */
-    turnstileToken: z.string().optional(),
-  }).optional(),
+  credentials: accountCredentialsSchema.optional(),
 }).refine((value) => value.thresholdRecover >= value.thresholdLow, {
   message: '恢复阈值不能低于告警阈值',
   path: ['thresholdRecover'],
@@ -254,7 +313,10 @@ const settingsSchema = z.object({
   resendApiKey: z.string().optional(),
   feishuEnabled: z.boolean(),
   feishuWebhook: z.string().optional(),
-  recoveryConfirmations: z.coerce.number().int().min(1).max(5),
+  telegramEnabled: z.boolean(),
+  telegramChatId: z.string().max(64),
+  telegramBotToken: z.string().optional(),
+  recoveryConfirmations: z.coerce.number().int().min(1).max(100),
   reminderMinutes: z.coerce.number().int().min(1).max(10080).optional(),
   reminderHours: z.coerce.number().int().min(1).max(168).optional(),
 });
@@ -265,7 +327,7 @@ const saveSettingsSchema = settingsSchema.refine(
 );
 
 const notificationTestSchema = z.object({
-  channel: z.enum(['resend', 'feishu']),
+  channel: z.enum(['resend', 'feishu', 'telegram']),
   settings: settingsSchema.partial().optional().default({}),
 });
 
@@ -331,13 +393,15 @@ function sanitizeAccount(account) {
 }
 
 function publicSettings(settings) {
-  const { resendApiKeyEncrypted, feishuWebhookEncrypted, ...safe } = settings;
+  const { resendApiKeyEncrypted, feishuWebhookEncrypted, telegramBotTokenEncrypted, ...safe } = settings;
   return {
     ...safe,
     hasResendApiKey: Boolean(resendApiKeyEncrypted),
     hasFeishuWebhook: Boolean(feishuWebhookEncrypted),
+    hasTelegramBotToken: Boolean(telegramBotTokenEncrypted),
     resendConfigured: Boolean(resendApiKeyEncrypted && settings.resendFrom && settings.resendTo),
     feishuConfigured: Boolean(feishuWebhookEncrypted),
+    telegramConfigured: Boolean(telegramBotTokenEncrypted && settings.telegramChatId),
   };
 }
 
@@ -401,34 +465,64 @@ function dashboard() {
 const loginAttempts = new Map();
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_ATTEMPTS = 5;
+/** Per-IP ceiling across all usernames/scopes so username rotation cannot bypass throttling. */
+const LOGIN_IP_MAX_ATTEMPTS = 60;
+/** Hard cap on tracked keys so failure buckets cannot grow memory without bound. */
+const LOGIN_ATTEMPT_MAP_LIMIT = 20000;
+
+function pruneLoginAttempts(now = Date.now()) {
+  for (const [key, entry] of loginAttempts) {
+    if (now - entry.startedAt >= LOGIN_WINDOW_MS) loginAttempts.delete(key);
+  }
+}
+const loginAttemptSweeper = setInterval(pruneLoginAttempts, 60_000);
+loginAttemptSweeper.unref?.();
 
 function attemptKey(req, username, scope = 'password') {
   return `${scope}:${req.ip}:${normalizeUsername(username)}`;
 }
 
-function checkLoginLimit(req, username, scope = 'password') {
-  const key = attemptKey(req, username, scope);
+function attemptBucket(key, now) {
   const entry = loginAttempts.get(key);
-  if (!entry || Date.now() - entry.startedAt >= LOGIN_WINDOW_MS) {
+  if (!entry || now - entry.startedAt >= LOGIN_WINDOW_MS) {
     loginAttempts.delete(key);
-    return key;
+    return null;
   }
-  if (entry.count >= LOGIN_MAX_ATTEMPTS) {
-    const retryAfter = Math.max(1, Math.ceil((entry.startedAt + LOGIN_WINDOW_MS - Date.now()) / 1000));
-    throw Object.assign(new Error(`尝试次数过多，请 ${Math.ceil(retryAfter / 60)} 分钟后再试`), { statusCode: 429, retryAfter });
-  }
-  return key;
+  return entry;
 }
 
-function recordLoginFailure(key) {
-  const current = loginAttempts.get(key);
-  if (!current || Date.now() - current.startedAt >= LOGIN_WINDOW_MS) {
-    loginAttempts.set(key, { count: 1, startedAt: Date.now() });
-    return 1;
-  } else {
-    current.count += 1;
-    return current.count;
+function throwLoginLimited(entry, now) {
+  const retryAfter = Math.max(1, Math.ceil((entry.startedAt + LOGIN_WINDOW_MS - now) / 1000));
+  throw Object.assign(new Error(`尝试次数过多，请 ${Math.ceil(retryAfter / 60)} 分钟后再试`), { statusCode: 429, retryAfter });
+}
+
+function checkLoginLimit(req, username, scope = 'password') {
+  const now = Date.now();
+  if (loginAttempts.size > LOGIN_ATTEMPT_MAP_LIMIT) {
+    pruneLoginAttempts(now);
+    if (loginAttempts.size > LOGIN_ATTEMPT_MAP_LIMIT) {
+      throw Object.assign(new Error('登录服务繁忙，请稍后再试'), { statusCode: 429, retryAfter: 60 });
+    }
   }
+  const keys = { scope: attemptKey(req, username, scope), ip: `ip:${req.ip}` };
+  const scoped = attemptBucket(keys.scope, now);
+  if (scoped && scoped.count >= LOGIN_MAX_ATTEMPTS) throwLoginLimited(scoped, now);
+  const ipBucket = attemptBucket(keys.ip, now);
+  if (ipBucket && ipBucket.count >= LOGIN_IP_MAX_ATTEMPTS) throwLoginLimited(ipBucket, now);
+  return keys;
+}
+
+function recordLoginFailure(keys) {
+  const now = Date.now();
+  for (const key of [keys.scope, keys.ip]) {
+    const current = loginAttempts.get(key);
+    if (!current || now - current.startedAt >= LOGIN_WINDOW_MS) {
+      loginAttempts.set(key, { count: 1, startedAt: now });
+    } else {
+      current.count += 1;
+    }
+  }
+  return loginAttempts.get(keys.scope)?.count || 1;
 }
 
 function clearLoginFailures(key) {
@@ -438,7 +532,15 @@ function clearLoginFailures(key) {
 const sessionCookieOptions = {
   httpOnly: true,
   sameSite: 'strict',
-  secure: config.production,
+  // Keep cookies Secure whenever the configured public origin is HTTPS, even
+  // if a manually-run deployment forgot to set NODE_ENV=production.
+  secure: config.production || (() => {
+    try {
+      return new URL(config.appOrigin).protocol === 'https:';
+    } catch {
+      return false;
+    }
+  })(),
   path: '/',
 };
 
@@ -459,7 +561,7 @@ function publicSession(req) {
     setupRequired: !config.authDisabled && setupRequired,
     bootstrapRequired: !config.authDisabled && setupRequired && Boolean(config.bootstrapToken),
     username: authenticated && auth.username ? auth.username : '',
-    twoFactorEnabled: Boolean(auth.twoFactorEnabled),
+    twoFactorEnabled: Boolean(authenticated && auth.twoFactorEnabled),
     turnstile: {
       enabled: config.dashboardTurnstileEnabled,
       siteKey: config.dashboardTurnstileEnabled ? config.dashboardTurnstileSiteKey : '',
@@ -504,11 +606,11 @@ function asyncRoute(handler) {
   return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 }
 
-app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString(), storage: store.health() }));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString(), storage: store.health().status }));
 app.get('/api/ready', (req, res) => {
   const health = store.health();
-  if (health.status !== 'healthy') return res.status(503).json({ status: 'not_ready', storage: health });
-  return res.json({ status: 'ready', storage: health });
+  if (health.status !== 'healthy') return res.status(503).json({ status: 'not_ready' });
+  return res.json({ status: 'ready' });
 });
 app.get('/api/session', (req, res) => res.json(publicSession(req)));
 
@@ -516,7 +618,9 @@ app.post('/api/session/setup', asyncRoute(async (req, res) => {
   if (config.authDisabled) return res.status(400).json({ message: '认证已被环境变量关闭' });
   if (store.snapshot().auth.passwordHash) return res.status(410).json({ message: '管理员初始化入口已关闭' });
   const input = setupSchema.parse(req.body);
+  const limitKeys = checkLoginLimit(req, input.username, 'setup');
   if (config.bootstrapToken && !verifyBootstrapToken(config.bootstrapToken, input.bootstrapToken)) {
+    recordLoginFailure(limitKeys);
     return res.status(403).json({ message: '初始化引导令牌不正确' });
   }
   await verifyTurnstileToken(input.turnstileToken, req.ip, 'setup');
@@ -535,6 +639,7 @@ app.post('/api/session/setup', asyncRoute(async (req, res) => {
     };
     data.audit.unshift({ id: crypto.randomUUID(), type: 'security.account_initialized', at: timestamp, details: { username: input.username } });
   });
+  clearLoginFailures(limitKeys.scope);
   const auth = store.snapshot().auth;
   setSessionCookie(res, auth);
   res.status(201).json({ success: true, session: publicSession({ ...req, cookies: { ...req.cookies, frosted_session: createSessionToken(auth) } }) });
@@ -545,15 +650,15 @@ app.post('/api/session/login', asyncRoute(async (req, res) => {
   const input = loginSchema.parse(req.body);
   const auth = store.snapshot().auth;
   if (!auth.passwordHash) return res.status(409).json({ message: '请先完成管理员账户初始化', setupRequired: true });
-  const key = checkLoginLimit(req, input.username);
+  const limitKeys = checkLoginLimit(req, input.username);
   await verifyTurnstileToken(input.turnstileToken, req.ip, 'login');
   const passwordValid = await verifyPassword(input.password, auth.passwordHash);
   const valid = usernameMatches(input.username, auth) && passwordValid;
   if (!valid) {
-    recordLoginFailure(key);
+    recordLoginFailure(limitKeys);
     return res.status(401).json({ message: '用户名或密码不正确' });
   }
-  clearLoginFailures(key);
+  clearLoginFailures(limitKeys.scope);
   if (auth.twoFactorEnabled) {
     return res.json({ requiresTwoFactor: true, challengeToken: createTwoFactorChallenge(auth) });
   }
@@ -569,10 +674,10 @@ app.post('/api/session/verify-2fa', asyncRoute(async (req, res) => {
   const input = twoFactorLoginSchema.parse(req.body);
   const auth = store.snapshot().auth;
   if (!verifyTwoFactorChallenge(input.challengeToken, auth)) return res.status(401).json({ message: '二次验证已过期，请重新登录' });
-  const key = checkLoginLimit(req, auth.username, 'two_factor');
+  const limitKeys = checkLoginLimit(req, auth.username, 'two_factor');
   const verified = await consumeSecondFactor(input.code);
   if (!verified.valid) {
-    if (recordLoginFailure(key) >= LOGIN_MAX_ATTEMPTS) {
+    if (recordLoginFailure(limitKeys) >= LOGIN_MAX_ATTEMPTS) {
       consumeTwoFactorChallenge(input.challengeToken, auth);
     }
     return res.status(401).json({ message: '验证码或恢复码不正确' });
@@ -580,7 +685,7 @@ app.post('/api/session/verify-2fa', asyncRoute(async (req, res) => {
   if (!consumeTwoFactorChallenge(input.challengeToken, auth)) {
     return res.status(401).json({ message: '二次验证已过期，请重新登录' });
   }
-  clearLoginFailures(key);
+  clearLoginFailures(limitKeys.scope);
   if (verified.recovery) await store.mutate((data) => {
     data.audit.unshift({ id: crypto.randomUUID(), type: 'security.recovery_code_used', at: new Date().toISOString() });
   });
@@ -732,6 +837,11 @@ app.patch('/api/security/profile', asyncRoute(async (req, res) => {
 app.post('/api/security/2fa/setup', asyncRoute(async (req, res) => {
   const auth = store.snapshot().auth;
   if (auth.twoFactorEnabled) return res.status(409).json({ message: '两步验证已经启用' });
+  // Generating a pending secret is itself a state-changing operation.  Bound
+  // it to the authenticated administrator/IP so it cannot be used to force
+  // unbounded encrypted writes or rotate the enrollment QR indefinitely.
+  const limitKeys = checkLoginLimit(req, auth.username, 'two_factor_setup');
+  recordLoginFailure(limitKeys);
   const enrollment = createTotpEnrollment(auth.username);
   const timestamp = new Date().toISOString();
   await store.mutate((data) => {
@@ -748,11 +858,15 @@ app.post('/api/security/2fa/setup', asyncRoute(async (req, res) => {
 app.post('/api/security/2fa/enable', asyncRoute(async (req, res) => {
   const input = twoFactorCodeSchema.parse(req.body);
   const auth = store.snapshot().auth;
+  const limitKeys = checkLoginLimit(req, auth.username, 'two_factor_setup');
   if (!auth.pendingTotpEncrypted || Date.now() - new Date(auth.pendingTotpCreatedAt || 0).getTime() > 10 * 60 * 1000) {
     return res.status(400).json({ message: '绑定信息已过期，请重新生成二维码' });
   }
   const secret = decryptSecret(auth.pendingTotpEncrypted).value;
-  if (!await verifyTotpCode(secret, input.code)) return res.status(400).json({ message: '动态验证码不正确' });
+  if (!await verifyTotpCode(secret, input.code)) {
+    recordLoginFailure(limitKeys);
+    return res.status(400).json({ message: '动态验证码不正确' });
+  }
   const recoveryCodes = generateRecoveryCodes();
   const timestamp = new Date().toISOString();
   await store.mutate((data) => {
@@ -766,6 +880,7 @@ app.post('/api/security/2fa/enable', asyncRoute(async (req, res) => {
     data.auth.updatedAt = timestamp;
     data.audit.unshift({ id: crypto.randomUUID(), type: 'security.2fa_enabled', at: timestamp });
   });
+  clearLoginFailures(limitKeys.scope);
   closeBrowserConnections();
   const updated = store.snapshot().auth;
   setSessionCookie(res, updated);
@@ -776,9 +891,17 @@ app.post('/api/security/2fa/recovery-codes', asyncRoute(async (req, res) => {
   const input = disableTwoFactorSchema.parse(req.body);
   const auth = store.snapshot().auth;
   if (!auth.twoFactorEnabled) return res.status(400).json({ message: '两步验证尚未启用' });
-  if (!await verifyPassword(input.currentPassword, auth.passwordHash)) return res.status(401).json({ message: '当前密码不正确' });
+  const limitKeys = checkLoginLimit(req, auth.username, 'two_factor_sensitive');
+  if (!await verifyPassword(input.currentPassword, auth.passwordHash)) {
+    recordLoginFailure(limitKeys);
+    return res.status(401).json({ message: '当前密码不正确' });
+  }
   const verified = await consumeSecondFactor(input.code);
-  if (!verified.valid) return res.status(400).json({ message: '验证码或恢复码不正确' });
+  if (!verified.valid) {
+    recordLoginFailure(limitKeys);
+    return res.status(400).json({ message: '验证码或恢复码不正确' });
+  }
+  clearLoginFailures(limitKeys.scope);
   const recoveryCodes = generateRecoveryCodes();
   await store.mutate((data) => {
     data.auth.recoveryCodeHashes = recoveryCodes.map(hashRecoveryCode);
@@ -791,9 +914,17 @@ app.delete('/api/security/2fa', asyncRoute(async (req, res) => {
   const input = disableTwoFactorSchema.parse(req.body);
   const auth = store.snapshot().auth;
   if (!auth.twoFactorEnabled) return res.status(400).json({ message: '两步验证尚未启用' });
-  if (!await verifyPassword(input.currentPassword, auth.passwordHash)) return res.status(401).json({ message: '当前密码不正确' });
+  const limitKeys = checkLoginLimit(req, auth.username, 'two_factor_sensitive');
+  if (!await verifyPassword(input.currentPassword, auth.passwordHash)) {
+    recordLoginFailure(limitKeys);
+    return res.status(401).json({ message: '当前密码不正确' });
+  }
   const verified = await consumeSecondFactor(input.code);
-  if (!verified.valid) return res.status(400).json({ message: '验证码或恢复码不正确' });
+  if (!verified.valid) {
+    recordLoginFailure(limitKeys);
+    return res.status(400).json({ message: '验证码或恢复码不正确' });
+  }
+  clearLoginFailures(limitKeys.scope);
   const timestamp = new Date().toISOString();
   await store.mutate((data) => {
     data.auth.twoFactorEnabled = false;
@@ -1104,11 +1235,13 @@ app.patch('/api/accounts/:id', asyncRoute(async (req, res) => {
     if (!current) return { status: 404, message: '账号不存在' };
     const timestamp = new Date().toISOString();
     const targetUpstreamId = req.body.upstreamId || current.upstreamId;
-    const merged = accountSchema.parse({ ...current, ...req.body, upstreamId: targetUpstreamId, credentials: req.body.credentials || undefined });
+    // 先按白名单 schema 剥离未知键，防止 sessionCookie/browserProfileId 等内部字段被直接写入密文。
+    const submittedCredentials = req.body.credentials ? accountCredentialsSchema.parse(req.body.credentials) : undefined;
+    const merged = accountSchema.parse({ ...current, ...req.body, upstreamId: targetUpstreamId, credentials: submittedCredentials });
     await validateUpstreamDestination(merged.baseUrl);
     evaluateFormula(merged.formula, Number(current.rawBalance || 1));
     const originChanged = !sameOrigin(current.baseUrl, merged.baseUrl);
-    if (originChanged && !req.body.credentials) {
+    if (originChanged && !submittedCredentials) {
       return { status: 400, message: '更换站点域名时必须重新输入凭据，旧凭据不会发送到新站点' };
     }
     const changedFields = Object.keys(req.body || {}).filter((key) => key !== 'credentials' && key !== 'encryptedSecret');
@@ -1117,7 +1250,7 @@ app.patch('/api/accounts/:id', asyncRoute(async (req, res) => {
       if (!account) throw Object.assign(new Error('账号不存在'), { statusCode: 404 });
       requireUpstream(merged.upstreamId, data);
       let nextSecret = account.encryptedSecret;
-      if (req.body.credentials) {
+      if (submittedCredentials) {
         let existing = {};
         if (!originChanged) {
           try {
@@ -1126,12 +1259,12 @@ app.patch('/api/accounts/:id', asyncRoute(async (req, res) => {
             existing = {};
           }
         }
-        nextSecret = encryptSecret(mergeSecrets(existing, req.body.credentials));
+        nextSecret = encryptSecret(mergeSecrets(existing, submittedCredentials));
       }
       Object.assign(account, merged, { updatedAt: timestamp });
       account.encryptedSecret = nextSecret;
       delete account.credentials;
-      data.audit.unshift({ id: crypto.randomUUID(), type: 'account.updated', accountId: account.id, upstreamId: account.upstreamId, at: account.updatedAt, details: { changedFields, credentialsUpdated: Boolean(req.body.credentials) } });
+      data.audit.unshift({ id: crypto.randomUUID(), type: 'account.updated', accountId: account.id, upstreamId: account.upstreamId, at: account.updatedAt, details: { changedFields, credentialsUpdated: Boolean(submittedCredentials) } });
     });
     return { account: sanitizeAccount(store.snapshot().accounts.find((item) => item.id === req.params.id)) };
   });
@@ -1296,10 +1429,13 @@ app.put('/api/settings', asyncRoute(async (req, res) => {
       resendFrom: input.resendFrom,
       resendTo: input.resendTo,
       feishuEnabled: input.feishuEnabled,
+      telegramEnabled: input.telegramEnabled,
+      telegramChatId: input.telegramChatId.trim(),
       recoveryConfirmations: input.recoveryConfirmations,
       reminderMinutes: input.reminderHours !== undefined ? input.reminderHours * 60 : input.reminderMinutes,
       resendApiKeyEncrypted: input.resendApiKey ? encryptSecret({ value: input.resendApiKey }) : data.settings.resendApiKeyEncrypted,
       feishuWebhookEncrypted: input.feishuWebhook ? encryptSecret({ value: input.feishuWebhook }) : data.settings.feishuWebhookEncrypted,
+      telegramBotTokenEncrypted: input.telegramBotToken ? encryptSecret({ value: input.telegramBotToken }) : data.settings.telegramBotTokenEncrypted,
     };
   });
   res.json({ settings: publicSettings(store.snapshot().settings) });
@@ -1308,18 +1444,23 @@ app.put('/api/settings', asyncRoute(async (req, res) => {
 app.post('/api/settings/test-notification', asyncRoute(async (req, res) => {
   const input = notificationTestSchema.parse(req.body);
   const data = store.snapshot();
-  const draft = { ...data.settings, ...input.settings };
+  // 仅覆盖显式提交的键：partial schema 会给带默认值的字段填入默认值，不能用普通展开。
+  const draft = { ...data.settings };
+  for (const [key, value] of Object.entries(input.settings)) {
+    if (value !== undefined) draft[key] = value;
+  }
   const realAccount = data.accounts.find((item) => !item.demo) || data.accounts[0];
   const upstream = data.upstreams.find((item) => item.id === realAccount?.upstreamId);
   const account = {
     ...(realAccount || { name: '测试账号', thresholdLow: 50 }),
     upstreamName: upstream?.name || '',
-    notifications: { resend: true, feishu: true },
+    notifications: { resend: true, feishu: true, telegram: true },
   };
   const incident = { id: 'test-notification', currentBalance: account.convertedCny || 21.6 };
   const secrets = {
     resendApiKey: input.settings.resendApiKey || decryptSecret(data.settings.resendApiKeyEncrypted).value,
     feishuWebhook: input.settings.feishuWebhook || decryptSecret(data.settings.feishuWebhookEncrypted).value,
+    telegramBotToken: input.settings.telegramBotToken || decryptSecret(data.settings.telegramBotTokenEncrypted).value,
   };
   const results = await notify('opened', account, incident, draft, secrets, { channels: [input.channel], force: true });
   await store.mutate((state) => {
@@ -1328,6 +1469,14 @@ app.post('/api/settings/test-notification', asyncRoute(async (req, res) => {
   });
   res.json({ result: results[input.channel] });
 }));
+
+// noVNC 静态资源由应用直接托管并要求会话认证，这样 websockify 只需监听回环地址，
+// 桌面数据面只有一个入口（带 ticket 校验的 WebSocket 网关）。
+const novncDir = config.novncWebDir;
+if (config.browserWorkspaceUrl && fs.existsSync(novncDir)) {
+  app.get(['/browser', '/browser/'], (req, res) => res.redirect('/browser/vnc.html'));
+  app.use('/browser', authRequired, express.static(novncDir, { index: false, redirect: false }));
+}
 
 const dist = path.resolve(process.cwd(), 'dist');
 if (fs.existsSync(dist)) {
@@ -1359,10 +1508,11 @@ app.use((error, req, res, next) => {
       ...(error.upstreamStatus ? { upstreamStatus: error.upstreamStatus } : {}),
     });
   }
-  res.status(500).json({ message: error.message || '服务器内部错误' });
+  // 500 多为未预期的内部错误；生产环境不回显内部消息，避免泄露路径或密文细节。
+  res.status(500).json({ message: config.production ? '服务器内部错误' : (error?.message || '服务器内部错误') });
 });
 
-const server = app.listen(config.port, '0.0.0.0', () => {
+const server = app.listen(config.port, config.host, () => {
   const address = server.address();
   const port = typeof address === 'object' && address ? address.port : config.port;
   console.log(`[frosted-console] http://localhost:${port}`);

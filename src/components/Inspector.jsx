@@ -1,7 +1,9 @@
 import { useMemo, useState } from 'react';
-import { BellRinging, CheckCircle, EnvelopeSimple, Link, ShieldCheck, Wallet, PaperPlaneTilt } from '@phosphor-icons/react';
+import { BellRinging, CheckCircle, EnvelopeSimple, Link, ShieldCheck, TelegramLogo, Wallet, PaperPlaneTilt } from '@phosphor-icons/react';
 import { duration, money, relativeTime } from '../lib.js';
-import { notificationResult, notificationStatus, notificationText, notificationTone } from '../notification-state.js';
+import { CHANNEL_NAMES, notificationResult, notificationStatus, notificationText, notificationTone } from '../notification-state.js';
+
+const CHANNELS = [['resend', EnvelopeSimple], ['feishu', PaperPlaneTilt], ['telegram', TelegramLogo]];
 
 const steps = [
   { id: 'trigger', icon: BellRinging, title: '低余额事件建立', tone: 'warning' },
@@ -14,7 +16,7 @@ const steps = [
 
 function ResultLine({ incident, kind, channel, Icon }) {
   const result = notificationResult(incident, kind, channel);
-  return <span className={`notification-line ${notificationTone(result)}`}><Icon size={13} /><b>{channel === 'resend' ? 'Resend' : '飞书'}</b><em>{notificationText(result, channel)}</em></span>;
+  return <span className={`notification-line ${notificationTone(result)}`}><Icon size={13} /><b>{CHANNEL_NAMES[channel] || channel}</b><em>{notificationText(result, channel)}</em></span>;
 }
 
 function channelReadiness(account, settings, channel) {
@@ -52,10 +54,10 @@ export function Inspector({ account, incidents, settings, onOpenIncidents }) {
   const stepComplete = (id) => {
     if (!incident) return false;
     if (id === 'trigger') return true;
-    if (id === 'opened') return ['resend', 'feishu'].some((channel) => notificationStatus(notificationResult(incident, 'opened', channel)) !== 'pending');
+    if (id === 'opened') return CHANNELS.some(([channel]) => notificationStatus(notificationResult(incident, 'opened', channel)) !== 'pending');
     if (id === 'recharge') return incident.state === 'resolved' || Number(incident.recoveryChecks || 0) > 0;
     if (id === 'recover') return incident.state === 'resolved';
-    if (id === 'recovered') return ['resend', 'feishu'].some((channel) => notificationStatus(notificationResult(incident, 'recovered', channel)) !== 'pending');
+    if (id === 'recovered') return CHANNELS.some(([channel]) => notificationStatus(notificationResult(incident, 'recovered', channel)) !== 'pending');
     return incident.state === 'resolved';
   };
 
@@ -112,10 +114,10 @@ export function Inspector({ account, incidents, settings, onOpenIncidents }) {
             const Icon = step.icon;
             return <div className={`timeline-step ${complete ? 'complete' : ''}`} key={step.id}><div className={`timeline-icon ${complete ? step.tone : ''}`}><Icon size={17} weight={complete ? 'fill' : 'regular'} /></div><div className="timeline-copy"><div><strong>{step.title}</strong>{step.id === 'closed' && incident.state === 'resolved' && <em>已结单</em>}</div>
               {step.id === 'trigger' && <p>当前 {money(incident.currentBalance)}，告警阈值 {money(account.thresholdLow)}</p>}
-              {step.id === 'opened' && <div className="notification-lines"><ResultLine incident={incident} kind="opened" channel="resend" Icon={EnvelopeSimple} /><ResultLine incident={incident} kind="opened" channel="feishu" Icon={PaperPlaneTilt} />{incident.notifications?.reminders?.length > 0 && <small>已重复提醒 {incident.notifications.reminders.length} 次，最近 {relativeTime(incident.lastReminderAt)}</small>}</div>}
+              {step.id === 'opened' && <div className="notification-lines">{CHANNELS.map(([channel, Icon]) => <ResultLine key={channel} incident={incident} kind="opened" channel={channel} Icon={Icon} />)}{incident.notifications?.reminders?.length > 0 && <small>已重复提醒 {incident.notifications.reminders.length} 次，最近 {relativeTime(incident.lastReminderAt)}</small>}</div>}
               {step.id === 'recharge' && <p>{incident.state === 'resolved' || incident.recoveryChecks > 0 ? `检测到余额回升至 ${money(incident.currentBalance)}` : '等待你在上游完成充值；系统会按采集频率自动复查'}</p>}
               {step.id === 'recover' && <p>恢复确认 {incident.recoveryChecks || 0}/{settings.recoveryConfirmations || 2}，达到 {money(account.thresholdRecover)} 才累计</p>}
-              {step.id === 'recovered' && <div className="notification-lines"><ResultLine incident={incident} kind="recovered" channel="resend" Icon={EnvelopeSimple} /><ResultLine incident={incident} kind="recovered" channel="feishu" Icon={PaperPlaneTilt} /></div>}
+              {step.id === 'recovered' && <div className="notification-lines">{CHANNELS.map(([channel, Icon]) => <ResultLine key={channel} incident={incident} kind="recovered" channel={channel} Icon={Icon} />)}</div>}
               {step.id === 'closed' && <p>{incident.resolvedAt ? `自动结单于 ${relativeTime(incident.resolvedAt)}` : '恢复确认完成后自动执行，无需手工结单'}</p>}
             </div></div>;
           })}</div>}
@@ -125,7 +127,7 @@ export function Inspector({ account, incidents, settings, onOpenIncidents }) {
 
       {tab === 'conversion' && account && <div className="inspector-content inspector-detail"><h2>转换详情</h2><dl><div><dt>原始字段</dt><dd>{account.balancePath}</dd></div><div><dt>原始单位</dt><dd>{account.rawUnit}</dd></div><div><dt>原始余额</dt><dd>{account.rawBalance}</dd></div><div><dt>转换公式</dt><dd><code>{account.formula}</code></dd></div><div className="strong"><dt>人民币余额</dt><dd>{money(account.convertedCny)}</dd></div></dl><div className="formula-rule"><CheckCircle size={18} weight="fill" /><p>公式仅允许变量 x、数字、括号和四则运算。</p></div></div>}
 
-      {tab === 'alert' && account && <div className="inspector-content inspector-detail"><h2>通知链路</h2><dl><div><dt>低余额阈值</dt><dd>{money(account.thresholdLow)}</dd></div><div><dt>恢复阈值</dt><dd>{money(account.thresholdRecover)}</dd></div><div><dt>恢复确认</dt><dd>连续 {settings.recoveryConfirmations || 2} 次</dd></div><div><dt>重复提醒</dt><dd>{reminderIntervalLabel(settings)}</dd></div></dl><div className="channel-list">{[['resend', EnvelopeSimple, 'Resend 邮件'], ['feishu', PaperPlaneTilt, '飞书机器人']].map(([channel, Icon, label]) => { const state = channelReadiness(account, settings, channel); return <div key={channel}><Icon size={18} /><span>{label}</span><b className={state.tone}>{state.label}</b></div>; })}</div><p className="channel-scope-note">渠道需要同时满足“全局启用、凭据完整、该账号启用”才会发送。</p></div>}
+      {tab === 'alert' && account && <div className="inspector-content inspector-detail"><h2>通知链路</h2><dl><div><dt>低余额阈值</dt><dd>{money(account.thresholdLow)}</dd></div><div><dt>恢复阈值</dt><dd>{money(account.thresholdRecover)}</dd></div><div><dt>恢复确认</dt><dd>连续 {settings.recoveryConfirmations || 2} 次</dd></div><div><dt>重复提醒</dt><dd>{reminderIntervalLabel(settings)}</dd></div></dl><div className="channel-list">{[['resend', EnvelopeSimple, 'Resend 邮件'], ['feishu', PaperPlaneTilt, '飞书机器人'], ['telegram', TelegramLogo, 'Telegram 机器人']].map(([channel, Icon, label]) => { const state = channelReadiness(account, settings, channel); return <div key={channel}><Icon size={18} /><span>{label}</span><b className={state.tone}>{state.label}</b></div>; })}</div><p className="channel-scope-note">渠道需要同时满足“全局启用、凭据完整、该账号启用”才会发送。</p></div>}
       <button className="inspector-history" onClick={onOpenIncidents}><Link size={16} /> 查看事件记录</button>
     </aside>
   );

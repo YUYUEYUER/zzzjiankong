@@ -6,9 +6,9 @@ services:
       TURNSTILE_HEADLESS: "false"
       NOVNC_ENABLED: "true"
       BROWSER_WORKSPACE_URL: "/browser/vnc.html?autoconnect=true&resize=remote&reconnect=true&path=browser%2Fwebsockify"
+    # 8787 同时承载 API、noVNC 静态资源与 websockify 网关；6080 仅在容器回环监听
     expose:
       - "8787"
-      - "6080"
 
   caddy:
     image: caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648

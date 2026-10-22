@@ -4,6 +4,7 @@ import { api } from '../api.js';
 import { money } from '../lib.js';
 import { applySub2ApiSession, buildQuickAccountPayload, parseSub2ApiSession } from '../quick-account.js';
 import { Modal } from './Modal.jsx';
+import { SetupStepNote } from './OnboardingGuide.jsx';
 
 function defaults(upstream = null) {
   return {
@@ -20,21 +21,24 @@ function defaults(upstream = null) {
   };
 }
 
-export function QuickAccountModal({ open, upstreams, defaultUpstreamId, browserWorkspaceUrl = '', onClose, onSaved, onAdvanced, pushToast }) {
+export function QuickAccountModal({ open, onboarding = false, settings = {}, upstreams, defaultUpstreamId, browserWorkspaceUrl = '', onClose, onSaved, onAdvanced, pushToast }) {
   const [form, setForm] = useState(defaults());
   const [busy, setBusy] = useState('');
   const [preview, setPreview] = useState(null);
   const [importError, setImportError] = useState('');
+  const [connectionError, setConnectionError] = useState('');
+  const formRef = useRef(null);
   const sessionFileInputId = useId();
   const sessionFileInputRef = useRef(null);
 
   useEffect(() => {
     if (!open) return;
     const defaultUpstream = upstreams.find((upstream) => upstream.id === defaultUpstreamId) || upstreams[0];
-    setForm(defaults(defaultUpstream));
+    setForm({ ...defaults(defaultUpstream), ...(onboarding ? { name: '主账号' } : {}) });
     setPreview(null);
     setBusy('');
     setImportError('');
+    setConnectionError('');
   }, [open, defaultUpstreamId]);
 
   useEffect(() => {
@@ -66,6 +70,7 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, browserW
   const payload = useMemo(() => buildQuickAccountPayload(form), [form]);
   const set = (key, value) => {
     setPreview(null);
+    setConnectionError('');
     setForm((current) => ({ ...current, [key]: value }));
   };
 
@@ -94,6 +99,9 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, browserW
     if (!file) return;
 
     try {
+      // Keep untrusted local files from causing an unbounded read/parse in the
+      // renderer. A valid export contains only metadata and two short tokens.
+      if (file.size > 256 * 1024) throw new Error('登录态文件不能超过 256 KiB');
       const session = parseSub2ApiSession(await file.text());
       if (form.browserLogin?.id) api.cancelUpstreamLogin(form.browserLogin.id).catch(() => {});
       setPreview(null);
@@ -167,12 +175,15 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, browserW
     : '自动填写上游地址，并使用文件中的 AT / RT';
 
   const testConnection = async () => {
+    if (!formRef.current?.reportValidity()) return;
     setBusy('test');
+    setConnectionError('');
     try {
       const result = await api.testAccount(payload);
       setPreview(result);
       pushToast(`连接成功，人民币余额 ${money(result.convertedCny)}`, 'success');
     } catch (error) {
+      setConnectionError(error.message);
       pushToast(error.message, 'error');
     } finally {
       setBusy('');
@@ -182,6 +193,7 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, browserW
   const submit = async (event) => {
     event.preventDefault();
     setBusy('save');
+    setConnectionError('');
     try {
       const result = await api.createAccount(payload);
       if (result.syncError) pushToast(`账号已保存，首次同步待重试：${result.syncError}`, 'warning');
@@ -189,6 +201,7 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, browserW
       await onSaved(result.account);
       onClose();
     } catch (error) {
+      setConnectionError(error.message);
       pushToast(error.message, 'error');
     } finally {
       setBusy('');
@@ -204,6 +217,7 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, browserW
   const usingSub2Session = form.type === 'sub2api' && Boolean(form.importedSession);
   const browserLoginCaptured = usingSub2BrowserLogin && form.browserLogin?.status === 'captured';
   const browserLoginWaiting = usingSub2BrowserLogin && ['opening', 'waiting'].includes(form.browserLogin?.status);
+  const notificationReady = ['resend', 'feishu', 'telegram'].some((channel) => settings[`${channel}Enabled`] && settings[`${channel}Configured`]);
 
   const closeModal = () => {
     if (form.browserLogin?.id) api.cancelUpstreamLogin(form.browserLogin.id).catch(() => {});
@@ -211,12 +225,15 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, browserW
   };
 
   return (
-    <Modal open={open} title="添加监控账号" subtitle="默认使用上游官方令牌，无需账号密码" onClose={closeModal} width={620}>
-      <form className="modal-body quick-account-form" onSubmit={submit}>
+    <Modal open={open} title="添加监控账号" subtitle="选择站点类型，再连接你在该站点的账号" onClose={closeModal} dismissible={!busy} width={620}>
+      <form ref={formRef} className="modal-body quick-account-form" onSubmit={submit}>
+        {onboarding && <SetupStepNote step={2}>保存后会立即尝试同步余额。下一步再核对金额和提醒阈值。</SetupStepNote>}
         <div className="quick-type-switch" role="group" aria-label="上游类型">
           <button type="button" className={form.type === 'newapi' ? 'active' : ''} onClick={() => changeType('newapi')}>New API</button>
           <button type="button" className={form.type === 'sub2api' ? 'active' : ''} onClick={() => changeType('sub2api')}>Sub2API</button>
         </div>
+
+        <details className="quick-credential-help"><summary>在哪里找到接入信息？</summary><p>{form.type === 'newapi' ? '登录上游站点，在「个人资料 → 安全 → 访问令牌」生成账户访问令牌，并从个人资料复制数字 User ID。如果要监控一枚 API Key 的额度，可进入下方高级设置切换读取方式。' : '登录上游站点，在「API 密钥」创建 Key 后粘贴。希望监控整个账户时，也可以选择下方的浏览器登录，或导入已有登录态。'}</p></details>
 
         <div className="form-grid two">
           <label><span>所属上游</span><select required value={form.upstreamId} onChange={(event) => selectUpstream(event.target.value)}><option value="" disabled>请选择已创建的上游</option>{upstreams.map((upstream) => <option key={upstream.id} value={upstream.id}>{upstream.name}</option>)}</select></label>
@@ -278,11 +295,13 @@ export function QuickAccountModal({ open, upstreams, defaultUpstreamId, browserW
           {usingSub2BrowserLogin && <button type="button" className="quick-browser-login-clear" onClick={cancelBrowserLogin} aria-label="取消内置浏览器登录" title="取消登录"><X size={17} /></button>}
         </div>}
 
-        <div className="quick-defaults"><span>默认配置</span><strong>低于 ¥3 报警 · 5 分钟检测 · Resend 与飞书通知</strong></div>
-        {preview && <div className="quick-preview"><span>连接正常</span><strong>{money(preview.convertedCny)}</strong></div>}
+        <div className="quick-defaults"><span>默认监控规则</span><strong>低于 ¥3 提醒 · 达到 ¥5 恢复 · 每 5 分钟检测</strong></div>
+        {!notificationReady && <p className="onboarding-note">提醒渠道尚未配置。账号接入后，可以继续设置邮件或机器人通知。</p>}
+        {connectionError && <div className="quick-connection-error" role="alert"><strong>连接未完成</strong><div>{connectionError}</div><div>请检查站点地址与凭据，修正后可重新测试。</div></div>}
+        {preview && <div className="quick-preview" role="status"><span>已读取余额 · 保存后开始监控</span><strong>{money(preview.convertedCny)}</strong></div>}
 
         <div className="modal-actions quick-actions">
-          <button type="button" className="advanced-command" onClick={() => onAdvanced(advancedDraft())}><SlidersHorizontal size={17} />高级设置</button>
+          <button type="button" className="advanced-command" disabled={Boolean(busy)} onClick={() => onAdvanced(advancedDraft())}><SlidersHorizontal size={17} />高级设置</button>
           <span />
           <button type="button" className="secondary-button" disabled={Boolean(busy) || (usingSub2BrowserLogin && !browserLoginCaptured)} onClick={testConnection}>{busy === 'test' ? <SpinnerGap className="spin" /> : <Flask size={17} />}测试连接</button>
           <button type="submit" className="primary-button" disabled={Boolean(busy) || (usingSub2BrowserLogin && !browserLoginCaptured)}>{busy === 'save' && <SpinnerGap className="spin" />}{usingSub2BrowserLogin ? '使用登录态添加' : '添加账号'}</button>

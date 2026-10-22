@@ -9,11 +9,17 @@
 // @grant        none
 // @noframes
 // ==/UserScript==
+//
+// 安全提示：本脚本在所有站点捕获并自动导出 AT/RT 文件。请仅在专用浏览器/专用配置
+// 中安装（例如霜镜浏览器登录弹出的 Chromium 实例），用完即禁用；切勿装入日常
+// 浏览器，否则任何页面都能触发凭据导出。
 
 (function () {
   'use strict';
 
   const AUTH_ENDPOINT = /\/api\/v1\/auth\/(login|refresh)(?:[/?#]|$)/i;
+  const MAX_CAPTURE_TEXT_BYTES = 256 * 1024;
+  const MAX_TOKEN_LENGTH = 4096;
   const ACCESS_KEYS = new Set(['accesstoken', 'authtoken', 'access', 'jwt']);
   const REFRESH_KEYS = new Set(['refreshtoken', 'refresh']);
   const capture = {
@@ -39,7 +45,8 @@
 
   function normalizedToken(value) {
     if (typeof value !== 'string') return '';
-    return value.trim().replace(/^Bearer\s+/i, '');
+    const token = value.trim().replace(/^Bearer\s+/i, '');
+    return token.length <= MAX_TOKEN_LENGTH ? token : '';
   }
 
   function extractTokens(value, options = {}, result = {}, depth = 0, seen = new WeakSet()) {
@@ -47,7 +54,7 @@
 
     if (typeof value === 'string') {
       const text = value.trim();
-      if ((text.startsWith('{') || text.startsWith('[')) && text.length < 2_000_000) {
+      if ((text.startsWith('{') || text.startsWith('[')) && text.length <= MAX_CAPTURE_TEXT_BYTES) {
         try {
           return extractTokens(JSON.parse(text), options, result, depth + 1, seen);
         } catch {
@@ -160,6 +167,7 @@
         body: JSON.stringify({ refresh_token: capture.refreshToken }),
       });
       const text = await response.text();
+      if (text.length > MAX_CAPTURE_TEXT_BYTES) throw new Error('刷新接口响应超过 256 KiB');
       let body = {};
       try {
         body = text ? JSON.parse(text) : {};

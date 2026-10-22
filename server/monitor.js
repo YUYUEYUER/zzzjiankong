@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { withAccountCredentialLock } from './account-lock.js';
 import { config } from './config.js';
-import { collectBalance } from './collectors.js';
+import { collectBalance, redactCredentialText } from './collectors.js';
 import { evaluateFormula } from './converter.js';
 import { attachCredentialCheckpoint, takeCredentialCheckpoint } from './credential-checkpoint.js';
 import { decryptSecret, encryptSecret } from './security.js';
@@ -41,6 +41,21 @@ function simulate(account, recharge = false) {
   const ratio = account.rawBalance ? account.convertedCny / account.rawBalance : 1;
   const nextCny = Math.max(0, account.convertedCny - Math.max(0.04, account.convertedCny * 0.002));
   return { rawBalance: ratio ? nextCny / ratio : nextCny, metadata: { authSource: 'demo' } };
+}
+
+function secretTokens(secret = {}) {
+  const values = [
+    secret.accessToken,
+    secret.apiToken,
+    secret.refreshToken,
+    secret.password,
+    secret.sessionCookie,
+    secret.cfAccessClientSecret,
+  ];
+  for (const list of [secret.accessTokens, secret.apiTokens]) {
+    if (Array.isArray(list)) values.push(...list);
+  }
+  return values;
 }
 
 export class Monitor {
@@ -122,11 +137,12 @@ export class Monitor {
 
   async pollUnlocked(accountId, options = {}) {
     let result;
+    let secret = {};
     try {
       const data = this.store.snapshot();
       const account = data.accounts.find((item) => item.id === accountId);
       if (!account) throw new Error('账号不存在');
-      const secret = decryptSecret(account.encryptedSecret);
+      secret = decryptSecret(account.encryptedSecret);
       result = account.demo ? simulate(account, options.recharge) : await this.collector(account, secret);
       const convertedCny = evaluateFormula(account.formula, result.rawBalance);
       const transition = await this.applySuccess(accountId, result, convertedCny);
@@ -151,7 +167,13 @@ export class Monitor {
             data.audit = data.audit.slice(0, 500);
           }
           account.status = 'error';
-          account.lastError = error.message;
+          account.recoveryChecks = 0;
+          // A failed poll breaks the sequence of verified healthy readings.
+          for (const incident of data.incidents) {
+            if (incident.accountId === accountId && incident.state === 'open') incident.recoveryChecks = 0;
+          }
+          // 上游可控的错误文本先脱敏，避免其回显账号凭据并落入明文存储/界面。
+          account.lastError = redactCredentialText(error.message, secretTokens(secret));
           account.lastSyncAt = now();
           account.updatedAt = now();
         }

@@ -13,11 +13,14 @@ import {
   Plus,
   SignOut,
   SpinnerGap,
+  ListChecks,
   Trash,
   WarningCircle,
 } from '@phosphor-icons/react';
 import { AnimatePresence, motion } from 'motion/react';
 import { compactNumber, hostname, money, platformLabel, relativeTime } from '../lib.js';
+import { OnboardingGuide } from './OnboardingGuide.jsx';
+import { getOnboardingState } from '../onboarding.js';
 
 const STATUS_COPY = {
   healthy: '运行正常',
@@ -176,7 +179,7 @@ function AccountDetails({ account, state, onEdit }) {
   );
 }
 
-function AccountRow({ account, expanded, detailState, onToggle, onRefresh, onOpenUpstream, onEdit, busy, opening }) {
+function AccountRow({ account, balanceKnown, expanded, detailState, onToggle, onRefresh, onOpenUpstream, onEdit, busy, opening }) {
   return (
     <div className={`status-account ${expanded ? 'expanded' : ''}`}>
       <div className="status-account-main">
@@ -190,7 +193,7 @@ function AccountRow({ account, expanded, detailState, onToggle, onRefresh, onOpe
             <small>{platformLabel(account.type)} · {hostname(account.baseUrl)}{account.apiTokenCount > 1 ? ` · ${account.apiTokenCount} Keys` : ''}</small>
           </span>
           <span className="status-account-sync">{relativeTime(account.lastSyncAt)}</span>
-          <span className="status-account-balance">{money(account.convertedCny)}</span>
+          <span className="status-account-balance">{balanceKnown ? money(account.convertedCny) : '未获取余额'}</span>
           <span className={`status-label ${account.status}`}>{statusCopy(account.status)}</span>
         </button>
         <div className="status-account-actions">
@@ -241,6 +244,8 @@ function IncidentHistory({ incidents, onAcknowledge }) {
 
 export function StatusDashboard({
   dashboard,
+  username,
+  onSetupAction,
   busyAccount,
   openingAccount,
   busyUpstream,
@@ -261,19 +266,26 @@ export function StatusDashboard({
   const [detailStates, setDetailStates] = useState({});
   const [historyOpen, setHistoryOpen] = useState(false);
   const [recycleOpen, setRecycleOpen] = useState(false);
+  const [onboardingOpen, setOnboardingOpen] = useState(null);
+  const [showDemo, setShowDemo] = useState(false);
 
   const realAccounts = useMemo(() => dashboard.accounts.filter((account) => !account.demo), [dashboard.accounts]);
-  const visibleAccounts = realAccounts.length ? realAccounts : dashboard.accounts;
+  const setupState = getOnboardingState(dashboard);
+  const demoAccounts = dashboard.accounts.filter((account) => account.demo);
+  const canShowExamples = !setupState.realUpstreams.length && !realAccounts.length
+    && !dashboard.deletedAccounts?.some((account) => !account.demo);
+  const visibleAccounts = showDemo && canShowExamples ? dashboard.accounts : realAccounts;
   const visibleAccountIds = useMemo(() => new Set(visibleAccounts.map((account) => account.id)), [visibleAccounts]);
   const visibleIncidents = useMemo(() => dashboard.incidents.filter((incident) => visibleAccountIds.has(incident.accountId)), [dashboard.incidents, visibleAccountIds]);
   const visibleUpstreams = useMemo(() => dashboard.upstreams.filter((upstream) => (
     visibleAccounts.some((account) => account.upstreamId === upstream.id)
-    || !realAccounts.length
-    || (upstream.accountCount === 0 && upstream.demoAccountCount === 0)
-  )), [dashboard.upstreams, visibleAccounts, realAccounts.length]);
+    || (!upstream.demo && upstream.accountCount === 0 && !upstream.demoAccountCount)
+  )), [dashboard.upstreams, visibleAccounts]);
   const attention = visibleAccounts.filter((account) => ['warning', 'critical', 'error', 'offline'].includes(account.status)).length;
   const allHealthy = visibleAccounts.length > 0 && visibleAccounts.every((account) => account.status === 'healthy');
   const lastSyncAt = visibleAccounts.map((account) => account.lastSyncAt).filter(Boolean).sort().at(-1) || null;
+  const balanceAccountIds = new Set((dashboard.snapshots || []).map((snapshot) => snapshot.accountId));
+  const hasBalance = (account) => balanceAccountIds.has(account.id) || ['healthy', 'warning', 'critical'].includes(account.status);
   const detailRevision = visibleAccounts.map((account) => `${account.id}:${account.updatedAt || ''}:${account.lastSyncAt || ''}:${account.apiTokenCount || 0}`).join('|');
   const expandedKeyIds = [...expandedAccounts].filter((id) => {
     const account = visibleAccounts.find((item) => item.id === id);
@@ -316,21 +328,26 @@ export function StatusDashboard({
     <main className="status-page">
       <div className="status-container">
         <header className="status-topbar">
-          <div className="status-brand"><span className="status-brand-mark">上</span><div><strong>上游余额</strong><small>余额与告警监控</small></div></div>
+          <div className="status-brand"><span className="status-brand-mark">霜</span><div><strong>霜镜</strong><small>上游余额与告警监控</small></div></div>
           <div className="status-top-actions">
+            <button className="first-use-command" type="button" onClick={() => setOnboardingOpen(true)}><ListChecks size={17} />首次设置</button>
             <button className="quiet-icon-button large" type="button" onClick={onSettings} title="通知与安全设置" aria-label="通知与安全设置"><Gear size={20} /></button>
             <button className="quiet-icon-button large" type="button" onClick={onLogout} title="退出登录" aria-label="退出登录"><SignOut size={20} /></button>
             <button className="dark-command" type="button" onClick={onAddUpstream}><Plus size={18} weight="bold" />添加上游</button>
           </div>
         </header>
 
-        <section className={`status-summary-banner ${allHealthy ? 'healthy' : attention ? 'warning' : 'pending'}`}>
+        <OnboardingGuide key={username || 'local'} username={username} dashboard={dashboard} requested={onboardingOpen} onOpenChange={setOnboardingOpen} onAction={onSetupAction} busyAccount={busyAccount} />
+
+        {canShowExamples && demoAccounts.length > 0 && <div className="status-demo-bar"><span>{showDemo ? '正在展示示例数据，用于了解页面；不代表已接入真实账号。' : '想先了解监控界面？可以查看示例。'}</span><button type="button" className="text-command" onClick={() => setShowDemo((value) => !value)}>{showDemo ? '隐藏示例' : '查看示例'}</button></div>}
+
+        {visibleAccounts.length > 0 && <section className={`status-summary-banner ${allHealthy ? 'healthy' : attention ? 'warning' : 'pending'}`}>
           <div className="summary-title">
             {allHealthy ? <CheckCircle size={24} weight="fill" /> : <WarningCircle size={24} weight="fill" />}
-            <strong>{allHealthy ? '所有上游运行正常' : attention ? `${attention} 个账号需要处理` : '等待添加监控账号'}</strong>
+            <strong>{allHealthy ? '所有上游运行正常' : attention ? `${attention} 个账号需要处理` : '账号已保存，等待首次同步'}</strong>
           </div>
-          <p>{allHealthy ? `正在监控 ${visibleUpstreams.length} 个上游、${visibleAccounts.length} 个账号，当前没有未处理告警。` : attention ? '系统会持续检测余额；手动充值后，余额恢复将自动结单。' : '点击“添加上游”，再通过官方令牌接入账号。'}</p>
-        </section>
+          <p>{allHealthy ? `正在监控 ${visibleUpstreams.length} 个上游、${visibleAccounts.length} 个账号，当前没有未处理告警。` : attention ? '系统会持续检测余额；手动充值后，余额恢复将自动结单。' : '首次同步成功后会显示余额，也可以点击账号旁的同步按钮立即重试。'}</p>
+        </section>}
 
         <section className="status-board" aria-label="上游状态">
           <header className="status-board-header">
@@ -344,7 +361,8 @@ export function StatusDashboard({
             const upstreamStatus = accounts.length
               ? accounts.reduce((worst, account) => (statusPriority[account.status] > statusPriority[worst] ? account.status : worst), 'empty')
               : 'empty';
-            const upstreamTotal = accounts.reduce((sum, account) => sum + Number(account.convertedCny || 0), 0);
+            const knownBalances = accounts.filter(hasBalance);
+            const upstreamTotal = knownBalances.reduce((sum, account) => sum + Number(account.convertedCny || 0), 0);
             const upstreamPlatforms = [...new Set(accounts.map((account) => account.type))];
             return (
               <section className="status-upstream" key={upstream.id}>
@@ -353,8 +371,8 @@ export function StatusDashboard({
                     <span className={`status-icon ${upstreamStatus}`}>
                       {['healthy', 'empty'].includes(upstreamStatus) ? <CheckCircle size={22} weight="fill" /> : <WarningCircle size={22} weight="fill" />}
                     </span>
-                    <span><strong>{upstream.name}</strong><small>{upstreamPlatforms.map(platformLabel).join(' / ') || '等待账号'} · {accounts.length} 个账号</small></span>
-                    <span className="upstream-total">{money(upstreamTotal)}<small>人民币余额</small></span>
+                    <span><strong>{upstream.name}{accounts.length > 0 && accounts.every((account) => account.demo) && <em className="status-demo-label">示例</em>}</strong><small>{upstreamPlatforms.map(platformLabel).join(' / ') || '等待账号'} · {accounts.length} 个账号</small></span>
+                    <span className="upstream-total">{knownBalances.length ? money(upstreamTotal) : '—'}<small>{knownBalances.length < accounts.length ? '已读取人民币余额' : '人民币余额'}</small></span>
                     <span className={`status-label ${upstreamStatus}`}>{statusCopy(upstreamStatus)}</span>
                     <PencilSimple className="banner-edit-icon" size={17} />
                   </button>
@@ -368,6 +386,7 @@ export function StatusDashboard({
                     <AccountRow
                       key={account.id}
                       account={account}
+                      balanceKnown={hasBalance(account)}
                       expanded={expandedAccounts.has(account.id)}
                       detailState={detailStates[account.id]}
                       onToggle={() => toggleAccount(account)}
@@ -383,7 +402,7 @@ export function StatusDashboard({
             );
           })}
 
-          {!visibleUpstreams.length && <div className="status-empty"><h2>还没有上游</h2><p>先创建上游名称，再通过官方令牌添加监控账号。</p><button className="dark-command" type="button" onClick={onAddUpstream}><Plus size={18} />添加上游</button></div>}
+          {!visibleUpstreams.length && <div className="status-empty"><h2>这里将展示你的上游状态</h2><p>创建第一个上游并接入账号后，就可以查看余额与告警。</p><button className="dark-command" type="button" onClick={() => onSetupAction('upstream')}><Plus size={18} />创建第一个上游</button></div>}
         </section>
 
         <button className="history-toggle" type="button" onClick={() => setHistoryOpen((value) => !value)} aria-expanded={historyOpen}>
@@ -396,7 +415,7 @@ export function StatusDashboard({
           {recycleOpen && <section className="history-panel recycle-panel"><header><div><Trash size={18} /><h2>账号回收站</h2></div><span>历史记录保留</span></header><div className="recycle-list">{dashboard.deletedAccounts.map((account) => <div className="recycle-row" key={account.id}><div><strong>{account.name}</strong><small>{hostname(account.baseUrl)} · 删除于 {relativeTime(account.deletedAt)}</small></div><button type="button" className="text-command" onClick={() => onRestoreAccount(account)}><ArrowCounterClockwise size={16} />恢复</button></div>)}</div></section>}
         </>}
 
-        <footer className="status-footer">余额统一换算为人民币。低于账号阈值时触发 Resend / 飞书通知，充值恢复后自动结单。</footer>
+        <footer className="status-footer">{setupState.realAccounts.length > 0 && !setupState.channels.length ? '尚未为当前账号配置有效提醒渠道，可在首次设置中继续配置。' : '余额统一换算为人民币，低于阈值时通过已启用渠道提醒；充值后连续检测恢复，自动结单。'}</footer>
       </div>
     </main>
   );

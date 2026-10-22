@@ -1,3 +1,4 @@
+import { redactCredentialText } from './collectors.js';
 import { readLimitedBody } from './network-policy.js';
 
 function formatMoney(value) {
@@ -80,6 +81,13 @@ function configResult(channel, account, settings, secrets, force) {
   if (channel === 'feishu' && !secrets.feishuWebhook) {
     return { status: 'missing_config', message: '缺少 Webhook 地址' };
   }
+  if (channel === 'telegram') {
+    const missing = [
+      !secrets.telegramBotToken && 'Bot Token',
+      !settings.telegramChatId && 'Chat ID',
+    ].filter(Boolean);
+    if (missing.length) return { status: 'missing_config', message: `缺少${missing.join('、')}` };
+  }
   return null;
 }
 
@@ -95,6 +103,7 @@ function retryAfterMs(response) {
 async function sendResend(settings, secrets, copy, options = {}) {
   const response = await fetch('https://api.resend.com/emails', {
     method: 'POST',
+    redirect: 'error',
     headers: {
       Authorization: `Bearer ${secrets.resendApiKey}`,
       'Content-Type': 'application/json',
@@ -130,6 +139,7 @@ async function sendFeishu(settings, secrets, copy) {
 
   const response = await fetch(webhook, {
     method: 'POST',
+    redirect: 'error',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       msg_type: 'interactive',
@@ -154,7 +164,47 @@ async function sendFeishu(settings, secrets, copy) {
   return { message: '飞书机器人已确认' };
 }
 
-const senders = { resend: sendResend, feishu: sendFeishu };
+/** Telegram Bot Token 只能是 `数字ID:密钥段`；校验字符集防止 URL 路径注入。 */
+const TELEGRAM_TOKEN_PATTERN = /^\d{5,}:[A-Za-z0-9_-]{20,}$/;
+/** chat_id 支持数字（含群组负数）与 @频道名。 */
+const TELEGRAM_CHAT_ID_PATTERN = /^(@[A-Za-z0-9_]{5,64}|-?\d{5,20})$/;
+
+async function sendTelegram(settings, secrets, copy) {
+  const token = String(secrets.telegramBotToken || '').trim();
+  if (!TELEGRAM_TOKEN_PATTERN.test(token)) {
+    throw new ChannelError('invalid_config', 'Bot Token 格式无效（应为 123456:ABC-... 形式）');
+  }
+  const chatId = String(settings.telegramChatId || '').trim();
+  if (!TELEGRAM_CHAT_ID_PATTERN.test(chatId)) {
+    throw new ChannelError('invalid_config', 'Chat ID 格式无效（数字、负数群组 ID 或 @频道名）');
+  }
+  const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: 'POST',
+    redirect: 'error',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: `<b>${escapeHtml(copy.title)}</b>\n${escapeHtml(copy.summary)}`,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  const body = await responseBody(response);
+  if (!response.ok || body.ok !== true) {
+    const retryAfterSeconds = Number(body.parameters?.retry_after);
+    throw new ChannelError('provider_rejected', redactCredentialText(
+      `Telegram 拒绝请求 (${body.error_code ?? response.status})：${concise(body.description, '未提供原因')}`,
+      [token],
+    ), {
+      retryable: response.status === 429 || response.status >= 500,
+      retryAfterMs: retryAfterMs(response) || (Number.isFinite(retryAfterSeconds) ? retryAfterSeconds * 1000 : 0),
+    });
+  }
+  return { externalId: String(body.result?.message_id ?? ''), message: 'Telegram 已送达' };
+}
+
+const senders = { resend: sendResend, feishu: sendFeishu, telegram: sendTelegram };
 
 async function runChannel(channel, account, settings, secrets, copy, force, options) {
   const startedAt = new Date().toISOString();
@@ -186,7 +236,7 @@ async function runChannel(channel, account, settings, secrets, copy, force, opti
 
 export async function notify(kind, account, incident, settings, secrets, options = {}) {
   const copy = notificationCopy(kind, account, incident);
-  const channels = options.channels || ['resend', 'feishu'];
+  const channels = options.channels || ['resend', 'feishu', 'telegram'];
   const entries = await Promise.all(channels.map(async (channel) => [
     channel,
     await runChannel(channel, account, settings, secrets, copy, Boolean(options.force), {

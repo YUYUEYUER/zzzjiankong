@@ -2,6 +2,9 @@ import dns from 'node:dns/promises';
 import net from 'node:net';
 import { Agent } from 'undici';
 
+const DNS_LOOKUP_TIMEOUT_MS = 6_000;
+const MAX_RESOLVED_ADDRESSES = 32;
+
 const blockedAddresses = new net.BlockList();
 
 for (const [address, prefix] of [
@@ -14,6 +17,11 @@ for (const [address, prefix] of [
 for (const [address, prefix] of [
   ['::', 128], ['::1', 128], ['100::', 64], ['2001:2::', 48], ['2001:db8::', 32],
   ['2002::', 16], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8],
+  // IPv4-compatible and deprecated site-local IPv6 ranges must not be used as
+  // an alternate spelling of loopback/private destinations.
+  ['::', 96], ['fec0::', 10],
+  // NAT64 转换前缀可把流量导向任意 IPv4（含内网）；Teredo 隧道同理可达映射地址。
+  ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['2001::', 32],
 ]) blockedAddresses.addSubnet(address, prefix, 'ipv6');
 
 function policyError(message, statusCode = 400, code = 'UPSTREAM_URL_BLOCKED') {
@@ -21,12 +29,27 @@ function policyError(message, statusCode = 400, code = 'UPSTREAM_URL_BLOCKED') {
 }
 
 export function isPublicNetworkAddress(address) {
-  const family = net.isIP(address);
+  const value = String(address || '').trim();
+  const family = net.isIP(value);
   if (!family) return false;
-  if (family === 6 && address.toLowerCase().startsWith('::ffff:')) {
-    return isPublicNetworkAddress(address.slice(address.lastIndexOf(':') + 1));
+  if (family === 6 && value.toLowerCase().startsWith('::ffff:')) {
+    // dns.lookup() may return an IPv4-mapped address in either dotted or
+    // canonical hexadecimal form (for example ::ffff:7f00:1). Convert the
+    // latter before applying the IPv4 policy so a private mapped address
+    // cannot bypass the block list.
+    const mapped = value.slice(value.indexOf(':ffff:') + 6);
+    const parts = mapped.split(':');
+    let ipv4 = '';
+    if (parts.length === 1 && net.isIP(mapped) === 4) {
+      ipv4 = mapped;
+    } else if (parts.length === 2 && parts.every((part) => /^[0-9a-f]{1,4}$/i.test(part))) {
+      const high = Number.parseInt(parts[0], 16);
+      const low = Number.parseInt(parts[1], 16);
+      ipv4 = `${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`;
+    }
+    return ipv4 ? isPublicNetworkAddress(ipv4) : false;
   }
-  return !blockedAddresses.check(address, family === 4 ? 'ipv4' : 'ipv6');
+  return !blockedAddresses.check(value, family === 4 ? 'ipv4' : 'ipv6');
 }
 
 function normalizeHostname(value) {
@@ -68,12 +91,20 @@ export async function resolveUpstreamUrl(value, {
   const hostAllowed = allowlisted(url.hostname, allowedHosts);
   let addresses;
   try {
-    addresses = await lookup(url.hostname, { all: true, verbatim: true });
+    let timeout;
+    addresses = await Promise.race([
+      lookup(url.hostname, { all: true, verbatim: true }),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error('DNS lookup timeout')), DNS_LOOKUP_TIMEOUT_MS);
+        timeout.unref?.();
+      }),
+    ]);
+    clearTimeout(timeout);
   } catch {
     throw policyError('无法解析上游域名', 502, 'UPSTREAM_DNS_FAILED');
   }
   addresses = Array.isArray(addresses) ? addresses : [addresses];
-  if (!addresses.length || addresses.some((entry) => !net.isIP(entry?.address))) {
+  if (!addresses.length || addresses.length > MAX_RESOLVED_ADDRESSES || addresses.some((entry) => !net.isIP(String(entry?.address || '').trim()))) {
     throw policyError('无法解析上游域名', 502, 'UPSTREAM_DNS_FAILED');
   }
   if (!allowPrivate && !hostAllowed && addresses.some((entry) => !isPublicNetworkAddress(entry.address))) {
@@ -81,13 +112,26 @@ export async function resolveUpstreamUrl(value, {
   }
   return {
     url,
-    addresses: addresses.map((entry) => ({ address: entry.address, family: Number(entry.family) || net.isIP(entry.address) })),
+    addresses: addresses.map((entry) => {
+      const address = String(entry.address).trim();
+      const detectedFamily = net.isIP(address);
+      const family = Number(entry.family);
+      return { address, family: family === 4 || family === 6 ? family : detectedFamily };
+    }),
   };
 }
 
 export function createPinnedDispatcher({ url, addresses }) {
   const hostname = normalizeHostname(url.hostname);
-  const pinned = addresses.map((entry) => ({ address: entry.address, family: Number(entry.family) || net.isIP(entry.address) }));
+  const pinned = (Array.isArray(addresses) ? addresses : [])
+    .map((entry) => {
+      const address = String(entry?.address || '').trim();
+      const detectedFamily = net.isIP(address);
+      const family = Number(entry?.family);
+      return { address, family: family === 4 || family === 6 ? family : detectedFamily };
+    })
+    .filter((entry) => entry.family && net.isIP(entry.address) === entry.family);
+  if (!hostname || !pinned.length) throw policyError('上游域名没有可用的已校验地址', 502);
   return new Agent({
     headersTimeout: 12_000,
     bodyTimeout: 12_000,

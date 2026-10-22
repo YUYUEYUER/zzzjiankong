@@ -11,12 +11,20 @@ const SUB2_SESSION_DEFAULTS = {
   formula: 'x',
   rawUnit: 'CNY',
 };
+const MAX_SESSION_FILE_BYTES = 256 * 1024;
 
 function tokenValue(value) {
-  return typeof value === 'string' ? value.trim() : '';
+  if (typeof value !== 'string') return '';
+  const token = value.trim();
+  // Access/refresh tokens are opaque strings; bounding them prevents a
+  // malformed import from turning into an oversized API request.
+  return token.length <= 4096 ? token : '';
 }
 
 export function parseSub2ApiSession(raw) {
+  if (typeof raw === 'string' && raw.length > MAX_SESSION_FILE_BYTES) {
+    throw new Error('登录态文件不能超过 256 KiB');
+  }
   let data;
   try {
     data = typeof raw === 'string' ? JSON.parse(raw) : raw;
@@ -130,7 +138,7 @@ export function buildQuickAccountPayload(form) {
     thresholdRecover: 5,
     pollIntervalMinutes: 5,
     enabled: true,
-    notifications: { resend: true, feishu: true },
+    notifications: { resend: true, feishu: true, telegram: true },
     credentials,
   };
 }

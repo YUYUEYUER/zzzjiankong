@@ -1,3 +1,5 @@
+export const CHANNEL_NAMES = { resend: 'Resend', feishu: '飞书', telegram: 'Telegram' };
+
 export function notificationResult(incident, kind, channel) {
   const current = incident?.notifications?.[kind]?.results?.[channel];
   if (current) return current;
@@ -15,7 +17,7 @@ export function notificationStatus(result) {
 
 export function notificationText(result, channel) {
   const status = notificationStatus(result);
-  if (status === 'sent') return result?.message || (channel === 'resend' ? 'Resend 已受理' : '飞书机器人已确认');
+  if (status === 'sent') return result?.message || `${CHANNEL_NAMES[channel] || channel} 已确认`;
   if (status === 'failed') return result?.message || '发送失败';
   if (status === 'missing_config') return result?.message || '配置不完整';
   if (status === 'account_disabled') return '该账号未启用';

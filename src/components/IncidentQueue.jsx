@@ -1,4 +1,4 @@
-import { ArrowClockwise, CaretLeft, CaretRight, Check, EnvelopeSimple, Eye, PaperPlaneTilt } from '@phosphor-icons/react';
+import { ArrowClockwise, CaretLeft, CaretRight, Check, EnvelopeSimple, Eye, PaperPlaneTilt, TelegramLogo } from '@phosphor-icons/react';
 import { duration, money } from '../lib.js';
 import { notificationResult, notificationStatus, notificationText } from '../notification-state.js';
 
@@ -32,7 +32,7 @@ export function IncidentQueue({ incidents, filter, setFilter, onAcknowledge, onS
                 <td className={incident.state === 'open' ? 'money-warning' : 'money-success'}>{money(incident.currentBalance)}</td>
                 <td>{new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(incident.openedAt))}</td>
                 <td className={incident.state === 'open' ? 'duration-open' : ''}>{duration(incident.openedAt, incident.resolvedAt)}</td>
-                <td><span className="channel-icons">{[['resend', EnvelopeSimple], ['feishu', PaperPlaneTilt]].map(([channel, Icon]) => { const result = notificationResult(incident, 'opened', channel); const status = notificationStatus(result); return <Icon key={channel} className={status} title={notificationText(result, channel)} size={16} weight={status === 'sent' ? 'fill' : 'regular'} />; })}</span></td>
+                <td><span className="channel-icons">{[['resend', EnvelopeSimple], ['feishu', PaperPlaneTilt], ['telegram', TelegramLogo]].map(([channel, Icon]) => { const result = notificationResult(incident, 'opened', channel); const status = notificationStatus(result); return <Icon key={channel} className={status} title={notificationText(result, channel)} size={16} weight={status === 'sent' ? 'fill' : 'regular'} />; })}</span></td>
                 <td>{incident.state === 'resolved' ? `已恢复 (${incident.recoveryChecks}/2)` : `未恢复 (${incident.recoveryChecks || 0}/2)`}</td>
                 <td>{incident.state === 'open' && !incident.acknowledgedAt ? <button className="table-action" onClick={() => onAcknowledge(incident.id)}><Check size={14} /> 确认</button> : <button className="table-action" onClick={() => onSelectAccount(incident.accountId)}><Eye size={14} /> 查看</button>}</td>
               </tr>

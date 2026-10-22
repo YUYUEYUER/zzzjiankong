@@ -27,7 +27,23 @@ test('production containers do not publish the application or noVNC ports', asyn
   assert.deepEqual(app.cap_drop, ['ALL']);
   assert.deepEqual(app.cap_add, ['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETUID', 'SYS_CHROOT']);
   assert.ok(app.security_opt.includes('no-new-privileges:true'));
-  assert.deepEqual(server.services['frosted-console'].expose, ['8787', '6080']);
+  assert.deepEqual(server.services['frosted-console'].expose, ['8787']);
+});
+
+test('the desktop data path is terminated by the authenticated application gateway', async () => {
+  const entrypoint = await fs.readFile('server/docker-entrypoint.sh', 'utf8');
+  const caddyfile = await fs.readFile('docker/Caddyfile', 'utf8');
+  const server = await readYaml('docker-compose.server.yml');
+
+  // websockify 只绑容器回环；noVNC 静态资源由应用（8787）认证托管
+  assert.match(entrypoint, /websockify --web=\/usr\/share\/novnc "\$novnc_bind:6080"/);
+  assert.doesNotMatch(entrypoint, /websockify --web=\S+ 0\.0\.0\.0/);
+  // Caddy 不再剥 /browser 前缀，也不再直连 6080
+  assert.match(caddyfile, /handle \/browser\/websockify\* \{/);
+  assert.match(caddyfile, /handle \/browser\/\* \{/);
+  assert.doesNotMatch(caddyfile, /handle_path \/browser/);
+  assert.doesNotMatch(caddyfile, /6080/);
+  assert.deepEqual(server.services['frosted-console'].expose, ['8787']);
 });
 
 test('loopback application and noVNC ports exist only in the development override', async () => {

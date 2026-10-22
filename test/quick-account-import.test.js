@@ -107,3 +107,17 @@ test('Sub2API session import rejects the wrong schema, platform, origin, and mis
     /HTTP\(S\)/,
   );
 });
+
+test('Sub2API session import rejects oversized opaque credentials', () => {
+  assert.throws(
+    () => parseSub2ApiSession(sessionJson({ access_token: 'a'.repeat(4097) })),
+    /Access Token 或 Refresh Token/,
+  );
+});
+
+test('Sub2API session import rejects oversized files before parsing JSON', () => {
+  assert.throws(
+    () => parseSub2ApiSession(`${' '.repeat(256 * 1024)}{}`),
+    /不能超过 256 KiB/,
+  );
+});

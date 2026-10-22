@@ -50,6 +50,103 @@ test('manual recharge closes an incident after two healthy polls', async () => {
   await fs.rm(dir, { recursive: true, force: true });
 });
 
+test('a custom recovery count requires four consecutive readings at the recovery threshold', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'frosted-custom-recovery-'));
+  const store = await new JsonStore(path.join(dir, 'db.json')).init();
+  const readings = [20, 20, 19, 20, 20, 20, 20];
+  const monitor = new Monitor(store, {
+    collector: async () => ({ rawBalance: readings.shift(), metadata: {} }),
+  });
+
+  try {
+    await store.mutate((data) => {
+      data.settings.recoveryConfirmations = 4;
+      data.settings.resendEnabled = false;
+      data.settings.feishuEnabled = false;
+      data.settings.telegramEnabled = false;
+      const account = data.accounts.find((item) => item.id === 'acct-hk-backup');
+      account.demo = false;
+      account.formula = 'x';
+      account.thresholdLow = 10;
+      account.thresholdRecover = 20;
+    });
+
+    for (const expectedChecks of [1, 2, 0, 1, 2, 3]) {
+      await monitor.poll('acct-hk-backup');
+      const incident = store.snapshot().incidents.find((item) => item.id === 'inc-hk');
+      assert.equal(incident.state, 'open');
+      assert.equal(incident.recoveryChecks, expectedChecks);
+      assert.equal(incident.notifications?.recovered, undefined);
+    }
+
+    await monitor.poll('acct-hk-backup');
+    const snapshot = store.snapshot();
+    const incident = snapshot.incidents.find((item) => item.id === 'inc-hk');
+    assert.equal(incident.state, 'resolved');
+    assert.equal(incident.recoveryChecks, 4);
+    assert.equal(snapshot.accounts.find((item) => item.id === 'acct-hk-backup').recoveryChecks, 0);
+    assert.ok(incident.resolvedAt);
+    assert.equal(incident.notifications.recovered.results.resend.status, 'disabled');
+    assert.equal(incident.notifications.recovered.results.feishu.status, 'disabled');
+    assert.equal(incident.notifications.recovered.results.telegram.status, 'disabled');
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('failed collection breaks a custom recovery streak and requires four fresh healthy polls', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'frosted-recovery-failure-'));
+  const store = await new JsonStore(path.join(dir, 'db.json')).init();
+  const readings = [20, 20, new Error('balance endpoint unavailable'), 20, 20, 20, 20];
+  const monitor = new Monitor(store, {
+    collector: async () => {
+      const reading = readings.shift();
+      if (reading instanceof Error) throw reading;
+      return { rawBalance: reading, metadata: {} };
+    },
+  });
+
+  try {
+    await store.mutate((data) => {
+      data.settings.recoveryConfirmations = 4;
+      data.settings.resendEnabled = false;
+      data.settings.feishuEnabled = false;
+      data.settings.telegramEnabled = false;
+      const account = data.accounts.find((item) => item.id === 'acct-hk-backup');
+      account.demo = false;
+      account.formula = 'x';
+      account.thresholdLow = 10;
+      account.thresholdRecover = 20;
+    });
+
+    await monitor.poll('acct-hk-backup');
+    await monitor.poll('acct-hk-backup');
+    assert.equal(store.snapshot().incidents.find((item) => item.id === 'inc-hk').recoveryChecks, 2);
+
+    await assert.rejects(monitor.poll('acct-hk-backup'), /balance endpoint unavailable/);
+    const failed = store.snapshot();
+    const failedAccount = failed.accounts.find((item) => item.id === 'acct-hk-backup');
+    assert.equal(failedAccount.status, 'error');
+    assert.equal(failedAccount.recoveryChecks, 0);
+    assert.equal(failed.incidents.find((item) => item.id === 'inc-hk').recoveryChecks, 0);
+
+    for (const expectedChecks of [1, 2, 3]) {
+      await monitor.poll('acct-hk-backup');
+      const incident = store.snapshot().incidents.find((item) => item.id === 'inc-hk');
+      assert.equal(incident.state, 'open');
+      assert.equal(incident.recoveryChecks, expectedChecks);
+      assert.equal(incident.notifications?.recovered, undefined);
+    }
+
+    await monitor.poll('acct-hk-backup');
+    const incident = store.snapshot().incidents.find((item) => item.id === 'inc-hk');
+    assert.equal(incident.state, 'resolved');
+    assert.equal(incident.recoveryChecks, 4);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('an unresolved incident is reminded once per configured interval', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'frosted-reminder-'));
   const store = await new JsonStore(path.join(dir, 'db.json')).init();

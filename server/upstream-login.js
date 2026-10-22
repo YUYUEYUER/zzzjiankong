@@ -6,10 +6,13 @@ import net from 'node:net';
 import path from 'node:path';
 import { chromium } from 'playwright';
 import { config } from './config.js';
+import { isPublicNetworkAddress } from './network-policy.js';
 
 const LOGIN_TTL_MS = Math.max(2 * 60_000, Number(process.env.UPSTREAM_LOGIN_TTL_MS || 10 * 60_000));
 const CAPTURE_TTL_MS = Math.max(LOGIN_TTL_MS, Number(process.env.UPSTREAM_CAPTURE_TTL_MS || 30 * 60_000));
 const PROFILE_ID_PATTERN = /^[A-Za-z0-9_-]{24,64}$/;
+const MAX_SESSION_TOKEN_LENGTH = 16 * 1024;
+const MAX_COOKIE_HEADER_LENGTH = 64 * 1024;
 const ACTIVE_JOB_STATUSES = new Set(['opening', 'waiting', 'captured', 'opened']);
 const jobs = new Map();
 const activeProfiles = new Map();
@@ -20,7 +23,9 @@ function normalizedKey(value) {
 }
 
 function tokenValue(value) {
-  return typeof value === 'string' ? value.trim().replace(/^Bearer\s+/i, '') : '';
+  if (typeof value !== 'string') return '';
+  const token = value.trim().replace(/^Bearer\s+/i, '');
+  return token && token.length <= MAX_SESSION_TOKEN_LENGTH ? token : '';
 }
 
 export function extractSub2SessionTokens(value, result = {}, depth = 0, seen = new WeakSet()) {
@@ -41,8 +46,9 @@ export function extractSub2SessionTokens(value, result = {}, depth = 0, seen = n
   for (const [key, item] of Object.entries(value)) {
     const normalized = normalizedKey(key);
     if (typeof item === 'string') {
-      if (['accesstoken', 'authtoken'].includes(normalized)) result.accessToken = tokenValue(item);
-      if (normalized === 'refreshtoken') result.refreshToken = tokenValue(item);
+      const token = tokenValue(item);
+      if (token && ['accesstoken', 'authtoken'].includes(normalized)) result.accessToken = token;
+      if (token && normalized === 'refreshtoken') result.refreshToken = token;
     }
     extractSub2SessionTokens(item, result, depth + 1, seen);
   }
@@ -55,6 +61,27 @@ function loginOrigin(value) {
     throw Object.assign(new Error('上游地址必须是 HTTP(S) 站点'), { statusCode: 400 });
   }
   return url.origin;
+}
+
+function normalizeResolvedAddresses(value = []) {
+  if (value == null || value === '') return [];
+  if (!Array.isArray(value)) throw statusError('上游 DNS 地址格式无效', 400);
+  const addresses = [];
+  const seen = new Set();
+  for (const entry of value) {
+    const address = String(entry?.address || '').trim();
+    const detectedFamily = net.isIP(address);
+    const familyValue = Number(entry?.family);
+    const family = familyValue === 4 || familyValue === 6 ? familyValue : detectedFamily;
+    if (!detectedFamily || family !== detectedFamily || !isPublicNetworkAddress(address)) {
+      throw statusError('上游 DNS 地址未通过公网网络策略校验', 400);
+    }
+    const key = `${address}/${family}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    addresses.push({ address, family });
+  }
+  return addresses;
 }
 
 function statusError(message, statusCode) {
@@ -133,8 +160,27 @@ async function freeLoopbackPort() {
 }
 
 export function buildSystemBrowserArgs(job, port) {
-  const targetUrl = job.targetUrl || `${job.origin}/login`;
+  const origin = loginOrigin(job.origin);
+  const targetUrl = String(job.targetUrl || `${origin}/login`);
+  let parsedTarget;
+  try {
+    parsedTarget = new URL(targetUrl);
+  } catch {
+    throw statusError('浏览器目标地址无效', 400);
+  }
+  if (
+    !['http:', 'https:'].includes(parsedTarget.protocol)
+    || parsedTarget.username
+    || parsedTarget.password
+    || parsedTarget.origin !== origin
+  ) {
+    throw statusError('浏览器目标地址必须与上游来源一致', 400);
+  }
   const proxyServer = normalizeBrowserProxyServer(job.proxyServer);
+  const resolvedAddresses = normalizeResolvedAddresses(job.resolvedAddresses || []);
+  if (!Number.isInteger(Number(port)) || Number(port) < 1 || Number(port) > 65535) {
+    throw statusError('浏览器调试端口无效', 500);
+  }
   const args = [
     `--remote-debugging-port=${port}`,
     '--remote-debugging-address=127.0.0.1',
@@ -145,10 +191,9 @@ export function buildSystemBrowserArgs(job, port) {
     '--new-window',
     '--disable-quic',
   ];
-  if (!proxyServer && Array.isArray(job.resolvedAddresses) && job.resolvedAddresses.length) {
-    const addresses = job.resolvedAddresses
-      .map((entry) => String(entry?.address || '').trim())
-      .filter(Boolean)
+  if (!proxyServer && resolvedAddresses.length) {
+    const addresses = resolvedAddresses
+      .map((entry) => entry.address)
       .map((address) => address.includes(':') ? `[${address}]` : address);
     if (addresses.length) args.push(`--host-resolver-rules=MAP ${new URL(targetUrl).hostname} ${addresses[0]}, EXCLUDE localhost`);
   }
@@ -167,13 +212,18 @@ export function buildSystemBrowserArgs(job, port) {
 
 export function browserCookiesFromHeader(origin, cookieHeader = '') {
   const url = `${loginOrigin(origin)}/`;
+  const header = String(cookieHeader || '');
+  if (header.length > MAX_COOKIE_HEADER_LENGTH) return [];
   const cookies = new Map();
-  for (const segment of String(cookieHeader || '').replace(/[\r\n]/g, '').split(';')) {
+  for (const segment of header.split(';')) {
     const separator = segment.indexOf('=');
     if (separator <= 0) continue;
     const name = segment.slice(0, separator).trim();
     const value = segment.slice(separator + 1).trim();
     if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name)) continue;
+    // RFC 6265 cookie-octet; reject controls, separators and line breaks
+    // instead of silently forwarding attacker-supplied header bytes.
+    if (value.length > MAX_COOKIE_HEADER_LENGTH || !/^[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]*$/.test(value)) continue;
     cookies.set(name, { name, value, url });
   }
   return [...cookies.values()];
@@ -321,6 +371,7 @@ async function captureJob(job, page, tokens = {}) {
     browserProfileId: job.profileId,
     browserSessionOrigin: job.origin,
   };
+  clearJobCandidate(job);
   job.captureMode = accessToken ? 'tokens' : 'cookies';
   job.status = 'captured';
   job.capturedAt = new Date().toISOString();
@@ -382,6 +433,10 @@ function markForRemoval(job, current = Date.now(), delay = config.upstreamBrowse
   job.removeAfter = current + delay;
 }
 
+function clearJobCandidate(job) {
+  if (job?.candidate) job.candidate = { accessToken: '', refreshToken: '' };
+}
+
 function expirationTime(job) {
   const values = [job.expiresAt, job.absoluteExpiresAt]
     .map((value) => Date.parse(value))
@@ -393,6 +448,7 @@ function markExpired(job, current = Date.now()) {
   if (!isActiveJob(job)) return false;
   job.status = 'expired';
   job.secret = null;
+  clearJobCandidate(job);
   job.message = job.purpose === 'browse'
     ? '上游浏览器会话已到期，请重新打开'
     : '登录任务已过期，请重新发起';
@@ -488,7 +544,8 @@ jobSweepTimer.unref?.();
 
 async function runJob(job) {
   try {
-    await fs.mkdir(job.profilePath, { recursive: true });
+    await fs.mkdir(job.profilePath, { recursive: true, mode: 0o700 });
+    await fs.chmod(job.profilePath, 0o700).catch(() => {});
     if (!isActiveJob(job)) return;
     job.launching = true;
     let connection;
@@ -576,6 +633,7 @@ async function runJob(job) {
       job.status = 'failed';
       job.error = String(error?.message || error || '浏览器启动失败');
       job.message = '内置浏览器启动失败';
+      clearJobCandidate(job);
       markForRemoval(job);
     }
     await closeJobBrowser(job);
@@ -586,6 +644,7 @@ export function startUpstreamLogin({ type = 'sub2api', baseUrl, proxyServer = ''
   if (type !== 'sub2api') throw Object.assign(new Error('当前仅支持 Sub2API 浏览器登录'), { statusCode: 400 });
   const origin = loginOrigin(baseUrl);
   const normalizedProxy = normalizeBrowserProxyServer(proxyServer);
+  const normalizedAddresses = normalizeResolvedAddresses(resolvedAddresses);
 
   const id = crypto.randomUUID();
   const browserProfileId = createBrowserProfileId();
@@ -596,7 +655,7 @@ export function startUpstreamLogin({ type = 'sub2api', baseUrl, proxyServer = ''
     type,
     origin,
     proxyServer: normalizedProxy,
-    resolvedAddresses,
+    resolvedAddresses: normalizedAddresses,
     profileId: browserProfileId,
     profilePath: profileDirectory(browserProfileId),
     status: 'opening',
@@ -639,6 +698,7 @@ export function startUpstreamBrowserSession({
   const origin = loginOrigin(baseUrl);
   const savedProfileId = validateBrowserProfileId(browserProfileId);
   const normalizedProxy = normalizeBrowserProxyServer(proxyServer);
+  const normalizedAddresses = normalizeResolvedAddresses(resolvedAddresses);
   const existing = activeJobForProfile(savedProfileId);
   if (existing) {
     if (existing.origin !== origin) {
@@ -666,7 +726,7 @@ export function startUpstreamBrowserSession({
     type,
     origin,
     proxyServer: normalizedProxy,
-    resolvedAddresses,
+    resolvedAddresses: normalizedAddresses,
     purpose: 'browse',
     targetUrl: `${origin}/`,
     savedCookieHeader: String(sessionCookie || ''),
@@ -737,6 +797,7 @@ export async function consumeUpstreamLogin(id) {
   if (!job) return;
   job.status = 'consumed';
   job.secret = null;
+  clearJobCandidate(job);
   job.message = '登录态已加密保存到监控账号';
   markForRemoval(job, Date.now(), 60_000);
   await closeJobBrowser(job);
@@ -747,6 +808,7 @@ export async function cancelUpstreamLogin(id) {
   if (!job) return false;
   job.status = 'cancelled';
   job.secret = null;
+  clearJobCandidate(job);
   job.message = '登录任务已取消';
   markForRemoval(job, Date.now(), 60_000);
   await closeJobBrowser(job);
@@ -759,6 +821,7 @@ export async function shutdownUpstreamLogins() {
   await Promise.allSettled(activeJobs.map(async (job) => {
     job.status = 'cancelled';
     job.secret = null;
+    clearJobCandidate(job);
     await closeJobBrowser(job);
   }));
   await Promise.allSettled(allJobs.map((job) => job.runPromise).filter(Boolean));

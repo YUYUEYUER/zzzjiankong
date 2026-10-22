@@ -576,6 +576,30 @@ function newApiTokenList(body) {
   return candidates.find(Array.isArray) || [];
 }
 
+function newApiUsageRemaining(body, balancePath = 'data.total_available') {
+  if (balancePath !== 'data.total_available') {
+    return { rawBalance: numericBalance(body, balancePath), unlimitedQuota: false, userQuotaRemaining: undefined };
+  }
+  const data = readPath(body, 'data') || {};
+  const keyRemaining = nonnegativeFiniteNumber(data.total_available);
+  const userQuotaRemaining = nonnegativeFiniteNumber(data.user_quota?.total_available);
+  const unlimitedQuota = data.unlimited_quota === true;
+  const candidates = [
+    ...(unlimitedQuota ? [] : [keyRemaining]),
+    userQuotaRemaining,
+  ].filter((value) => value !== undefined);
+  if (!candidates.length) {
+    const error = new Error('该令牌为无限额度，接口未返回可监控的用户有限余额；请为令牌开启用户额度查询或创建有限额度令牌');
+    error.code = 'UNLIMITED_QUOTA';
+    throw error;
+  }
+  return {
+    rawBalance: Math.min(...candidates),
+    unlimitedQuota: false,
+    userQuotaRemaining,
+  };
+}
+
 function matchNewApiTokenItem(items, authorizationToken, tokenName) {
   const masked = maskNewApiKey(authorizationToken);
   const keyMatches = items.filter((item) => {
@@ -695,6 +719,23 @@ async function collectSub2ApiKeyRate(root, secret, authorizationToken) {
   }
 }
 
+async function requestNewApiTokenUsage(root, account, headers) {
+  const configuredPath = account.profilePath || '/api/usage/token';
+  const paths = [...new Set([
+    configuredPath,
+    configuredPath.endsWith('/') ? configuredPath.slice(0, -1) : `${configuredPath}/`,
+  ])];
+  let lastResult;
+  for (const path of paths) {
+    const result = await requestJson(`${root}${path}`, { headers });
+    lastResult = result;
+    if (result.response.ok) return { ...result, path };
+    if (![404, 405].includes(result.response.status)) assertSuccess(result.response, result.body);
+  }
+  assertSuccess(lastResult.response, lastResult.body);
+  return { ...lastResult, path: paths.at(-1) };
+}
+
 async function collectNewApiTokenUsage(root, account, secret = {}) {
   const tokenPool = normalizeApiTokenPool(secret);
   if (!tokenPool.length) throw new Error('请填写 New API 左侧“API 密钥”页面创建的调用密钥');
@@ -704,20 +745,14 @@ async function collectNewApiTokenUsage(root, account, secret = {}) {
     let slotError;
     for (const authorizationToken of apiTokenAuthorizationCandidates(tokenPool[index])) {
       try {
-        const result = await requestJson(`${root}/api/usage/token`, {
-          headers: {
-            Accept: 'application/json',
-            Authorization: `Bearer ${authorizationToken}`,
-            ...cloudflareAccessHeaders(secret),
-          },
+        const result = await requestNewApiTokenUsage(root, account, {
+          Accept: 'application/json',
+          Authorization: `Bearer ${authorizationToken}`,
+          ...cloudflareAccessHeaders(secret),
         });
         assertSuccess(result.response, result.body);
-        if (readPath(result.body, 'data.unlimited_quota') === true) {
-          const error = new Error('该令牌为无限额度，接口不提供可监控的有限余额；请创建有限额度令牌');
-          error.code = 'UNLIMITED_QUOTA';
-          throw error;
-        }
-        const rawBalance = numericBalance(result.body, 'data.total_available');
+        const usage = newApiUsageRemaining(result.body, account.balancePath || 'data.total_available');
+        const rawBalance = usage.rawBalance;
         const rateMetadata = await collectNewApiKeyRate(root, account, secret, authorizationToken, result.body);
         const normalizedTokenPool = tokenPool.map((token, slot) => (
           slot === index ? authorizationToken : token
@@ -742,8 +777,10 @@ async function collectNewApiTokenUsage(root, account, secret = {}) {
             tokenName: readPath(result.body, 'data.name'),
             totalGranted: readPath(result.body, 'data.total_granted'),
             totalUsed: readPath(result.body, 'data.total_used'),
-            unlimitedQuota: false,
+            unlimitedQuota: usage.unlimitedQuota,
+            userQuotaRemaining: usage.userQuotaRemaining,
             expiresAt: readPath(result.body, 'data.expires_at'),
+            profilePath: result.path || account.profilePath || '/api/usage/token',
             apiTokenPoolSize: tokenPool.length,
             apiTokenSlot: index + 1,
             tokenStrategy: account.tokenStrategy || 'sticky',
@@ -1748,7 +1785,7 @@ function finiteDetailNumber(value) {
   return nonnegativeFiniteNumber(value) ?? null;
 }
 
-function redactCredentialText(value, tokens = []) {
+export function redactCredentialText(value, tokens = []) {
   let output = String(value || '');
   for (const token of tokens) {
     const raw = String(token || '').trim().replace(/^Bearer\s+/i, '');
@@ -1973,6 +2010,25 @@ function sub2PanelRates(body = {}) {
   return data && typeof data === 'object' && !Array.isArray(data) ? data : {};
 }
 
+async function collectSub2ApiKeyList(root, headers) {
+  // Sub2API 0.2.x renamed /keys to /api-keys. Keep the legacy path first so
+  // older deployments and existing compatible forks do not pay an extra 404.
+  let lastResult;
+  for (const path of ['/api/v1/keys?page=1&page_size=1000', '/api/v1/api-keys?page=1&page_size=1000']) {
+    const result = await requestJson(`${root}${path}`, { headers });
+    lastResult = result;
+    if (result.response.ok) {
+      assertSuccess(result.response, result.body);
+      return result;
+    }
+    if (![404, 405].includes(result.response.status)) {
+      assertSuccess(result.response, result.body);
+    }
+  }
+  assertSuccess(lastResult.response, lastResult.body);
+  return lastResult;
+}
+
 function minutesInTimezone(timezone, current = new Date()) {
   try {
     const parts = new Intl.DateTimeFormat('en-GB', {
@@ -2189,7 +2245,7 @@ async function collectSub2ApiAccountKeyDetails(account, secret, inspectedAt) {
     ...upstreamBrowserSessionHeaders(effectiveSecret),
   };
   const [keysResult, groupsResult, ratesResult, settingsResult] = await Promise.all([
-    requestJson(`${root}/api/v1/keys?page=1&page_size=1000`, { headers }),
+    collectSub2ApiKeyList(root, headers),
     requestJson(`${root}/api/v1/groups/available`, { headers }).catch((error) => ({ error })),
     requestJson(`${root}/api/v1/groups/rates`, { headers }).catch((error) => ({ error })),
     requestJson(`${root}/api/v1/settings/public`, { headers: { Accept: 'application/json' } }).catch((error) => ({ error })),

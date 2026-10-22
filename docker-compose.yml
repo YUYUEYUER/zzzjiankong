@@ -89,6 +89,7 @@ services:
       MIHOMO_SHARED_DIR: /shared-proxy
       MIHOMO_RUNTIME_PATH: /shared-proxy/config.yaml
       MIHOMO_BIND_ADDRESS: 0.0.0.0
+      HOST: "0.0.0.0"
       MIHOMO_CONTROLLER_BIND_ADDRESS: 0.0.0.0
       UPSTREAM_PROXY_HOST: mihomo
       PROXY_BASE_PORT: ${PROXY_BASE_PORT:-17890}

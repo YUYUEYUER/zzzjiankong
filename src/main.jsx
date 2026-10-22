@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import "@fontsource-variable/inter";
 import { App } from "./App.jsx";
 import "./styles.css";
+import "./selects.css";
 
 createRoot(document.getElementById("root")).render(
   <React.StrictMode>

@@ -45,6 +45,7 @@ export function createNotificationOutboxEvent(kind, account, incident, current =
     channels: {
       resend: { status: 'pending', attempts: 0 },
       feishu: { status: 'pending', attempts: 0 },
+      telegram: { status: 'pending', attempts: 0 },
     },
     createdAt,
     updatedAt: createdAt,
@@ -116,6 +117,7 @@ export class NotificationOutbox {
     const secrets = {
       resendApiKey: decryptSecret(settings.resendApiKeyEncrypted).value,
       feishuWebhook: decryptSecret(settings.feishuWebhookEncrypted).value,
+      telegramBotToken: decryptSecret(settings.telegramBotTokenEncrypted).value,
     };
     const results = await this.notifier(
       event.kind,

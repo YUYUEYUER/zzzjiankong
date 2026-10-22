@@ -2,12 +2,14 @@ import { useEffect, useState } from 'react';
 import { ArrowClockwise, CheckCircle, GlobeHemisphereWest, SpinnerGap, Trash, WarningCircle } from '@phosphor-icons/react';
 import { api } from '../api.js';
 import { Modal } from './Modal.jsx';
+import { SetupStepNote } from './OnboardingGuide.jsx';
 
-export function UpstreamModal({ open, editingUpstream, proxyPool, onClose, onSaved, onDeleted, onOpenProxySettings, pushToast }) {
+export function UpstreamModal({ open, onboarding = false, editingUpstream, proxyPool, onClose, onSaved, onDeleted, onOpenProxySettings, pushToast }) {
   const [name, setName] = useState('');
   const [proxyMode, setProxyMode] = useState('direct');
   const [busy, setBusy] = useState('');
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [error, setError] = useState('');
 
   useEffect(() => {
     if (!open) return;
@@ -15,19 +17,22 @@ export function UpstreamModal({ open, editingUpstream, proxyPool, onClose, onSav
     setProxyMode(editingUpstream?.proxyMode || 'direct');
     setBusy('');
     setConfirmDelete(false);
+    setError('');
   }, [open, editingUpstream]);
 
   const submit = async (event) => {
     event.preventDefault();
     setBusy('save');
+    setError('');
     try {
       const result = editingUpstream
         ? await api.updateUpstream(editingUpstream.id, { name, proxyMode })
         : await api.createUpstream({ name, proxyMode });
       pushToast(editingUpstream ? '上游配置已更新' : '上游已创建，可以继续添加监控账号', 'success');
-      onSaved(result.upstream, !editingUpstream);
+      await onSaved(result.upstream, !editingUpstream);
       onClose();
     } catch (error) {
+      setError(error.message);
       pushToast(error.message, 'error');
     } finally {
       setBusy('');
@@ -73,10 +78,12 @@ export function UpstreamModal({ open, editingUpstream, proxyPool, onClose, onSav
     <Modal
       open={open}
       onClose={onClose}
+      dismissible={!busy}
       title={editingUpstream ? '编辑上游' : '添加上游'}
       width={520}
     >
       <form className="upstream-form" onSubmit={submit}>
+        {onboarding && <SetupStepNote step={1}>给站点起一个便于识别的名字。下一步填写站点地址和账号凭据。</SetupStepNote>}
         <label>
           <span>上游名称</span>
           <input autoFocus required maxLength={60} value={name} onChange={(event) => setName(event.target.value)} placeholder="例如 newapi、sub2api" />
@@ -96,6 +103,7 @@ export function UpstreamModal({ open, editingUpstream, proxyPool, onClose, onSav
             </div>
           )}
         </div>
+        {error && <p className="quick-connection-error" role="alert">{error}</p>}
         <footer className="modal-actions upstream-modal-actions">
           <div>
             {editingUpstream?.accountCount === 0 && (
@@ -106,7 +114,7 @@ export function UpstreamModal({ open, editingUpstream, proxyPool, onClose, onSav
             )}
           </div>
           <div>
-            <button type="button" className="ghost-button" onClick={onClose}>取消</button>
+            <button type="button" className="ghost-button" disabled={Boolean(busy)} onClick={onClose}>取消</button>
             <button className="primary-button" disabled={Boolean(busy) || !name.trim()}>
               {busy === 'save' && <SpinnerGap className="spin" />}
               {editingUpstream ? '保存配置' : '创建并添加账号'}

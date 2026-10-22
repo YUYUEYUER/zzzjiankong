@@ -1,5 +1,8 @@
 services:
   frosted-console:
+    environment:
+      # 开发环境允许 websockify 监听容器网卡，宿主机经 127.0.0.1 端口映射直连
+      NOVNC_BIND_ADDRESS: "0.0.0.0"
     ports:
       - "127.0.0.1:${PORT:-8787}:8787"
       - "127.0.0.1:${NOVNC_PORT:-6080}:6080"

@@ -7,6 +7,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { Agent, ProxyAgent } from 'undici';
 import YAML from 'yaml';
 import { config } from './config.js';
+import { readLimitedBody } from './network-policy.js';
 import { decryptSecret, encryptSecret } from './security.js';
 
 const PROVIDER_NAME = 'frosted-subscription';
@@ -29,6 +30,7 @@ for (const [address, prefix] of [
 for (const [address, prefix] of [
   ['::', 128], ['::1', 128], ['100::', 64], ['2001:2::', 48], ['2001:db8::', 32],
   ['2002::', 16], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8],
+  ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['2001::', 32],
 ]) blockedAddresses.addSubnet(address, prefix, 'ipv6');
 
 const routes = new Map();
@@ -60,6 +62,21 @@ function median(values) {
 
 function errorWithStatus(message, statusCode = 400, code = 'PROXY_POOL_ERROR', extra = {}) {
   return Object.assign(new Error(message), { statusCode, code, ...extra });
+}
+
+function safeProviderFile(value) {
+  const normalized = String(value || '').replaceAll('\\', '/');
+  if (
+    !normalized
+    || normalized.startsWith('/')
+    || normalized.includes('\0')
+    || normalized.split('/').some((part) => part === '..' || part === '.')
+    || !normalized.startsWith('providers/')
+    || normalized.length > 256
+  ) {
+    throw errorWithStatus('Mihomo 订阅文件路径无效', 500, 'PROXY_PROVIDER_PATH_INVALID');
+  }
+  return normalized;
 }
 
 function decodeBase64Text(value) {
@@ -645,6 +662,7 @@ export class ProxyPoolManager {
   }
 
   runtimeConfig({ providerFile = PROVIDER_FILE, includeProvider = true } = {}) {
+    const normalizedProviderFile = safeProviderFile(providerFile);
     const data = this.store.snapshot();
     const enabled = includeProvider
       ? data.upstreams.filter((upstream) => upstream.proxyMode === 'auto_sticky' && Number.isInteger(upstream.proxyPort))
@@ -677,7 +695,7 @@ export class ProxyPoolManager {
       runtime['proxy-providers'] = {
         [PROVIDER_NAME]: {
           type: 'file',
-          path: `./${providerFile.replaceAll('\\', '/')}`,
+          path: `./${normalizedProviderFile}`,
           'health-check': {
             enable: true,
             url: HEALTH_URL,
@@ -701,8 +719,15 @@ export class ProxyPoolManager {
   }
 
   async controllerRequest(endpoint, options = {}) {
-    const response = await this.fetch(`${this.controllerUrl}${endpoint}`, {
+    const normalizedEndpoint = String(endpoint || '');
+    if (!/^\/[\x21-\x7e]*$/.test(normalizedEndpoint) || normalizedEndpoint.includes('\\r') || normalizedEndpoint.includes('\\n')) {
+      throw errorWithStatus('Mihomo 控制接口路径无效', 500, 'MIHOMO_CONTROL_FAILED');
+    }
+    const response = await this.fetch(`${this.controllerUrl}${normalizedEndpoint}`, {
       ...options,
+      // The controller carries the Mihomo secret. Never follow a redirect
+      // that could move it to a different host or scheme.
+      redirect: 'error',
       headers: {
         Accept: 'application/json',
         ...(options.body ? { 'Content-Type': 'application/json' } : {}),
@@ -711,9 +736,12 @@ export class ProxyPoolManager {
       },
       signal: options.signal || AbortSignal.timeout(10000),
     }).catch(() => { throw errorWithStatus('Mihomo 服务不可用，请检查代理服务是否启动', 503, 'MIHOMO_UNAVAILABLE'); });
-    if (!response.ok) throw errorWithStatus(`Mihomo 控制接口失败 (${response.status})`, 502, 'MIHOMO_CONTROL_FAILED', { controllerStatus: response.status, retryable: response.status >= 500 });
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      throw errorWithStatus(`Mihomo 控制接口失败 (${response.status})`, 502, 'MIHOMO_CONTROL_FAILED', { controllerStatus: response.status, retryable: response.status >= 500 });
+    }
     if (response.status === 204) return {};
-    return response.json().catch(() => {
+    return readLimitedBody(response, config.upstreamResponseMaxBytes).then((text) => text ? JSON.parse(text) : {}).catch(() => {
       throw errorWithStatus('Mihomo 控制接口返回了无效响应', 502, 'MIHOMO_INVALID_RESPONSE', { retryable: true });
     });
   }

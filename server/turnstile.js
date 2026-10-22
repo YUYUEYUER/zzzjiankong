@@ -6,6 +6,8 @@
  *   or optional CapSolver / 2Captcha
  */
 import { currentUpstreamProxyContext } from './proxy-pool.js';
+import { config } from './config.js';
+import { createPinnedDispatcher, readLimitedBody, resolveUpstreamUrl } from './network-policy.js';
 
 import crypto from 'node:crypto';
 
@@ -201,22 +203,45 @@ function extractScriptSrcs(html, baseUrl) {
   return srcs;
 }
 
-async function fetchText(url, timeoutMs = 10000) {
+async function fetchText(url, timeoutMs = 10000, redirectsLeft = 3) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const proxy = currentUpstreamProxyContext();
+    let dispatcher = proxy?.dispatcher;
+    // 直连时钉住已校验的 DNS 结果；redirect 手动跟随并对每跳重新校验，
+    // 防止上游把发现请求 302 到内网地址（盲 SSRF / 元数据端点）。
+    if (!dispatcher && config.enforceUpstreamNetworkPolicy) {
+      dispatcher = createPinnedDispatcher(await resolveUpstreamUrl(url, {
+        production: config.production,
+        allowedHosts: config.upstreamAllowedHosts,
+        allowPrivate: false,
+      }));
+    }
     const response = await fetch(url, {
       signal: controller.signal,
       headers: {
         Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'User-Agent': 'FrostedConsole/1.0 (+turnstile-sitekey-discovery)',
       },
-      redirect: 'follow',
-      ...(proxy?.dispatcher ? { dispatcher: proxy.dispatcher } : {}),
+      redirect: 'manual',
+      ...(dispatcher ? { dispatcher } : {}),
     });
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel().catch(() => {});
+      const location = response.headers.get('location');
+      if (!location || redirectsLeft <= 0) return '';
+      let nextUrl;
+      try {
+        nextUrl = new URL(location, url);
+      } catch {
+        return '';
+      }
+      if (nextUrl.origin !== new URL(url).origin) return '';
+      return fetchText(nextUrl.toString(), timeoutMs, redirectsLeft - 1);
+    }
     if (!response.ok) return '';
-    return await response.text();
+    return await readLimitedBody(response, config.upstreamResponseMaxBytes);
   } catch {
     return '';
   } finally {
@@ -296,6 +321,7 @@ async function postJson(url, payload, timeoutMs = 20000) {
   try {
     const response = await fetch(url, {
       method: 'POST',
+      redirect: 'error',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify(payload),
       signal: controller.signal,

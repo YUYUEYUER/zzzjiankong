@@ -8,7 +8,8 @@ RUN npm run build
 FROM mcr.microsoft.com/playwright:v1.61.1-noble@sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48
 WORKDIR /app
 ENV NODE_ENV=production \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    HOST=0.0.0.0
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       novnc \
@@ -41,6 +42,7 @@ LABEL org.opencontainers.image.title="Frosted Console" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.version="${VERSION}"
-EXPOSE 8787 6080
+# noVNC/websockify 默认只监听容器回环，由 8787 上的应用网关统一代理
+EXPOSE 8787
 ENTRYPOINT ["/app/server/docker-entrypoint.sh"]
 CMD ["node", "server/index.js"]

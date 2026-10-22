@@ -33,8 +33,11 @@ start_remote_desktop() {
   runuser -u pwuser -- env HOME=/home/pwuser DISPLAY="$DISPLAY" XDG_RUNTIME_DIR="$runtime_dir" \
     x11vnc -display "$DISPLAY" -forever -shared -localhost -nopw -rfbport 5900 -noxdamage \
     >/tmp/frosted-x11vnc.log 2>&1 &
+  # websockify 默认只绑回环：noVNC 静态资源由应用（8787）托管，桌面数据只能通过
+  # 带 ticket 校验的应用网关进入。仅本地开发需要直接访问 6080 时才放宽。
+  novnc_bind="${NOVNC_BIND_ADDRESS:-127.0.0.1}"
   runuser -u pwuser -- env HOME=/home/pwuser XDG_RUNTIME_DIR="$runtime_dir" \
-    websockify --web=/usr/share/novnc 0.0.0.0:6080 127.0.0.1:5900 \
+    websockify --web=/usr/share/novnc "$novnc_bind:6080" 127.0.0.1:5900 \
     >/tmp/frosted-websockify.log 2>&1 &
   echo "[desktop] headed Chromium workspace ready on display $DISPLAY"
 }

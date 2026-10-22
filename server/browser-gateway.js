@@ -36,7 +36,11 @@ function ticketKey(jti) {
 
 export function issueBrowserTicket(auth, origin = appOrigin()) {
   pruneTickets();
-  const normalizedOrigin = new URL(origin).origin;
+  const parsedOrigin = new URL(origin);
+  if (!['http:', 'https:'].includes(parsedOrigin.protocol) || parsedOrigin.username || parsedOrigin.password) {
+    throw new Error('浏览器工作区来源无效');
+  }
+  const normalizedOrigin = parsedOrigin.origin;
   const jti = crypto.randomBytes(32).toString('base64url');
   const payload = {
     jti,
@@ -64,9 +68,16 @@ function consumeBrowserTicket(token, auth, origin) {
   } catch {
     return false;
   }
+  if (typeof payload.jti !== 'string' || !payload.jti) return false;
   pruneTickets();
   const pending = pendingTickets.get(ticketKey(payload.jti));
-  if (!pending || Number(payload.exp) <= Date.now()) return false;
+  if (
+    !pending
+    || !Number.isFinite(Number(payload.exp))
+    || Number(payload.exp) <= Date.now()
+    || pending.jti !== payload.jti
+    || Number(pending.exp) !== Number(payload.exp)
+  ) return false;
   if (payload.origin !== origin || pending.origin !== origin) return false;
   if (payload.username !== (auth.usernameCanonical || auth.username)) return false;
   if (Number(payload.version) !== Number(auth.sessionVersion || 1)) return false;
@@ -76,7 +87,20 @@ function consumeBrowserTicket(token, auth, origin) {
 
 function cookies(request) {
   const header = String(request.headers.cookie || '');
-  return Object.fromEntries(header.split(';').map((part) => part.trim().split('=')));
+  const values = Object.create(null);
+  let duplicateSession = false;
+  for (const part of header.split(';')) {
+    const separator = part.indexOf('=');
+    if (separator <= 0) continue;
+    const name = part.slice(0, separator).trim();
+    const value = part.slice(separator + 1).trim();
+    if (!name) continue;
+    if (name === 'frosted_session' && Object.hasOwn(values, name)) duplicateSession = true;
+    // Preserve '=' characters in signed cookie values. The session token is
+    // base64url today, but parsing must not silently truncate future formats.
+    values[name] = value;
+  }
+  return { values, duplicateSession };
 }
 
 function reject(socket, status = 403, message = 'Forbidden') {
@@ -88,6 +112,7 @@ export function closeBrowserConnections(username = '') {
   for (const connection of sockets) {
     if (!username || connection.username === username) {
       clearTimeout(connection.timer);
+      clearTimeout(connection.idleTimer);
       connection.client.terminate();
       connection.upstream.terminate();
       sockets.delete(connection);
@@ -96,7 +121,7 @@ export function closeBrowserConnections(username = '') {
 }
 
 export function attachBrowserGateway(server, store) {
-  const webSocketServer = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
+  const webSocketServer = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024, perMessageDeflate: false });
   server.on('upgrade', (request, socket, head) => {
     let url;
     try {
@@ -116,7 +141,12 @@ export function attachBrowserGateway(server, store) {
       return;
     }
     const auth = store.snapshot().auth;
-    const token = cookies(request).frosted_session;
+    const parsedCookies = cookies(request);
+    if (parsedCookies.duplicateSession) {
+      reject(socket, 400, 'Bad Request');
+      return;
+    }
+    const token = parsedCookies.values.frosted_session;
     const authenticated = config.authDisabled || verifySessionToken(token, auth);
     if (!authenticated) {
       reject(socket, 401, 'Unauthorized');

@@ -251,6 +251,7 @@ export async function verifyTurnstileToken(token, remoteIp, expectedAction = 'lo
   try {
     response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
       method: 'POST',
+      redirect: 'error',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: form,
       signal: AbortSignal.timeout(8000),

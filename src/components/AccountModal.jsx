@@ -3,6 +3,7 @@ import { CheckCircle, Eraser, Eye, EyeSlash, Flask, Info, SpinnerGap, Trash } fr
 import { api } from '../api.js';
 import { money } from '../lib.js';
 import { Modal } from './Modal.jsx';
+import { SetupStepNote } from './OnboardingGuide.jsx';
 
 const SUB2_AUTH_DEFAULTS = {
   api_token: { profilePath: '/v1/usage', balancePath: 'remaining', rawUnit: 'USD', formula: 'x * 7.2' },
@@ -21,7 +22,7 @@ function defaults(type = 'newapi', upstreamId = '', upstreamName = '') {
     rawUnit: type === 'sub2api' ? sub2Defaults.rawUnit : type === 'newapi' ? 'quota' : 'CNY',
     turnstileSiteKey: '',
     thresholdLow: 3, thresholdRecover: 5, pollIntervalMinutes: 5, enabled: true,
-    notifications: { resend: true, feishu: true },
+    notifications: { resend: true, feishu: true, telegram: true },
     credentials: {
       apiToken: '', accessToken: '', refreshToken: '', password: '', turnstileToken: '',
       cfAccessClientId: '', cfAccessClientSecret: '',
@@ -29,7 +30,7 @@ function defaults(type = 'newapi', upstreamId = '', upstreamName = '') {
   };
 }
 
-export function AccountModal({ open, editingAccount, initialDraft, upstreams, defaultUpstreamId, onClose, onSaved, onDeleted, pushToast, turnstileSolver }) {
+export function AccountModal({ open, onboarding = false, editingAccount, initialDraft, upstreams, defaultUpstreamId, onClose, onSaved, onDeleted, pushToast, turnstileSolver }) {
   const [form, setForm] = useState(defaults());
   const [showSecret, setShowSecret] = useState(false);
   const [advanced, setAdvanced] = useState(false);
@@ -121,7 +122,7 @@ export function AccountModal({ open, editingAccount, initialDraft, upstreams, de
     setForm((current) => ({
       ...current,
       authMode,
-      profilePath: authMode === 'api_token' ? '/api/usage/token' : '/api/user/self',
+      profilePath: authMode === 'api_token' ? '/api/usage/token/' : '/api/user/self',
       balancePath: authMode === 'api_token' ? 'data.total_available' : 'data.quota',
     }));
   };
@@ -176,7 +177,7 @@ export function AccountModal({ open, editingAccount, initialDraft, upstreams, de
       const result = editingAccount ? await api.updateAccount(editingAccount.id, payload) : await api.createAccount(payload);
       if (result.syncError) pushToast(`账号已保存，但首次采集失败：${result.syncError}`, 'warning');
       else pushToast(editingAccount ? '账号配置已更新' : '账号已添加并开始监控', 'success');
-      onSaved(result.account);
+      await onSaved(result.account);
       onClose();
     } catch (error) {
       pushToast(error.message, 'error');
@@ -227,8 +228,9 @@ export function AccountModal({ open, editingAccount, initialDraft, upstreams, de
     : null;
 
   return (
-    <Modal open={open} onClose={onClose} title={editingAccount ? '编辑监控账号' : '添加监控账号'} width={720}>
+    <Modal open={open} onClose={onClose} dismissible={!busy} title={editingAccount ? '编辑监控账号' : '添加监控账号'} width={720}>
       <form className="account-form" onSubmit={submit}>
+        {onboarding && <SetupStepNote step={editingAccount ? 3 : 2}>{editingAccount ? '在下方「余额转换器」「告警与恢复」中调整金额与阈值。保存后回到引导重新核对。' : '填写接入信息，保存后回到引导核对余额与提醒阈值。'}</SetupStepNote>}
         <div className="form-section">
           <div className="form-section-title"><span>1</span><div><h3>账号归属与站点</h3></div></div>
           <label>
@@ -253,7 +255,7 @@ export function AccountModal({ open, editingAccount, initialDraft, upstreams, de
                 <div>
                   <strong>{form.authMode === 'api_token' ? 'API 密钥：只读取该密钥的可用额度' : form.authMode === 'access_token' ? '新版用户访问令牌：免登录读取整个账户余额' : '账号密码：仅作为回退方式'}</strong>
                   <p>{form.authMode === 'api_token'
-                    ? '使用左侧“API 密钥”页面创建的调用密钥，请求 /api/usage/token。余额只属于该 Key；额外填写用户访问令牌与 User ID 后，会自动定位并读取它的分组倍率。'
+                    ? '使用左侧“API 密钥”页面创建的调用密钥，请求 /api/usage/token/。新版会同时返回 Key 与用户额度，系统取较小值；额外填写用户访问令牌与 User ID 后，会自动读取分组倍率。'
                     : form.authMode === 'access_token'
                       ? '使用“个人资料 → 安全 → 访问令牌”生成的字符串，原样放入 Authorization；NewAPI 同时要求 User ID 请求头，不需要用户名或密码。'
                       : `密码模式遇到挑战时会${turnstileSolver?.enabled ? '进入浏览器验证并保存可用会话；仅在上游明确返回 AT/RT 时才回写令牌' : '尝试登录，建议同时保存用户访问令牌作为回退'}。`}</p>
@@ -289,7 +291,7 @@ export function AccountModal({ open, editingAccount, initialDraft, upstreams, de
                   />
                   <button type="button" onClick={() => setShowSecret((value) => !value)}>{showSecret ? <EyeSlash size={17} /> : <Eye size={17} />}</button>
                 </div>
-                <small>{form.tokenStrategy === 'round_robin' ? '每次采集从下一个 API 密钥开始，失败继续切换。' : '沿用上次成功的 API 密钥，失效时自动切换。'} 系统兼容带或不带 sk- 的密钥；无限额度密钥无法提供有限余额。</small>
+                <small>{form.tokenStrategy === 'round_robin' ? '每次采集从下一个 API 密钥开始，失败继续切换。' : '沿用上次成功的 API 密钥，失效时自动切换。'} 系统兼容带或不带 sk- 的密钥；无限 Key 需要上游同时返回有限用户额度才可监控。</small>
               </label>}
               {form.authMode === 'api_token' && <div className="form-grid two">
                 <label>
@@ -561,7 +563,7 @@ export function AccountModal({ open, editingAccount, initialDraft, upstreams, de
             {busy === 'connection' ? <SpinnerGap className="spin" /> : <Flask size={16} />} 测试连接
           </button>
           <div>
-            <button type="button" className="ghost-button" onClick={onClose}>取消</button>
+            <button type="button" className="ghost-button" disabled={Boolean(busy)} onClick={onClose}>取消</button>
             <button className="primary-button" disabled={Boolean(busy)}>{busy === 'save' && <SpinnerGap className="spin" />} {editingAccount ? '保存修改' : '添加并监控'}</button>
           </div>
         </footer>

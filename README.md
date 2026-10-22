@@ -1,6 +1,6 @@
 # 霜镜
 
-霜镜是一套可私有部署的上游余额监控面板。它登录你拥有的 New API、Sub2API 或兼容站点账号，读取原始余额，通过四则运算公式转换为人民币，并在低余额时通过 Resend 或飞书告警。你手动充值后，系统连续两次检测到恢复会自动发送恢复通知并结单。
+霜镜是一套可私有部署的上游余额监控面板。它登录你拥有的 New API、Sub2API 或兼容站点账号，读取原始余额，通过四则运算公式转换为人民币，并在低余额时通过 Resend、飞书或 Telegram 告警。你手动充值后，系统默认连续两次检测到恢复会自动发送恢复通知并结单。
 
 ![上游余额监控面板总览](docs/images/01-dashboard.png)
 
@@ -18,7 +18,9 @@ npm run build
 npm start
 ```
 
-打开 `http://localhost:8787`。首次运行时自拟管理员用户名，并使用页面生成的强密码完成初始化；以后使用该管理员账号登录。
+打开 `http://localhost:8787`。首次运行时自拟管理员用户名，保存好页面生成的强密码，并勾选保存确认后完成初始化；以后使用该管理员账号登录。
+
+首次进入会显示「创建上游 → 接入账号 → 核对余额 → 设置提醒」四步引导。进度按真实配置更新：同步失败不会跳过余额核对，通知需要同时满足全局启用、配置完整和账号启用。可点击「稍后设置」暂停，之后从右上角「首次设置」继续；该浏览器仅保存引导进度和配置确认标记，不保存账号凭据。示例只在尚未创建真实上游时可查看，开始真实配置后入口和示例数据会隐藏。已有真实账号的用户默认进入监控面板。
 
 ![管理员登录](docs/images/00-login.png)
 
@@ -78,12 +80,13 @@ Sub2API 提供三种接入方式：直接填写 API Key、导入登录态 JSON�
 
 1. 配置 Resend 发件人、收件人和 API Key，然后单独测试邮件链路。
 2. 配置飞书群机器人 Webhook，然后单独测试飞书链路。
-3. 保存恢复确认次数和未恢复重复提醒周期；提醒周期可选常用小时值，也可自定义 `1–10080` 分钟。
+2. 配置 Telegram Bot Token 和 Chat ID（个人数字 ID、`-100` 群组 ID 或 `@频道名`），然后单独测试 Telegram 链路。
+3. 保存恢复确认次数和未恢复重复提醒周期；恢复次数默认连续 2 次，可选 1/2/3 次或自定义 `1–100` 次，余额回落或检测失败会重新计数；提醒周期可选常用小时值，也可自定义 `1–10080` 分钟。
 4. 余额低于阈值时系统自动建单；手动充值后，连续检测达到恢复阈值便发送恢复通知并结单。
 
 ![配置 Resend、飞书与自动结单](docs/images/05-notifications.png)
 
-Resend 和飞书独立记录结果：一个渠道失败不会覆盖另一个渠道的成功状态。
+Resend、飞书和 Telegram 独立记录结果：一个渠道失败不会覆盖其他渠道的成功状态。
 
 ## 核心能力
 
@@ -92,7 +95,7 @@ Resend 和飞书独立记录结果：一个渠道失败不会覆盖另一个渠�
 - 自定义站点：可以配置用户接口路径和余额 JSON 字段。
 - 转换器：只允许变量 `x`、数字、括号和 `+ - * /`。
 - 告警闭环：低余额建单、通知去重、手动充值、连续恢复确认、自动结单。
-- 通知：Resend 邮件、飞书群机器人 Webhook。
+- 通知：Resend 邮件、飞书群机器人 Webhook、Telegram 机器人（Bot API `sendMessage`）。
 - 安全：首次自定义管理员用户名、bcrypt 强密码、Cloudflare Turnstile、TOTP 两步验证、一次性恢复码；上游凭据继续使用 AES-256-GCM 加密。
 
 ## 本地运行
@@ -108,10 +111,10 @@ npm run dev
 
 ```bash
 npm run build
-npm start
+NODE_ENV=production MASTER_KEY=<随机密钥> SESSION_SECRET=<随机密钥> npm start
 ```
 
-访问 `http://localhost:8787`。
+默认仅监听 `127.0.0.1`，访问 `http://localhost:8787`。裸机对外提供服务时设置 `HOST=0.0.0.0` 并确保 `NODE_ENV=production`、密钥显式配置、首次初始化携带 `BOOTSTRAP_TOKEN`；缺少任一项会被拒绝启动。
 
 ## Docker 部署
 
@@ -231,7 +234,7 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 
 运行镜像与项目的 Playwright `1.61.1` 版本严格匹配，内置 Chromium、Xvfb、Openbox、x11vnc 和 noVNC。浏览器始终运行在虚拟显示器中，不使用无头模式；点击“打开内置浏览器登录”或“进入上游”时，域名部署会自动打开同域名下的远程桌面。远程桌面由霜镜登录会话保护，不单独暴露公网 VNC 端口。入口只以 root 修正数据卷和虚拟桌面权限，随后应用、桌面和浏览器全部降权到 `pwuser`；Compose 同时加载 Playwright 官方同版本的 seccomp profile，以支持非 root Chromium sandbox。
 
-数据保存在 Docker 卷 `frosted-data` 中，Caddy 证书保存在 `frosted-caddy-data` 中。服务器需允许访问上游域名、`challenges.cloudflare.com`，以及你启用的 Resend/飞书/第三方解题服务。账号凭据锁目前是单进程锁，不要为同一数据卷同时启动多个应用副本。
+数据保存在 Docker 卷 `frosted-data` 中，Caddy 证书保存在 `frosted-caddy-data` 中。服务器需允许访问上游域名、`challenges.cloudflare.com`，以及你启用的 Resend/飞书/`api.telegram.org`/第三方解题服务。账号凭据锁目前是单进程锁，不要为同一数据卷同时启动多个应用副本。
 
 ### 浏览器会话数据
 

@@ -34,6 +34,9 @@ function LoadingScreen() {
 export function App() {
   const [session, setSession] = useState(null);
   const [dashboard, setDashboard] = useState(null);
+  const [dashboardError, setDashboardError] = useState('');
+  const [dashboardLoading, setDashboardLoading] = useState(false);
+  const [setupContext, setSetupContext] = useState('');
   const [upstreamModal, setUpstreamModal] = useState(false);
   const [editingUpstream, setEditingUpstream] = useState(null);
   const [quickAccountOpen, setQuickAccountOpen] = useState(false);
@@ -57,14 +60,19 @@ export function App() {
   }, []);
 
   const loadDashboard = useCallback(async (quiet = false) => {
+    if (!quiet) setDashboardLoading(true);
     try {
       const data = await api.dashboard();
       setDashboard(data);
+      setDashboardError('');
       return data;
     } catch (error) {
+      setDashboardError(error.message);
       if (error.status === 401) setSession((current) => ({ ...current, authenticated: false, authRequired: true }));
       else if (!quiet) pushToast(error.message, 'error');
       return null;
+    } finally {
+      if (!quiet) setDashboardLoading(false);
     }
   }, [pushToast]);
 
@@ -145,9 +153,11 @@ export function App() {
     try {
       const result = await api.refreshAccount(id);
       setDashboard(result.dashboard);
-      pushToast('余额已同步并完成阈值检查', 'success');
+      const account = result.dashboard?.accounts?.find((item) => item.id === id);
+      pushToast(account?.lastError ? `同步未成功：${account.lastError}` : '余额已同步并完成阈值检查', account?.lastError ? 'error' : 'success');
     } catch (error) {
       pushToast(error.message, 'error');
+      await loadDashboard(true);
     } finally {
       setBusyAccount('');
     }
@@ -207,7 +217,10 @@ export function App() {
   const upstreamSaved = async (upstream, created) => {
     setDefaultUpstreamId(upstream.id);
     await loadDashboard();
-    if (created) setQuickAccountOpen(true);
+    if (created) {
+      if (setupContext) setSetupContext('account');
+      setQuickAccountOpen(true);
+    }
   };
   const upstreamDeleted = async () => loadDashboard();
 
@@ -233,7 +246,14 @@ export function App() {
     setEditingAccount(null);
     setAdvancedDraft(null);
   };
-  const accountSaved = async () => loadDashboard();
+  const accountSaved = async (account) => {
+    if (editingAccount && account && account.enabled !== false) {
+      // An edited formula needs a fresh conversion before the guide can ask
+      // the user to confirm the amount displayed next to it.
+      await refreshAccount(editingAccount.id);
+    }
+    return loadDashboard();
+  };
   const accountDeleted = async () => loadDashboard();
   const restoreAccount = async (account) => {
     try {
@@ -245,36 +265,51 @@ export function App() {
     }
   };
 
+  const setupAction = (action, target) => {
+    setSetupContext(action);
+    if (action === 'upstream') openUpstreamModal();
+    if (action === 'account') addAccount(target);
+    if (action === 'balance') openEditAccount(target);
+    if (action === 'sync') refreshAccount(target);
+    if (action === 'notifications') {
+      setSettingsInitialTab('notifications');
+      setSettingsOpen(true);
+    }
+  };
+
   if (!session) return <LoadingScreen />;
   if (!session.authenticated) {
     return <><LoginScreen session={session} onSetup={setupAdmin} onLogin={login} onVerifyTwoFactor={verifyTwoFactor} busy={loginBusy} error={loginError} /><Toasts toasts={toasts} dismiss={(id) => setToasts((current) => current.filter((toast) => toast.id !== id))} /></>;
   }
+  if (!dashboard && dashboardError) return <main className="dashboard-load-error"><WarningCircle size={34} /><h1>暂时无法读取监控面板</h1><p role="alert">{dashboardError}</p><button type="button" className="primary-button" disabled={dashboardLoading} onClick={() => loadDashboard()}>{dashboardLoading ? '正在重新连接…' : '重新加载'}</button><button type="button" className="text-command" onClick={logout}>返回登录</button></main>;
   if (!dashboard) return <LoadingScreen />;
 
   return (
     <div className="single-page-shell">
       <StatusDashboard
         dashboard={dashboard}
+        username={session.username}
+        onSetupAction={setupAction}
         busyAccount={busyAccount}
         openingAccount={openingAccount}
         busyUpstream={busyUpstream}
-        onAddUpstream={() => openUpstreamModal()}
-        onEditUpstream={openUpstreamModal}
-        onAddAccount={addAccount}
-        onEditAccount={openEditAccount}
+        onAddUpstream={() => { setSetupContext(''); openUpstreamModal(); }}
+        onEditUpstream={(upstream) => { setSetupContext(''); openUpstreamModal(upstream); }}
+        onAddAccount={(id) => { setSetupContext(''); addAccount(id); }}
+        onEditAccount={(account) => { setSetupContext(''); openEditAccount(account); }}
         onRefreshAccount={refreshAccount}
         onOpenUpstream={openAccountUpstream}
         onRefreshUpstream={refreshUpstream}
-        onSettings={() => { setSettingsInitialTab('notifications'); setSettingsOpen(true); }}
+        onSettings={() => { setSetupContext(''); setSettingsInitialTab('notifications'); setSettingsOpen(true); }}
         onLogout={logout}
         onAcknowledge={acknowledge}
         onLoadKeyDetails={api.accountKeyDetails}
         onRestoreAccount={restoreAccount}
       />
-      <UpstreamModal open={upstreamModal} editingUpstream={editingUpstream} proxyPool={dashboard.proxyPool} onClose={closeUpstreamModal} onSaved={upstreamSaved} onDeleted={upstreamDeleted} onOpenProxySettings={() => { closeUpstreamModal(); setSettingsInitialTab('proxy'); setSettingsOpen(true); }} pushToast={pushToast} />
-      <QuickAccountModal open={quickAccountOpen} upstreams={dashboard.upstreams} defaultUpstreamId={defaultUpstreamId} browserWorkspaceUrl={dashboard.browserWorkspaceUrl} onClose={() => setQuickAccountOpen(false)} onSaved={accountSaved} onAdvanced={openAdvancedAccount} pushToast={pushToast} />
-      <AccountModal open={accountModal} editingAccount={editingAccount} initialDraft={advancedDraft} upstreams={dashboard.upstreams} defaultUpstreamId={defaultUpstreamId} onClose={closeAccountModal} onSaved={accountSaved} onDeleted={accountDeleted} pushToast={pushToast} turnstileSolver={dashboard.turnstileSolver} />
-      <SettingsModal open={settingsOpen} settings={dashboard.settings} proxyPool={dashboard.proxyPool} initialTab={settingsInitialTab} session={session} onSessionChanged={async () => setSession(await api.session())} onClose={() => setSettingsOpen(false)} onSaved={(settings) => setDashboard((current) => ({ ...current, settings }))} onProxyPoolChanged={async (proxyPool) => { setDashboard((current) => ({ ...current, proxyPool })); await loadDashboard(true); }} pushToast={pushToast} />
+      <UpstreamModal open={upstreamModal} onboarding={setupContext === 'upstream'} editingUpstream={editingUpstream} proxyPool={dashboard.proxyPool} onClose={closeUpstreamModal} onSaved={upstreamSaved} onDeleted={upstreamDeleted} onOpenProxySettings={() => { closeUpstreamModal(); setSettingsInitialTab('proxy'); setSettingsOpen(true); }} pushToast={pushToast} />
+      <QuickAccountModal open={quickAccountOpen} onboarding={setupContext === 'account'} settings={dashboard.settings} upstreams={dashboard.upstreams.filter((upstream) => !upstream.demoAccountCount || upstream.realAccountCount > 0)} defaultUpstreamId={defaultUpstreamId} browserWorkspaceUrl={dashboard.browserWorkspaceUrl} onClose={() => setQuickAccountOpen(false)} onSaved={accountSaved} onAdvanced={openAdvancedAccount} pushToast={pushToast} />
+      <AccountModal open={accountModal} onboarding={Boolean(setupContext)} editingAccount={editingAccount} initialDraft={advancedDraft} upstreams={dashboard.upstreams.filter((upstream) => !upstream.demoAccountCount || upstream.realAccountCount > 0)} defaultUpstreamId={defaultUpstreamId} onClose={closeAccountModal} onSaved={accountSaved} onDeleted={accountDeleted} pushToast={pushToast} turnstileSolver={dashboard.turnstileSolver} />
+      <SettingsModal open={settingsOpen} onboarding={setupContext === 'notifications'} settings={dashboard.settings} proxyPool={dashboard.proxyPool} initialTab={settingsInitialTab} session={session} onSessionChanged={async () => setSession(await api.session())} onClose={() => setSettingsOpen(false)} onSaved={(settings) => setDashboard((current) => ({ ...current, settings }))} onProxyPoolChanged={async (proxyPool) => { setDashboard((current) => ({ ...current, proxyPool })); await loadDashboard(true); }} pushToast={pushToast} />
       <Toasts toasts={toasts} dismiss={(id) => setToasts((current) => current.filter((toast) => toast.id !== id))} />
     </div>
   );

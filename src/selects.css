@@ -1,0 +1,106 @@
+/* Keep native form semantics while matching every selector to the workspace. */
+select {
+  color-scheme: light;
+  cursor: pointer;
+}
+
+:is(.account-form, .settings-form, .quick-account-form, .onboarding-select) select {
+  min-width: 0;
+  border-color: #d7d9de;
+  border-radius: 7px;
+  background-color: #fff;
+  color: #343840;
+  font-size: 13px;
+  line-height: 1.45;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+
+:is(.account-form, .settings-form, .quick-account-form, .onboarding-select) select:hover:not(:disabled) {
+  border-color: #b1b6bf;
+}
+
+:is(.account-form, .settings-form, .quick-account-form, .onboarding-select) select:focus-visible {
+  border-color: #8f97a2;
+  outline: 2px solid rgba(88, 97, 110, .22);
+  outline-offset: 2px;
+}
+
+select:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+@supports (appearance: base-select) {
+  select,
+  select::picker(select) {
+    appearance: base-select;
+  }
+
+  select {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  select::picker-icon {
+    flex: none;
+    color: #818791;
+    font-size: 12px;
+    transition: rotate .16s ease;
+  }
+
+  select:open::picker-icon { rotate: 180deg; }
+
+  select::picker(select) {
+    box-sizing: border-box;
+    width: anchor-size(width);
+    min-width: anchor-size(width);
+    max-width: calc(100vw - 24px);
+    max-height: min(304px, calc(100dvh - 24px));
+    overflow: auto;
+    overscroll-behavior: contain;
+    margin-block: 5px;
+    padding: 5px;
+    border: 1px solid #dedfe4;
+    border-radius: 9px;
+    background: #fff;
+    color: #343840;
+    box-shadow: 0 8px 24px rgba(29, 34, 44, .12), 0 2px 5px rgba(29, 34, 44, .04);
+    font: 13px/1.45 "Inter Variable", "PingFang SC", "Microsoft YaHei", sans-serif;
+    scrollbar-width: thin;
+    scrollbar-color: #cbd0d6 transparent;
+  }
+
+  select option {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-height: 36px;
+    padding: 8px 10px;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: #454b55;
+    font: inherit;
+    text-align: start;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    cursor: pointer;
+  }
+
+  select option + option { margin-top: 2px; }
+  select option:checked { background: #f1f3f5; color: #262b33; font-weight: 600; }
+  select option:hover:not(:disabled),
+  select option:focus { outline: none; background: #e9edf1; color: #262b33; }
+  select option::checkmark { order: 1; margin-inline-start: auto; color: #414b58; }
+  select option:disabled { color: #9298a2; background: transparent; font-weight: 400; cursor: not-allowed; }
+
+  @media (pointer: coarse) {
+    select option { min-height: 44px; }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  select, select::picker-icon { transition: none !important; }
+}

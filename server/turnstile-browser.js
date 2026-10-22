@@ -644,6 +644,7 @@ async function verifySessionInBrowser(
       const timer = setTimeout(() => controller.abort(), timeout);
       try {
         const response = await fetch(url, {
+          redirect: 'error',
           credentials: 'include',
           headers: { Accept: 'application/json', ...requestHeaders },
           signal: controller.signal,

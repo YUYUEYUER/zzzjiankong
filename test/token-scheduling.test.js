@@ -217,6 +217,39 @@ test('New API account access token enumerates per-key usage and group multiplier
   }
 });
 
+test('Sub2API current releases fall back to the renamed api-keys list endpoint', async () => {
+  const originalFetch = global.fetch;
+  const paths = [];
+  global.fetch = async (url) => {
+    const pathname = new URL(String(url)).pathname;
+    paths.push(pathname);
+    if (pathname === '/api/v1/auth/me') {
+      return new Response(JSON.stringify({ code: 0, data: { balance: 24.5, status: 'active' } }), { status: 200 });
+    }
+    if (pathname === '/api/v1/keys') return new Response(JSON.stringify({ code: 404, message: 'not found' }), { status: 404 });
+    if (pathname === '/api/v1/api-keys') {
+      return new Response(JSON.stringify({ code: 0, data: { total: 1, items: [{ id: 7, key: 'hidden', name: 'current', status: 'active', quota: 12, quota_used: 2 }] } }), { status: 200 });
+    }
+    if (pathname === '/api/v1/groups/available') return new Response(JSON.stringify({ code: 0, data: [] }), { status: 200 });
+    if (pathname === '/api/v1/groups/rates') return new Response(JSON.stringify({ code: 0, data: {} }), { status: 200 });
+    if (pathname === '/api/v1/settings/public') return new Response(JSON.stringify({ code: 0, data: { server_timezone: 'UTC' } }), { status: 200 });
+    if (pathname === '/api/v1/usage/dashboard/api-keys-usage') return new Response(JSON.stringify({ code: 0, data: { stats: {} } }), { status: 200 });
+    return new Response(JSON.stringify({ code: 404, message: 'not found' }), { status: 404 });
+  };
+  try {
+    const details = await collectApiKeyDetails({
+      id: 'account-sub2-current', name: 'Sub2 current', type: 'sub2api', authMode: 'access_token',
+      baseUrl: 'https://sub2.example.com', profilePath: '/api/v1/auth/me', balancePath: 'data.balance',
+    }, { accessToken: 'private-token' });
+    assert.equal(details.keyCount, 1);
+    assert.equal(details.keys[0].rawBalance, 10);
+    assert.ok(paths.includes('/api/v1/keys'));
+    assert.ok(paths.includes('/api/v1/api-keys'));
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('Sub2API account session enumerates every key and available group rate without exposing tokens', async () => {
   const originalFetch = global.fetch;
   let usageRequestBody;
@@ -693,6 +726,34 @@ test('New API raw API key reads key quota without login or User ID', async () =>
     assert.equal(result.metadata.tokenName, 'balance-monitor');
     assert.equal(result.metadata.apiTokenSlot, 1);
     assert.equal(result.metadata.tokenPrefixMode, 'as_entered');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('New API caps an unlimited key by the finite user quota exposed by current releases', async () => {
+  const originalFetch = global.fetch;
+  let requestedPath = '';
+  global.fetch = async (url) => {
+    requestedPath = new URL(String(url)).pathname;
+    return new Response(JSON.stringify({
+      code: true,
+      data: {
+        total_available: 2500000,
+        unlimited_quota: true,
+        user_quota: { total_available: 640000 },
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  try {
+    const result = await collectBalance({
+      type: 'newapi', authMode: 'api_token', baseUrl: 'https://newapi.example.com', profilePath: '/api/usage/token/',
+    }, { apiToken: 'sk-current-release' });
+    assert.equal(result.rawBalance, 640000);
+    assert.equal(requestedPath, '/api/usage/token/');
+    assert.equal(result.metadata.userQuotaRemaining, 640000);
+    assert.equal(result.metadata.unlimitedQuota, false);
   } finally {
     global.fetch = originalFetch;
   }

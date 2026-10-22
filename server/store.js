@@ -5,6 +5,8 @@ import { config } from "./config.js";
 
 const iso = (offsetMinutes = 0) => new Date(Date.now() + offsetMinutes * 60000).toISOString();
 const STORE_VERSION = 4;
+/** audit 只保留最新 N 条；在事务层统一截断，防止各写入点遗漏上限导致文件膨胀。 */
+const AUDIT_RETENTION_LIMIT = 500;
 
 function defaultProxyPool() {
   return {
@@ -34,6 +36,9 @@ function defaultSettings() {
     resendApiKeyEncrypted: "",
     feishuEnabled: false,
     feishuWebhookEncrypted: "",
+    telegramEnabled: false,
+    telegramChatId: "",
+    telegramBotTokenEncrypted: "",
     recoveryConfirmations: 2,
     reminderMinutes: 360,
   };
@@ -95,7 +100,7 @@ function demoAccount(input) {
     thresholdLow: input.thresholdLow ?? 20,
     thresholdRecover: input.thresholdRecover ?? 50,
     pollIntervalMinutes: 5,
-    notifications: { resend: true, feishu: true },
+    notifications: { resend: true, feishu: true, telegram: true },
     enabled: input.enabled ?? true,
     demo: true,
     encryptedSecret: "",
@@ -135,7 +140,7 @@ function normalizeDataShape(data) {
   for (const key of ['snapshots', 'incidents', 'audit', 'notificationOutbox']) {
     if (!Array.isArray(data[key])) data[key] = [];
   }
-  if (!data.settings || typeof data.settings !== 'object') data.settings = defaultSettings();
+  if (!data.settings || typeof data.settings !== 'object') data.settings = {};
   if (!data.auth || typeof data.auth !== 'object') data.auth = defaultAuth();
   if (!data.proxyPool || typeof data.proxyPool !== 'object') data.proxyPool = defaultProxyPool();
   data.proxyPool = { ...defaultProxyPool(), ...data.proxyPool };
@@ -232,6 +237,8 @@ export function migrateData(source, idFactory = () => crypto.randomUUID()) {
   if (fromVersion === STORE_VERSION) {
     if (!Array.isArray(data.upstreams)) throw new Error(`版本 ${STORE_VERSION} 数据缺少 upstreams 数组`);
     data.upstreams = data.upstreams.map(withProxyDefaults);
+    // 归一默认键：旧数据文件缺少后续新增的 settings 字段时自动补齐（已存值优先，含加密字段）。
+    data.settings = { ...defaultSettings(), ...data.settings };
     validateDataGraph(data);
     return { data, changed: false, fromVersion };
   }
@@ -250,6 +257,7 @@ export function migrateData(source, idFactory = () => crypto.randomUUID()) {
   data.proxyPool = { ...defaultProxyPool(), ...(data.proxyPool || {}) };
   if (!Array.isArray(data.proxyPool.nodes)) data.proxyPool.nodes = [];
   migrateReminderSettings(data.settings);
+  data.settings = { ...defaultSettings(), ...data.settings };
   data.version = STORE_VERSION;
   validateDataGraph(data);
   return { data, changed: true, fromVersion };
@@ -343,6 +351,9 @@ export class JsonStore {
     const operation = this.queue.catch(() => undefined).then(async () => {
       const draft = structuredClone(this.data);
       const result = await mutator(draft);
+      if (Array.isArray(draft.audit) && draft.audit.length > AUDIT_RETENTION_LIMIT) {
+        draft.audit = draft.audit.slice(0, AUDIT_RETENTION_LIMIT);
+      }
       validateDataGraph(draft);
       try {
         await this.persist(draft);
