@@ -97,7 +97,7 @@ export function UpstreamOverview({
                     ) : <span className="proxy-exit-cell direct"><i /><strong>直连</strong><small>服务器出口</small></span>}
                   </td>
                   <td data-label="账号"><strong className="tabular">{upstream.accountCount}</strong><small>{members.length ? members.map((account) => account.name).slice(0, 2).join('、') : '等待添加账号'}</small></td>
-                  <td data-label="人民币余额" className="balance-cell">{money(upstream.totalCny)}</td>
+                  <td data-label="人民币余额" className="balance-cell">{money(upstream.totalCny)}{Number.isFinite(upstream.minEtaDays) && upstream.minEtaDays <= 14 && <small className="eta-note">最快约 {upstream.minEtaDays} 天耗尽</small>}</td>
                   <td data-label="状态"><span className={`state-badge upstream-state ${upstream.status}`}>{statusLabels[upstream.status] || upstream.status}</span></td>
                   <td data-label="待处理" className={upstream.openIncidents ? 'attention-count' : ''}>{upstream.openIncidents ? <><WarningCircle size={16} weight="fill" /> {upstream.openIncidents} 项</> : '—'}</td>
                   <td data-label="最近检测">{relativeTime(upstream.lastSyncAt)}</td>

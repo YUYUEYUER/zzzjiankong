@@ -27,7 +27,7 @@ test('incident transition is persisted before notification dispatch and can resu
   const { dir, store, monitor } = await preparedMonitor(async () => {
     calls += 1;
     if (calls === 1) throw new Error('simulated crash before provider result');
-    return { resend: { status: 'sent', attemptedAt: new Date().toISOString() }, feishu: { status: 'disabled', attemptedAt: null }, telegram: { status: 'disabled', attemptedAt: null } };
+    return { resend: { status: 'sent', attemptedAt: new Date().toISOString() }, feishu: { status: 'disabled', attemptedAt: null }, telegram: { status: 'disabled', attemptedAt: null }, wecom: { status: 'disabled', attemptedAt: null } };
   });
   try {
     await monitor.poll('acct-us-backup');
@@ -57,12 +57,13 @@ test('partial channel success only retries the failed channel', async () => {
       resend: { status: 'sent', attemptedAt: new Date().toISOString(), externalId: 'resend-1' },
       feishu: { status: 'failed', retryable: true, attemptedAt: new Date().toISOString(), message: 'retry' },
       telegram: { status: 'disabled', attemptedAt: null },
+      wecom: { status: 'disabled', attemptedAt: null },
     };
     return { feishu: { status: 'sent', attemptedAt: new Date().toISOString() } };
   });
   try {
     await monitor.poll('acct-us-backup');
-    assert.deepEqual(seen[0].sort(), ['feishu', 'resend', 'telegram']);
+    assert.deepEqual(seen[0].sort(), ['feishu', 'resend', 'telegram', 'wecom']);
     await store.mutate((data) => {
       data.notificationOutbox[0].nextAttemptAt = new Date(Date.now() - 1000).toISOString();
       data.notificationOutbox[0].channels.feishu.nextAttemptAt = new Date(Date.now() - 1000).toISOString();

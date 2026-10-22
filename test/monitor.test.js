@@ -261,6 +261,179 @@ test('credential checkpoints are not enumerable or printable on Error objects', 
   assert.deepEqual(Object.keys(error), []);
 });
 
+test('a recorded recharge verifies once the balance rises by the declared amount', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'frosted-recharge-'));
+  const store = await new JsonStore(path.join(dir, 'db.json')).init();
+  const readings = [60, 75, 75];
+  const monitor = new Monitor(store, {
+    collector: async () => ({ rawBalance: readings.shift(), metadata: {} }),
+  });
+
+  try {
+    await store.mutate((data) => {
+      const account = data.accounts.find((item) => item.id === 'acct-hk-backup');
+      account.demo = false;
+      account.formula = 'x';
+      account.thresholdLow = 10;
+      account.thresholdRecover = 70;
+      const incident = data.incidents.find((item) => item.id === 'inc-hk');
+      incident.recharges = [{
+        id: 'recharge-1', amount: 50, at: new Date().toISOString(),
+        balanceAt: 8, verifiedAt: null, verifiedBalance: null,
+      }];
+    });
+
+    // 8 + 50 = 58；第一次回升到 60 已达标 → 标记已核对
+    await monitor.poll('acct-hk-backup');
+    let incident = store.snapshot().incidents.find((item) => item.id === 'inc-hk');
+    assert.ok(incident.recharges[0].verifiedAt);
+    assert.equal(incident.recharges[0].verifiedBalance, 60);
+    assert.equal(incident.state, 'open');
+    assert.equal(incident.recoveryChecks, 0);
+
+    await monitor.poll('acct-hk-backup');
+    incident = store.snapshot().incidents.find((item) => item.id === 'inc-hk');
+    assert.equal(incident.recoveryChecks, 1);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('depletion prediction enqueues at most one event per day per account', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'frosted-prediction-'));
+  const store = await new JsonStore(path.join(dir, 'db.json')).init();
+  const monitor = new Monitor(store, {
+    collector: async () => ({ rawBalance: 30, metadata: {} }),
+  });
+
+  try {
+    const now = Date.now();
+    await store.mutate((data) => {
+      data.settings.depletionAlertDays = 10;
+      const account = data.accounts.find((item) => item.id === 'acct-jp-prod');
+      account.demo = false;
+      account.formula = 'x';
+      account.thresholdLow = 10;
+      // 余额高于阈值、不在事件中 → 走预测分支
+      for (const incident of data.incidents) incident.state = 'resolved';
+      // 4 个点、每天消耗 4 元：当前 30，阈值 10 → ETA = (30-10)/4 = 5 天 ≤ 10 → 应入队
+      data.snapshots = [0, 1, 2, 3].map((index) => ({
+        id: `pred-${index}`, accountId: 'acct-jp-prod', rawBalance: 30 + index * 4,
+        convertedCny: 30 + index * 4, capturedAt: new Date(now - index * 86400000).toISOString(),
+      }));
+    });
+
+    await monitor.poll('acct-jp-prod');
+    let events = store.snapshot().notificationOutbox.filter((item) => item.kind === 'prediction' && item.accountId === 'acct-jp-prod');
+    assert.equal(events.length, 1);
+    assert.match(events[0].dedupeKey, /^account:acct-jp-prod:prediction:/);
+
+    // 同一天再次 poll 不得重复入队
+    await monitor.poll('acct-jp-prod');
+    events = store.snapshot().notificationOutbox.filter((item) => item.kind === 'prediction' && item.accountId === 'acct-jp-prod');
+    assert.equal(events.length, 1);
+
+    const account = store.snapshot().accounts.find((item) => item.id === 'acct-jp-prod');
+    assert.ok(account.dailyBurnRate > 3.5 && account.dailyBurnRate < 4.5);
+    assert.ok(Number.isFinite(account.depletionEtaDays));
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('depletion prediction is suppressed while an incident is open', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'frosted-prediction-open-'));
+  const store = await new JsonStore(path.join(dir, 'db.json')).init();
+  const monitor = new Monitor(store, {
+    collector: async () => ({ rawBalance: 5, metadata: {} }),
+  });
+
+  try {
+    const now = Date.now();
+    await store.mutate((data) => {
+      data.settings.depletionAlertDays = 10;
+      const account = data.accounts.find((item) => item.id === 'acct-hk-backup');
+      account.demo = false;
+      account.formula = 'x';
+      account.thresholdLow = 10;
+      data.snapshots = [0, 1, 2].map((index) => ({
+        id: `open-${index}`, accountId: 'acct-hk-backup', rawBalance: 12 + index * 4,
+        convertedCny: 12 + index * 4, capturedAt: new Date(now - index * 86400000).toISOString(),
+      }));
+    });
+
+    await monitor.poll('acct-hk-backup'); // 5 < 10 → 维持/建立事件
+    const events = store.snapshot().notificationOutbox.filter((item) => item.kind === 'prediction');
+    assert.equal(events.length, 0);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('credential expiry warning enqueues once per day when AT enters the three-day window', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'frosted-credential-expiry-'));
+  const store = await new JsonStore(path.join(dir, 'db.json')).init();
+  const monitor = new Monitor(store, {
+    collector: async () => ({
+      rawBalance: 100,
+      metadata: { accessTokenExpiresAt: new Date(Date.now() + 2 * 86400000).toISOString() },
+    }),
+  });
+
+  try {
+    await store.mutate((data) => {
+      const account = data.accounts.find((item) => item.id === 'acct-us-backup');
+      account.demo = false;
+      account.formula = 'x';
+      account.encryptedSecret = encryptSecret({ accessToken: 'cred-expiry-test' });
+      for (const incident of data.incidents) incident.state = 'resolved';
+      data.snapshots = [];
+    });
+
+    await monitor.poll('acct-us-backup');
+    let events = store.snapshot().notificationOutbox.filter((item) => item.kind === 'credential_expiry' && item.accountId === 'acct-us-backup');
+    assert.equal(events.length, 1);
+    assert.match(events[0].dedupeKey, /^account:acct-us-backup:credential_expiry:/);
+
+    await monitor.poll('acct-us-backup');
+    events = store.snapshot().notificationOutbox.filter((item) => item.kind === 'credential_expiry' && item.accountId === 'acct-us-backup');
+    assert.equal(events.length, 1);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('credential expiry warning still enqueues during an active low-balance incident', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'frosted-credential-incident-'));
+  const store = await new JsonStore(path.join(dir, 'db.json')).init();
+  const monitor = new Monitor(store, {
+    collector: async () => ({
+      rawBalance: 100,
+      metadata: { accessTokenExpiresAt: new Date(Date.now() + 2 * 86400000).toISOString() },
+    }),
+  });
+
+  try {
+    await store.mutate((data) => {
+      const account = data.accounts.find((item) => item.id === 'acct-us-backup');
+      account.demo = false;
+      account.formula = 'x';
+      account.thresholdLow = 200;
+      account.encryptedSecret = encryptSecret({ accessToken: 'cred-expiry-incident' });
+      for (const incident of data.incidents) incident.state = 'resolved';
+      data.snapshots = [];
+    });
+
+    await monitor.poll('acct-us-backup');
+    const data = store.snapshot();
+    assert.ok(data.incidents.some((item) => item.accountId === 'acct-us-backup' && item.state === 'open'));
+    const events = data.notificationOutbox.filter((item) => item.kind === 'credential_expiry' && item.accountId === 'acct-us-backup');
+    assert.equal(events.length, 1);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('rotated credentials survive a conversion failure after collection succeeds', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'frosted-formula-checkpoint-'));
   const store = await new JsonStore(path.join(dir, 'db.json')).init();

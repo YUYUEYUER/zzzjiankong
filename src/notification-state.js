@@ -1,4 +1,4 @@
-export const CHANNEL_NAMES = { resend: 'Resend', feishu: '飞书', telegram: 'Telegram' };
+export const CHANNEL_NAMES = { resend: 'Resend', feishu: '飞书', telegram: 'Telegram', wecom: '企业微信' };
 
 export function notificationResult(incident, kind, channel) {
   const current = incident?.notifications?.[kind]?.results?.[channel];

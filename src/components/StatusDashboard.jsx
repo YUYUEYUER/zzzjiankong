@@ -194,8 +194,8 @@ function AccountRow({ account, balanceKnown, expanded, detailState, onToggle, on
             <small>{platformLabel(account.type)} · {hostname(account.baseUrl)}{account.apiTokenCount > 1 ? ` · ${account.apiTokenCount} Keys` : ''}</small>
           </span>
           <span className="status-account-sync">{relativeTime(account.lastSyncAt)}</span>
-          <span className="status-account-balance">{balanceKnown ? money(account.convertedCny) : '未获取余额'}</span>
-          <span className={`status-label ${account.status}`}>{statusCopy(account.status)}</span>
+          <span className="status-account-balance">{balanceKnown ? money(account.convertedCny) : '未获取余额'}{Number.isFinite(account.depletionEtaDays) && account.depletionEtaDays <= 14 && <small className="eta-note">预计 {account.depletionEtaDays} 天低于阈值</small>}</span>
+          <span className={`status-label ${account.status}`}>{statusCopy(account.status)}{account.credentialExpired ? <small className="row-flag expired">凭据已过期</small> : account.credentialExpiringSoon ? <small className="row-flag expiring">凭据即将到期</small> : null}</span>
         </button>
         <div className="status-account-actions">
           {account.type === 'sub2api' && account.hasBrowserSession && !account.demo && <button className="quiet-icon-button" type="button" onClick={() => onOpenUpstream(account)} disabled={opening} title="进入上游（复用原浏览器登录态）" aria-label={`进入 ${account.name} 上游`}>
@@ -218,7 +218,11 @@ function AccountRow({ account, balanceKnown, expanded, detailState, onToggle, on
             exit={{ height: 0, opacity: 0 }}
             transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
           >
-            <div className="status-account-details"><AccountDetails account={account} state={detailState} onEdit={onEdit} /></div>
+            <div className="status-account-details">
+              {Number(account.dailyBurnRate) > 0 && <p className="account-meta-line">日均消耗约 {money(account.dailyBurnRate)}/天{Number.isFinite(account.depletionEtaDays) ? ` · 按当前速率约 ${account.depletionEtaDays} 天后低于阈值` : ''}</p>}
+              {account.credentialExpiresAt && <p className={`account-meta-line ${account.credentialExpired ? 'expired' : account.credentialExpiringSoon ? 'expiring' : ''}`}>访问令牌{account.credentialExpired ? '已过期' : '将于'} {relativeTime(account.credentialExpiresAt)}{account.credentialExpired ? '' : '到期'}</p>}
+              <AccountDetails account={account} state={detailState} onEdit={onEdit} />
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
@@ -226,7 +230,7 @@ function AccountRow({ account, balanceKnown, expanded, detailState, onToggle, on
   );
 }
 
-function IncidentHistory({ incidents, onAcknowledge }) {
+function IncidentHistory({ incidents, onAcknowledge, onRecordRecharge }) {
   const visible = incidents.slice(0, 12);
   if (!visible.length) return <div className="history-empty">暂无告警记录</div>;
   return (
@@ -234,12 +238,38 @@ function IncidentHistory({ incidents, onAcknowledge }) {
       {visible.map((incident) => (
         <div className="history-row" key={incident.id}>
           <span className={`status-dot ${incident.state === 'resolved' ? 'healthy' : 'warning'}`} />
-          <div><strong>{incident.account?.name || '账号告警'}</strong><small>{incident.state === 'resolved' ? '余额恢复，系统已自动结单' : '余额低于阈值，等待充值恢复'} · {relativeTime(incident.openedAt || incident.createdAt)}</small></div>
+          <div>
+            <strong>{incident.account?.name || '账号告警'}</strong>
+            <small>{incident.state === 'resolved' ? '余额恢复，系统已自动结单' : '余额低于阈值，等待充值恢复'} · {relativeTime(incident.openedAt || incident.createdAt)}</small>
+            {incident.recharges?.length > 0 && <small className="recharge-history">{incident.recharges.map((item) => (
+              <em key={item.id} className={item.verifiedAt ? 'verified' : ''}>充值 {money(item.amount)}{item.verifiedAt ? '·已核对' : '·待核对'}</em>
+            ))}</small>}
+          </div>
           <span>{incident.state === 'resolved' ? '已结单' : incident.acknowledgedAt ? '已确认' : '处理中'}</span>
           {incident.state === 'open' && !incident.acknowledgedAt && <button type="button" className="text-command" onClick={() => onAcknowledge(incident.id)}>确认</button>}
+          {incident.state === 'open' && onRecordRecharge && <RechargeRecorder incident={incident} onRecord={onRecordRecharge} />}
         </div>
       ))}
     </div>
+  );
+}
+
+function RechargeRecorder({ incident, onRecord }) {
+  const [open, setOpen] = useState(false);
+  const [amount, setAmount] = useState('');
+  const [busy, setBusy] = useState(false);
+  if (!open) return <button type="button" className="text-command" onClick={() => setOpen(true)}>记录充值</button>;
+  return (
+    <form className="recharge-form" onSubmit={async (event) => {
+      event.preventDefault();
+      const value = Number(amount);
+      if (!Number.isFinite(value) || value <= 0 || busy) return;
+      setBusy(true);
+      try { await onRecord(incident.id, value); setOpen(false); setAmount(''); } finally { setBusy(false); }
+    }}>
+      <input type="number" min="0.01" step="0.01" placeholder="¥ 金额" value={amount} onChange={(event) => setAmount(event.target.value)} autoFocus />
+      <button className="text-command" type="submit" disabled={busy}>{busy ? '…' : '保存'}</button>
+    </form>
   );
 }
 
@@ -260,6 +290,7 @@ export function StatusDashboard({
   onSettings,
   onLogout,
   onAcknowledge,
+  onRecordRecharge,
   onLoadKeyDetails,
   onRestoreAccount,
 }) {
@@ -373,7 +404,7 @@ export function StatusDashboard({
                       {['healthy', 'empty'].includes(upstreamStatus) ? <CheckCircle size={22} weight="fill" /> : <WarningCircle size={22} weight="fill" />}
                     </span>
                     <span><strong>{upstream.name}{accounts.length > 0 && accounts.every((account) => account.demo) && <em className="status-demo-label">示例</em>}</strong><small>{upstreamPlatforms.map(platformLabel).join(' / ') || '等待账号'} · {accounts.length} 个账号</small></span>
-                    <span className="upstream-total">{knownBalances.length ? money(upstreamTotal) : '—'}<small>{knownBalances.length < accounts.length ? '已读取人民币余额' : '人民币余额'}</small></span>
+                    <span className="upstream-total">{knownBalances.length ? money(upstreamTotal) : '—'}<small>{knownBalances.length < accounts.length ? '已读取人民币余额' : '人民币余额'}</small>{Number.isFinite(upstream.minEtaDays) && upstream.minEtaDays <= 14 && <small className="eta-note">最快约 {upstream.minEtaDays} 天耗尽</small>}</span>
                     <span className={`status-label ${upstreamStatus}`}>{statusCopy(upstreamStatus)}</span>
                     <PencilSimple className="banner-edit-icon" size={17} />
                   </button>
@@ -409,7 +440,7 @@ export function StatusDashboard({
         <button className="history-toggle" type="button" onClick={() => setHistoryOpen((value) => !value)} aria-expanded={historyOpen}>
           <ClockCounterClockwise size={19} />{historyOpen ? '收起告警历史' : '查看告警历史'}
         </button>
-        {historyOpen && <section className="history-panel"><header><div><Bell size={18} /><h2>告警与自动结单记录</h2></div><span>最近 {Math.min(12, visibleIncidents.length)} 条</span></header><IncidentHistory incidents={visibleIncidents} onAcknowledge={onAcknowledge} /></section>}
+        {historyOpen && <section className="history-panel"><header><div><Bell size={18} /><h2>告警与自动结单记录</h2></div><span>最近 {Math.min(12, visibleIncidents.length)} 条</span></header><IncidentHistory incidents={visibleIncidents} onAcknowledge={onAcknowledge} onRecordRecharge={onRecordRecharge} /></section>}
 
         {dashboard.deletedAccounts?.length > 0 && <>
           <button className="history-toggle" type="button" onClick={() => setRecycleOpen((value) => !value)} aria-expanded={recycleOpen}><Trash size={19} />{recycleOpen ? '收起回收站' : `回收站 · ${dashboard.deletedAccounts.length} 个账号`}</button>

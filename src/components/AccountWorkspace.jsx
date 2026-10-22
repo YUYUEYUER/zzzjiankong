@@ -153,6 +153,7 @@ export function AccountWorkspace({ account, upstream, snapshots, onRefresh, onEd
           <span>折算人民币 (CNY)</span>
           <strong>{money(account.convertedCny)}</strong>
           <small>= {compactNumber(account.rawBalance)} → CNY</small>
+          {Number(account.dailyBurnRate) > 0 && <small className="burn-note">日均消耗约 {money(account.dailyBurnRate)}/天{Number.isFinite(account.depletionEtaDays) ? ` · 预计 ${account.depletionEtaDays} 天后低于阈值` : ''}</small>}
         </div>
         <div className="metric-block threshold-metric">
           <span>告警阈值 (CNY)</span>

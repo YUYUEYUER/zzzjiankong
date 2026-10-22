@@ -1,6 +1,6 @@
 # 霜镜
 
-霜镜是一套可私有部署的上游余额监控面板。它登录你拥有的 New API、Sub2API 或兼容站点账号，读取原始余额，通过四则运算公式转换为人民币，并在低余额时通过 Resend、飞书或 Telegram 告警。你手动充值后，系统默认连续两次检测到恢复会自动发送恢复通知并结单。
+霜镜是一套可私有部署的上游余额监控面板。它登录你拥有的 New API、Sub2API 或兼容站点账号，读取原始余额，通过四则运算公式转换为人民币，并在低余额时通过 Resend、飞书、Telegram 或企业微信告警。你手动充值后，系统默认连续两次检测到恢复会自动发送恢复通知并结单。
 
 ![上游余额监控面板总览](docs/images/01-dashboard.png)
 
@@ -80,13 +80,16 @@ Sub2API 提供三种接入方式：直接填写 API Key、导入登录态 JSON�
 
 1. 配置 Resend 发件人、收件人和 API Key，然后单独测试邮件链路。
 2. 配置飞书群机器人 Webhook，然后单独测试飞书链路。
-2. 配置 Telegram Bot Token 和 Chat ID（个人数字 ID、`-100` 群组 ID 或 `@频道名`），然后单独测试 Telegram 链路。
-3. 保存恢复确认次数和未恢复重复提醒周期；恢复次数默认连续 2 次，可选 1/2/3 次或自定义 `1–100` 次，余额回落或检测失败会重新计数；提醒周期可选常用小时值，也可自定义 `1–10080` 分钟。
-4. 余额低于阈值时系统自动建单；手动充值后，连续检测达到恢复阈值便发送恢复通知并结单。
+3. 配置 Telegram Bot Token 和 Chat ID（个人数字 ID、`-100` 群组 ID 或 `@频道名`），然后单独测试 Telegram 链路。
+4. 配置企业微信机器人 Webhook（`qyapi.weixin.qq.com`），然后单独测试企业微信链路。
+5. 保存恢复确认次数和未恢复重复提醒周期；恢复次数默认连续 2 次，可选 1/2/3 次或自定义 `1–100` 次，余额回落或检测失败会重新计数；提醒周期可选常用小时值，也可自定义 `1–10080` 分钟。
+6. 可选开启「余额耗尽预警」：系统按近期消耗速率估算跌破阈值的天数，进入预警天数后每天最多提醒一次；余额低于阈值时系统自动建单；手动充值后，连续检测达到恢复阈值便发送恢复通知并结单。
 
 ![配置 Resend、飞书与自动结单](docs/images/05-notifications.png)
 
-Resend、飞书和 Telegram 独立记录结果：一个渠道失败不会覆盖其他渠道的成功状态。
+Resend、飞书、Telegram 和企业微信独立记录结果：一个渠道失败不会覆盖其他渠道的成功状态。每个账号的高级编辑里还可以单独关闭某个渠道；账号行会显示预计耗尽天数，访问令牌临近或已经过期时也会标记提醒。
+
+处理事件时可在告警历史里点「记录充值」登记充值金额；系统会把记录时的余额作为基准，余额回升达到申报金额即标记「已核对」，但事件仍要等连续恢复确认才结单。
 
 ## 核心能力
 
@@ -94,8 +97,10 @@ Resend、飞书和 Telegram 独立记录结果：一个渠道失败不会覆盖�
 - Sub2API：优先支持用户生成的 `sk-` API Key，通过 `/v1/usage` 免登录读取钱包、订阅或密钥剩余额度，并通过 `/v1/sub2api/billing` 读取该 Key 的当前有效倍率；同时保留 Access Token、Refresh Token 和密码登录链路。
 - 自定义站点：可以配置用户接口路径和余额 JSON 字段。
 - 转换器：只允许变量 `x`、数字、括号和 `+ - * /`。
-- 告警闭环：低余额建单、通知去重、手动充值、连续恢复确认、自动结单。
-- 通知：Resend 邮件、飞书群机器人 Webhook、Telegram 机器人（Bot API `sendMessage`）。
+- 告警闭环：低余额建单、通知去重、手动充值（可登记充值记录并自动核对回升）、连续恢复确认、自动结单。
+- 通知：Resend 邮件、飞书群机器人 Webhook、Telegram 机器人（Bot API `sendMessage`）、企业微信群机器人 Webhook；支持全局开关与账号级开关。
+- 余额预测：按近 14 天快照估算日均消耗速率，账号和上游行显示预计耗尽天数，可配置提前 N 天通过已启用渠道预警。
+- 凭据预警：访问令牌临近过期（3 天内）或已过期时在账号行与详情中标记提醒。
 - 安全：首次自定义管理员用户名、bcrypt 强密码、Cloudflare Turnstile、TOTP 两步验证、一次性恢复码；上游凭据继续使用 AES-256-GCM 加密。
 
 ## 本地运行
@@ -147,7 +152,7 @@ Caddy 会自动申请和续期 HTTPS 证书。脚本成功后访问 `https://pan
 1. 使用引导令牌初始化管理员，登录后在“系统设置 → 账户安全”启用 TOTP 并保存恢复码。
 2. 在“上游”中新建站点并选择直连或固定代理策略。
 3. 在对应上游下新增账号，优先使用 API Key/Access Token；需要网页验证时点击“打开内置浏览器登录”。
-4. 按需在“系统设置”配置 Clash 订阅、Resend、飞书和面板 Turnstile。
+4. 按需在“系统设置”配置 Clash 订阅、Resend、飞书、Telegram、企业微信和面板 Turnstile。
 
 普通部署只需填写域名和首次管理员信息。以下配置仅在对应功能启用时修改 `.env`：
 
@@ -160,7 +165,7 @@ Caddy 会自动申请和续期 HTTPS 证书。脚本成功后访问 `https://pan
 | `UPSTREAM_BROWSER_MAX_ACTIVE` | 调整人工有头浏览器并发 | 默认 `2`，按内存容量增加 |
 | `APP_MEMORY_LIMIT`、`MIHOMO_MEMORY_LIMIT` | 2 核 4G 小型服务器 | 分别使用 `2560m`、`256m` |
 | `APP_PIDS_LIMIT` | 8 核 16G 且需要 3 个以上浏览器 | 提高到 `1024`，同时观察内存与负载 |
-| Resend、飞书、Clash 订阅 | 启用通知或代理池 | 登录后直接在页面配置 |
+| Resend、飞书、Telegram、企业微信、Clash 订阅 | 启用通知或代理池 | 登录后直接在页面配置 |
 
 不要手动修改已经投入使用的 `MASTER_KEY`。需要轮换时使用文末的密钥轮换脚本。
 
@@ -234,7 +239,7 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 
 运行镜像与项目的 Playwright `1.61.1` 版本严格匹配，内置 Chromium、Xvfb、Openbox、x11vnc 和 noVNC。浏览器始终运行在虚拟显示器中，不使用无头模式；点击“打开内置浏览器登录”或“进入上游”时，域名部署会自动打开同域名下的远程桌面。远程桌面由霜镜登录会话保护，不单独暴露公网 VNC 端口。入口只以 root 修正数据卷和虚拟桌面权限，随后应用、桌面和浏览器全部降权到 `pwuser`；Compose 同时加载 Playwright 官方同版本的 seccomp profile，以支持非 root Chromium sandbox。
 
-数据保存在 Docker 卷 `frosted-data` 中，Caddy 证书保存在 `frosted-caddy-data` 中。服务器需允许访问上游域名、`challenges.cloudflare.com`，以及你启用的 Resend/飞书/`api.telegram.org`/第三方解题服务。账号凭据锁目前是单进程锁，不要为同一数据卷同时启动多个应用副本。
+数据保存在 Docker 卷 `frosted-data` 中，Caddy 证书保存在 `frosted-caddy-data` 中。服务器需允许访问上游域名、`challenges.cloudflare.com`，以及你启用的 Resend/飞书/`api.telegram.org`/`qyapi.weixin.qq.com`/第三方解题服务。账号凭据锁目前是单进程锁，不要为同一数据卷同时启动多个应用副本。
 
 ### 浏览器会话数据
 

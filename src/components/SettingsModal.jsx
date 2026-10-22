@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { CheckCircle, EnvelopeSimple, Flask, GlobeHemisphereWest, PaperPlaneTilt, ShieldCheck, SpinnerGap, TelegramLogo, WarningCircle } from '@phosphor-icons/react';
+import { CheckCircle, EnvelopeSimple, Flask, GlobeHemisphereWest, PaperPlaneTilt, ShieldCheck, SpinnerGap, TelegramLogo, WarningCircle, WechatLogo } from '@phosphor-icons/react';
 import { api } from '../api.js';
 import { notificationText, notificationTone } from '../notification-state.js';
 import { Modal } from './Modal.jsx';
@@ -11,6 +11,7 @@ const DEFAULT_REMINDER_MINUTES = 360;
 const REMINDER_PRESETS = [180, 360, 720, 1440];
 const DEFAULT_RECOVERY_CONFIRMATIONS = 2;
 const RECOVERY_PRESETS = [1, 2, 3];
+const DEPLETION_PRESETS = [0, 3, 7, 14];
 
 function readiness(channel, form) {
   if (channel === 'resend') {
@@ -25,11 +26,15 @@ function readiness(channel, form) {
     const ready = Boolean(form.feishuWebhook || form.hasFeishuWebhook);
     return { ready, missing: ready ? [] : ['Webhook'] };
   }
-  const missing = [
-    !(form.telegramBotToken || form.hasTelegramBotToken) && 'Bot Token',
-    !form.telegramChatId?.trim() && 'Chat ID',
-  ].filter(Boolean);
-  return { ready: missing.length === 0, missing };
+  if (channel === 'telegram') {
+    const missing = [
+      !(form.telegramBotToken || form.hasTelegramBotToken) && 'Bot Token',
+      !form.telegramChatId?.trim() && 'Chat ID',
+    ].filter(Boolean);
+    return { ready: missing.length === 0, missing };
+  }
+  const ready = Boolean(form.wecomWebhook || form.hasWecomWebhook);
+  return { ready, missing: ready ? [] : ['Webhook'] };
 }
 
 function ChannelState({ enabled, ready, missing }) {
@@ -59,17 +64,20 @@ export function SettingsModal({ open, onboarding = false, settings, proxyPool, i
   const [customReminderMinutes, setCustomReminderMinutes] = useState(DEFAULT_REMINDER_MINUTES);
   const [recoveryMode, setRecoveryMode] = useState(String(DEFAULT_RECOVERY_CONFIRMATIONS));
   const [customRecoveryConfirmations, setCustomRecoveryConfirmations] = useState(DEFAULT_RECOVERY_CONFIRMATIONS);
+  const [depletionMode, setDepletionMode] = useState('0');
   const wasOpen = useRef(false);
 
   useEffect(() => {
     if (open && !wasOpen.current) {
       const reminderMinutes = Number(settings?.reminderMinutes) || DEFAULT_REMINDER_MINUTES;
       const recoveryConfirmations = Number(settings?.recoveryConfirmations) || DEFAULT_RECOVERY_CONFIRMATIONS;
-      setForm({ ...settings, reminderMinutes, recoveryConfirmations, resendApiKey: '', feishuWebhook: '', telegramBotToken: '' });
+      setForm({ ...settings, reminderMinutes, recoveryConfirmations, resendApiKey: '', feishuWebhook: '', telegramBotToken: '', wecomWebhook: '' });
       setReminderMode(REMINDER_PRESETS.includes(reminderMinutes) ? String(reminderMinutes) : 'custom');
       setCustomReminderMinutes(reminderMinutes);
       setRecoveryMode(RECOVERY_PRESETS.includes(recoveryConfirmations) ? String(recoveryConfirmations) : 'custom');
       setCustomRecoveryConfirmations(recoveryConfirmations);
+      const depletionAlertDays = Number(settings?.depletionAlertDays) || 0;
+      setDepletionMode(DEPLETION_PRESETS.includes(depletionAlertDays) ? String(depletionAlertDays) : 'custom');
       setTests({});
     }
     wasOpen.current = open;
@@ -82,6 +90,7 @@ export function SettingsModal({ open, onboarding = false, settings, proxyPool, i
   const resendState = useMemo(() => readiness('resend', form), [form]);
   const feishuState = useMemo(() => readiness('feishu', form), [form]);
   const telegramState = useMemo(() => readiness('telegram', form), [form]);
+  const wecomState = useMemo(() => readiness('wecom', form), [form]);
   const proxyNeedsAttention = Boolean(proxyPool?.subscription?.lastError)
     || Boolean(proxyPool?.subscription?.configured && !proxyPool?.summary?.available);
   const proxyReady = Boolean(proxyPool?.subscription?.configured && proxyPool?.summary?.available > 0 && !proxyPool?.subscription?.lastError);
@@ -109,6 +118,10 @@ export function SettingsModal({ open, onboarding = false, settings, proxyPool, i
     const confirmations = value === '' ? '' : Number(value);
     setCustomRecoveryConfirmations(confirmations);
     set('recoveryConfirmations', confirmations);
+  };
+  const changeDepletionMode = (value) => {
+    setDepletionMode(value);
+    set('depletionAlertDays', value === 'custom' ? Math.min(90, Math.max(1, Number(form.depletionAlertDays) || 7)) : Number(value));
   };
 
   const save = async (event) => {
@@ -180,6 +193,17 @@ export function SettingsModal({ open, onboarding = false, settings, proxyPool, i
           <TestResult result={tests.telegram} channel="telegram" />
         </section>
 
+        <section className="notification-section">
+          <header>
+            <WechatLogo size={21} />
+            <div><h3>企业微信机器人链路</h3><p>群机器人 Markdown 消息推送到企业微信群。</p></div>
+            <div className="channel-header-actions"><ChannelState enabled={form.wecomEnabled} {...wecomState} /><label className="switch"><input aria-label="启用企业微信通知" type="checkbox" checked={Boolean(form.wecomEnabled)} onChange={(event) => set('wecomEnabled', event.target.checked)} /><span /></label></div>
+          </header>
+          <label><span>群机器人 Webhook</span><input type="password" value={form.wecomWebhook || ''} onChange={(event) => set('wecomWebhook', event.target.value)} placeholder={form.hasWecomWebhook ? '已配置，留空保持不变' : 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...'} /></label>
+          <div className="channel-test-row"><span>测试使用当前输入，不会自动保存。</span><button type="button" className="secondary-button" onClick={() => test('wecom')} disabled={Boolean(busy)}>{busy === 'wecom' ? <SpinnerGap className="spin" /> : <Flask size={15} />} 测试企业微信</button></div>
+          <TestResult result={tests.wecom} channel="wecom" />
+        </section>
+
         <section className="notification-section compact">
           <header><CheckCircle size={21} /><div><h3>提醒与恢复闭环</h3><p id="recovery-confirmations-help">余额连续达到恢复阈值指定次数后才结单；余额回落或检测失败会重新计数。</p></div></header>
           <div className="form-grid two">
@@ -196,6 +220,19 @@ export function SettingsModal({ open, onboarding = false, settings, proxyPool, i
               </div>
             </div>
             <div className="reminder-field"><span className="field-label">未恢复重复提醒</span><div className={`reminder-interval-control ${reminderMode === 'custom' ? 'custom' : ''}`}><select aria-label="未恢复重复提醒周期" value={reminderMode} onChange={(event) => changeReminderMode(event.target.value)}><option value="180">每 3 小时</option><option value="360">每 6 小时</option><option value="720">每 12 小时</option><option value="1440">每 24 小时</option><option value="custom">自定义分钟</option></select>{reminderMode === 'custom' && <div className="reminder-custom-input"><input aria-label="自定义提醒周期，单位分钟，范围 1 到 10080" type="number" min="1" max="10080" step="1" required value={form.reminderMinutes ?? ''} onChange={(event) => changeCustomReminder(event.target.value)} /><span aria-hidden="true">分钟</span></div>}</div></div>
+            <div className="reminder-field">
+              <span className="field-label">余额耗尽预警</span>
+              <div className={`reminder-interval-control ${depletionMode === 'custom' ? 'custom' : ''}`}>
+                <select aria-label="余额耗尽预警天数" value={depletionMode} onChange={(event) => changeDepletionMode(event.target.value)}>
+                  <option value="0">关闭</option>
+                  <option value="3">预计 3 天内耗尽时提醒</option>
+                  <option value="7">预计 7 天内耗尽时提醒</option>
+                  <option value="14">预计 14 天内耗尽时提醒</option>
+                  <option value="custom">自定义天数</option>
+                </select>
+                {depletionMode === 'custom' && <div className="reminder-custom-input"><input aria-label="自定义耗尽预警天数，范围 1 到 90" type="number" min="1" max="90" step="1" required value={form.depletionAlertDays ?? ''} onChange={(event) => set('depletionAlertDays', Math.min(90, Math.max(1, Number(event.target.value) || 1)))} /><span aria-hidden="true">天</span></div>}
+              </div>
+            </div>
           </div>
           <div className="closure-flow"><span>低于阈值</span><i>→</i><span>已启用渠道提醒</span><i>→</i><span>手动充值</span><i>→</i><span>连续检测恢复</span><i>→</i><span>恢复通知并结单</span></div>
         </section>

@@ -1,9 +1,9 @@
 import { useMemo, useState } from 'react';
-import { BellRinging, CheckCircle, EnvelopeSimple, Link, ShieldCheck, TelegramLogo, Wallet, PaperPlaneTilt } from '@phosphor-icons/react';
+import { BellRinging, CheckCircle, EnvelopeSimple, Link, ShieldCheck, TelegramLogo, Wallet, WechatLogo, PaperPlaneTilt } from '@phosphor-icons/react';
 import { duration, money, relativeTime } from '../lib.js';
 import { CHANNEL_NAMES, notificationResult, notificationStatus, notificationText, notificationTone } from '../notification-state.js';
 
-const CHANNELS = [['resend', EnvelopeSimple], ['feishu', PaperPlaneTilt], ['telegram', TelegramLogo]];
+const CHANNELS = [['resend', EnvelopeSimple], ['feishu', PaperPlaneTilt], ['telegram', TelegramLogo], ['wecom', WechatLogo]];
 
 const steps = [
   { id: 'trigger', icon: BellRinging, title: '低余额事件建立', tone: 'warning' },
@@ -44,8 +44,10 @@ function reminderIntervalLabel(settings) {
   return minutes % 60 === 0 ? `每 ${minutes / 60} 小时` : `每 ${minutes} 分钟`;
 }
 
-export function Inspector({ account, incidents, settings, onOpenIncidents }) {
+export function Inspector({ account, incidents, settings, onOpenIncidents, onRecordRecharge }) {
   const [tab, setTab] = useState('connection');
+  const [rechargeAmount, setRechargeAmount] = useState('');
+  const [rechargeBusy, setRechargeBusy] = useState(false);
   const incident = useMemo(() => {
     const matching = incidents.filter((item) => item.accountId === account?.id);
     return matching.find((item) => item.state === 'open') || matching[0];
@@ -95,6 +97,8 @@ export function Inspector({ account, incidents, settings, onOpenIncidents }) {
             <div className="token-status-row"><span>读取范围</span><strong>{balanceScope}</strong></div>
             <div className="token-status-row"><span>鉴权来源</span><strong>{account.metadata?.authSource || (account.hasApiToken ? 'api_key' : account.hasAccessToken ? 'user_access_token' : account.hasPassword ? 'password' : '—')}</strong></div>
             <div className="token-status-row"><span>凭据</span><strong>{credentialSummary}</strong></div>
+            {account.credentialExpired && <div className="token-status-row"><span>凭据到期</span><strong className="row-flag expired">已过期{account.credentialExpiresAt ? `（${relativeTime(account.credentialExpiresAt)}）` : ''}</strong></div>}
+            {!account.credentialExpired && account.credentialExpiringSoon && <div className="token-status-row"><span>凭据到期</span><strong className="row-flag expiring">将于 {relativeTime(account.credentialExpiresAt)}到期</strong></div>}
             {account.authMode === 'api_token' && <div className="token-status-row"><span>当前倍率</span><strong>{rateMultiplierLabel(account.metadata)}</strong></div>}
             {account.authMode === 'api_token' && account.metadata?.tokenGroup && <div className="token-status-row"><span>API Key 分组</span><strong>{account.metadata.tokenGroup}</strong></div>}
             {account.type === 'newapi' && account.authMode === 'api_token' && <>
@@ -115,7 +119,26 @@ export function Inspector({ account, incidents, settings, onOpenIncidents }) {
             return <div className={`timeline-step ${complete ? 'complete' : ''}`} key={step.id}><div className={`timeline-icon ${complete ? step.tone : ''}`}><Icon size={17} weight={complete ? 'fill' : 'regular'} /></div><div className="timeline-copy"><div><strong>{step.title}</strong>{step.id === 'closed' && incident.state === 'resolved' && <em>已结单</em>}</div>
               {step.id === 'trigger' && <p>当前 {money(incident.currentBalance)}，告警阈值 {money(account.thresholdLow)}</p>}
               {step.id === 'opened' && <div className="notification-lines">{CHANNELS.map(([channel, Icon]) => <ResultLine key={channel} incident={incident} kind="opened" channel={channel} Icon={Icon} />)}{incident.notifications?.reminders?.length > 0 && <small>已重复提醒 {incident.notifications.reminders.length} 次，最近 {relativeTime(incident.lastReminderAt)}</small>}</div>}
-              {step.id === 'recharge' && <p>{incident.state === 'resolved' || incident.recoveryChecks > 0 ? `检测到余额回升至 ${money(incident.currentBalance)}` : '等待你在上游完成充值；系统会按采集频率自动复查'}</p>}
+              {step.id === 'recharge' && <>
+                <p>{incident.state === 'resolved' || incident.recoveryChecks > 0 ? `检测到余额回升至 ${money(incident.currentBalance)}` : '等待你在上游完成充值；系统会按采集频率自动复查'}</p>
+                {incident.state === 'open' && onRecordRecharge && <form className="recharge-form" onSubmit={async (event) => {
+                  event.preventDefault();
+                  const amount = Number(rechargeAmount);
+                  if (!Number.isFinite(amount) || amount <= 0 || rechargeBusy) return;
+                  setRechargeBusy(true);
+                  try { await onRecordRecharge(incident.id, amount); setRechargeAmount(''); } finally { setRechargeBusy(false); }
+                }}>
+                  <input type="number" min="0.01" step="0.01" placeholder="充值金额 ¥" value={rechargeAmount} onChange={(event) => setRechargeAmount(event.target.value)} />
+                  <button className="secondary-button compact" type="submit" disabled={rechargeBusy}>{rechargeBusy ? '记录中…' : '记录充值'}</button>
+                </form>}
+                {incident.recharges?.length > 0 && <ul className="recharge-list">{incident.recharges.map((item) => (
+                  <li key={item.id} className={item.verifiedAt ? 'verified' : 'pending'}>
+                    {item.verifiedAt ? <CheckCircle size={13} weight="fill" /> : <Wallet size={13} />}
+                    <span>{money(item.amount)} · {relativeTime(item.at)}</span>
+                    <em>{item.verifiedAt ? `已核对 ${money(item.verifiedBalance)}` : '等待余额回升核对'}</em>
+                  </li>
+                ))}</ul>}
+              </>}
               {step.id === 'recover' && <p>恢复确认 {incident.recoveryChecks || 0}/{settings.recoveryConfirmations || 2}，达到 {money(account.thresholdRecover)} 才累计</p>}
               {step.id === 'recovered' && <div className="notification-lines">{CHANNELS.map(([channel, Icon]) => <ResultLine key={channel} incident={incident} kind="recovered" channel={channel} Icon={Icon} />)}</div>}
               {step.id === 'closed' && <p>{incident.resolvedAt ? `自动结单于 ${relativeTime(incident.resolvedAt)}` : '恢复确认完成后自动执行，无需手工结单'}</p>}
@@ -127,7 +150,7 @@ export function Inspector({ account, incidents, settings, onOpenIncidents }) {
 
       {tab === 'conversion' && account && <div className="inspector-content inspector-detail"><h2>转换详情</h2><dl><div><dt>原始字段</dt><dd>{account.balancePath}</dd></div><div><dt>原始单位</dt><dd>{account.rawUnit}</dd></div><div><dt>原始余额</dt><dd>{account.rawBalance}</dd></div><div><dt>转换公式</dt><dd><code>{account.formula}</code></dd></div><div className="strong"><dt>人民币余额</dt><dd>{money(account.convertedCny)}</dd></div></dl><div className="formula-rule"><CheckCircle size={18} weight="fill" /><p>公式仅允许变量 x、数字、括号和四则运算。</p></div></div>}
 
-      {tab === 'alert' && account && <div className="inspector-content inspector-detail"><h2>通知链路</h2><dl><div><dt>低余额阈值</dt><dd>{money(account.thresholdLow)}</dd></div><div><dt>恢复阈值</dt><dd>{money(account.thresholdRecover)}</dd></div><div><dt>恢复确认</dt><dd>连续 {settings.recoveryConfirmations || 2} 次</dd></div><div><dt>重复提醒</dt><dd>{reminderIntervalLabel(settings)}</dd></div></dl><div className="channel-list">{[['resend', EnvelopeSimple, 'Resend 邮件'], ['feishu', PaperPlaneTilt, '飞书机器人'], ['telegram', TelegramLogo, 'Telegram 机器人']].map(([channel, Icon, label]) => { const state = channelReadiness(account, settings, channel); return <div key={channel}><Icon size={18} /><span>{label}</span><b className={state.tone}>{state.label}</b></div>; })}</div><p className="channel-scope-note">渠道需要同时满足“全局启用、凭据完整、该账号启用”才会发送。</p></div>}
+      {tab === 'alert' && account && <div className="inspector-content inspector-detail"><h2>通知链路</h2><dl><div><dt>低余额阈值</dt><dd>{money(account.thresholdLow)}</dd></div><div><dt>恢复阈值</dt><dd>{money(account.thresholdRecover)}</dd></div><div><dt>恢复确认</dt><dd>连续 {settings.recoveryConfirmations || 2} 次</dd></div><div><dt>重复提醒</dt><dd>{reminderIntervalLabel(settings)}</dd></div></dl><div className="channel-list">{[['resend', EnvelopeSimple, 'Resend 邮件'], ['feishu', PaperPlaneTilt, '飞书机器人'], ['telegram', TelegramLogo, 'Telegram 机器人'], ['wecom', WechatLogo, '企业微信机器人']].map(([channel, Icon, label]) => { const state = channelReadiness(account, settings, channel); return <div key={channel}><Icon size={18} /><span>{label}</span><b className={state.tone}>{state.label}</b></div>; })}</div><p className="channel-scope-note">渠道需要同时满足“全局启用、凭据完整、该账号启用”才会发送。</p></div>}
       <button className="inspector-history" onClick={onOpenIncidents}><Link size={16} /> 查看事件记录</button>
     </aside>
   );

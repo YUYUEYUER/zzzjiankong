@@ -16,6 +16,7 @@ const settings = {
   feishuEnabled: true,
   telegramEnabled: true,
   telegramChatId: '-1001234567890',
+  wecomEnabled: true,
 };
 const secrets = {
   resendApiKey: 're_test',
@@ -153,6 +154,108 @@ test('Telegram missing secrets report missing_config without calling providers',
     assert.equal(results.telegram.status, 'missing_config');
     assert.match(results.telegram.message, /Bot Token/);
     assert.match(results.telegram.message, /Chat ID/);
+    assert.equal(calls, 0);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('WeCom posts markdown to the official webhook and reports errcode failures', async () => {
+  const originalFetch = global.fetch;
+  let seen;
+  global.fetch = async (url, options) => {
+    assert.equal(options.redirect, 'error');
+    seen = { url: String(url), payload: JSON.parse(options.body) };
+    return new Response(JSON.stringify({ errcode: 0, errmsg: 'ok' }), { status: 200 });
+  };
+  try {
+    const results = await notify('opened', account, incident, settings,
+      { wecomWebhook: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc-123' }, { channels: ['wecom'] });
+    assert.equal(results.wecom.status, 'sent');
+    assert.equal(results.wecom.message, '企业微信机器人已确认');
+    assert.match(seen.url, /^https:\/\/qyapi\.weixin\.qq\.com\//);
+    assert.equal(seen.payload.msgtype, 'markdown');
+    assert.match(seen.payload.markdown.content, /NewCLI \/ 生产账号/);
+
+    global.fetch = async () => new Response(JSON.stringify({ errcode: 93000, errmsg: 'invalid webhook' }), { status: 200 });
+    const failed = await notify('opened', account, incident, settings,
+      { wecomWebhook: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc-123' }, { channels: ['wecom'] });
+    assert.equal(failed.wecom.status, 'failed');
+    assert.equal(failed.wecom.code, 'provider_rejected');
+    assert.match(failed.wecom.message, /invalid webhook/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('WeCom rejects non-official or non-HTTPS webhook hosts before any network call', async () => {
+  const originalFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => { calls += 1; throw new Error('should not run'); };
+  try {
+    for (const webhook of [
+      'http://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=x',
+      'https://evil.example.com/cgi-bin/webhook/send?key=x',
+      'not-a-url',
+    ]) {
+      const results = await notify('opened', account, incident, settings,
+        { wecomWebhook: webhook }, { channels: ['wecom'], force: true });
+      assert.equal(results.wecom.status, 'failed');
+      assert.equal(results.wecom.code, 'invalid_config');
+    }
+    const missing = await notify('opened', account, incident, settings,
+      { wecomWebhook: '' }, { channels: ['wecom'] });
+    assert.equal(missing.wecom.status, 'missing_config');
+    assert.equal(calls, 0);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('webhook URLs containing userinfo are rejected before any network call', async () => {
+  const originalFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => { calls += 1; throw new Error('should not run'); };
+  try {
+    const feishu = await notify('opened', account, incident, settings,
+      { feishuWebhook: 'https://attacker:secret@open.feishu.cn/open-apis/bot/v2/hook/x' }, { channels: ['feishu'], force: true });
+    assert.equal(feishu.feishu.status, 'failed');
+    assert.equal(feishu.feishu.code, 'invalid_config');
+    const wecom = await notify('opened', account, incident, settings,
+      { wecomWebhook: 'https://attacker:secret@qyapi.weixin.qq.com/cgi-bin/webhook/send?key=x' }, { channels: ['wecom'], force: true });
+    assert.equal(wecom.wecom.status, 'failed');
+    assert.equal(wecom.wecom.code, 'invalid_config');
+    assert.equal(calls, 0);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('WeCom treats 429 and 5xx as retryable', async () => {
+  const originalFetch = global.fetch;
+  try {
+    global.fetch = async () => new Response(JSON.stringify({ errcode: 45009 }), { status: 429, headers: { 'retry-after': '5' } });
+    const rateLimited = await notify('opened', account, incident, settings,
+      { wecomWebhook: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc-123' }, { channels: ['wecom'] });
+    assert.equal(rateLimited.wecom.status, 'failed');
+    assert.equal(rateLimited.wecom.retryable, true);
+    assert.equal(rateLimited.wecom.retryAfterMs, 5000);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('demo accounts never send real notifications even when switches are on', async () => {
+  const originalFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => { calls += 1; throw new Error('should not run'); };
+  try {
+    const results = await notify('opened', { ...account, demo: true }, incident,
+      { ...settings, wecomEnabled: true }, { ...secrets, wecomWebhook: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=x' });
+    for (const channel of ['resend', 'feishu', 'telegram', 'wecom']) {
+      assert.equal(results[channel].status, 'disabled');
+      assert.match(results[channel].message, /演示账号/);
+    }
     assert.equal(calls, 0);
   } finally {
     global.fetch = originalFetch;

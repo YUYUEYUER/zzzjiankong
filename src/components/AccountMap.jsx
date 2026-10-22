@@ -1,5 +1,5 @@
-import { CaretDown, DotsThree, Globe, Plus, Stack } from '@phosphor-icons/react';
-import { money, statusLabels } from '../lib.js';
+import { CaretDown, DotsThree, Globe, Key, Plus, Stack, Timer } from '@phosphor-icons/react';
+import { money, relativeTime, statusLabels } from '../lib.js';
 
 function groupAccounts(accounts) {
   const platforms = new Map();
@@ -35,6 +35,8 @@ export function AccountMap({ accounts, selectedId, onSelect, onAdd }) {
                   <button key={account.id} className={`account-row ${selectedId === account.id ? 'selected' : ''}`} onClick={() => onSelect(account.id)}>
                     <i className={`status-dot ${account.status}`} title={statusLabels[account.status]} />
                     <span className="account-name">{account.name}</span>
+                    {account.credentialExpiringSoon && <Key size={13} className={`row-flag ${account.credentialExpired ? 'expired' : 'expiring'}`} weight="fill" title={account.credentialExpired ? `凭据已于 ${relativeTime(account.credentialExpiresAt)}过期` : `凭据将于 ${relativeTime(account.credentialExpiresAt)}到期`} />}
+                    {Number.isFinite(account.depletionEtaDays) && account.depletionEtaDays <= 14 && <em className="row-eta" title="按近期消耗速率预计跌破阈值天数"><Timer size={12} />{account.depletionEtaDays}天</em>}
                     <span className="account-money">{money(account.convertedCny)}</span>
                   </button>
                 ))}

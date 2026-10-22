@@ -21,6 +21,7 @@ export function aggregateUpstreams(upstreams, accounts, incidents) {
     const memberIds = new Set(members.map((account) => account.id));
     const relatedIncidents = incidents.filter((incident) => memberIds.has(incident.accountId));
     const lastSyncAt = members.map((account) => account.lastSyncAt).filter(Boolean).sort().at(-1) || null;
+    const etaValues = members.map((account) => Number(account.depletionEtaDays)).filter(Number.isFinite);
     return {
       ...upstream,
       accountCount: members.length,
@@ -29,6 +30,7 @@ export function aggregateUpstreams(upstreams, accounts, incidents) {
       totalCny: members.reduce((sum, account) => sum + Number(account.convertedCny || 0), 0),
       status: worstStatus(members),
       openIncidents: relatedIncidents.filter((incident) => incident.state === 'open').length,
+      minEtaDays: etaValues.length ? Math.min(...etaValues) : null,
       lastSyncAt,
       platforms: [...new Set(members.map((account) => account.type))],
       baseUrls: [...new Set(members.map((account) => account.baseUrl).filter(Boolean))],

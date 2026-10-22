@@ -37,6 +37,24 @@ function notificationCopy(kind, account, incident) {
       color: 'orange',
     };
   }
+  if (kind === 'credential_expiry') {
+    const expiryText = incident.credentialExpiresAt ? new Date(incident.credentialExpiresAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : '近期';
+    const expired = incident.credentialExpired;
+    return {
+      title: `凭据${expired ? '已过期' : '即将到期'}：${subject}`,
+      summary: `${subject} 的访问令牌${expired ? '已于' : '将于'} ${expiryText} ${expired ? '过期' : '到期'}。余额采集可能随时失败，请尽快在账号设置中更新凭据。`,
+      color: expired ? 'red' : 'orange',
+    };
+  }
+  if (kind === 'prediction') {
+    const eta = Number.isFinite(Number(incident.depletionEtaDays)) ? `${incident.depletionEtaDays} 天` : '数天';
+    const burn = formatMoney(incident.dailyBurnRate || 0);
+    return {
+      title: `余额预计耗尽：${subject}`,
+      summary: `${subject} 当前人民币余额 ${formatMoney(incident.currentBalance)}，按近期消耗速率约 ${burn}/天，预计 ${eta} 内跌破告警阈值 ${formatMoney(account.thresholdLow)}。建议提前充值。`,
+      color: 'orange',
+    };
+  }
   return {
     title: `低余额：${subject}`,
     summary: `${subject} 当前人民币余额 ${formatMoney(incident.currentBalance)}，低于告警阈值 ${formatMoney(account.thresholdLow)}。请手动充值。`,
@@ -64,6 +82,9 @@ async function responseBody(response) {
 }
 
 function configResult(channel, account, settings, secrets, force) {
+  if (!force && account.demo) {
+    return { status: 'disabled', message: '演示账号不发送真实通知' };
+  }
   if (!force && !settings[`${channel}Enabled`]) {
     return { status: 'disabled', message: '全局未启用' };
   }
@@ -79,6 +100,9 @@ function configResult(channel, account, settings, secrets, force) {
     if (missing.length) return { status: 'missing_config', message: `缺少${missing.join('、')}` };
   }
   if (channel === 'feishu' && !secrets.feishuWebhook) {
+    return { status: 'missing_config', message: '缺少 Webhook 地址' };
+  }
+  if (channel === 'wecom' && !secrets.wecomWebhook) {
     return { status: 'missing_config', message: '缺少 Webhook 地址' };
   }
   if (channel === 'telegram') {
@@ -136,6 +160,7 @@ async function sendFeishu(settings, secrets, copy) {
     throw new ChannelError('invalid_config', 'Webhook 地址格式无效');
   }
   if (webhook.protocol !== 'https:') throw new ChannelError('invalid_config', 'Webhook 必须使用 HTTPS');
+  if (webhook.username || webhook.password) throw new ChannelError('invalid_config', 'Webhook 地址不能包含用户名或密码');
 
   const response = await fetch(webhook, {
     method: 'POST',
@@ -204,7 +229,44 @@ async function sendTelegram(settings, secrets, copy) {
   return { externalId: String(body.result?.message_id ?? ''), message: 'Telegram 已送达' };
 }
 
-const senders = { resend: sendResend, feishu: sendFeishu, telegram: sendTelegram };
+/** 企业微信机器人 webhook 必须指向官方域名；地址内含 key，收紧域名可防止手滑把凭据发往他站。 */
+const WECOM_WEBHOOK_HOST = 'qyapi.weixin.qq.com';
+
+async function sendWecom(settings, secrets, copy) {
+  let webhook;
+  try {
+    webhook = new URL(secrets.wecomWebhook);
+  } catch {
+    throw new ChannelError('invalid_config', 'Webhook 地址格式无效');
+  }
+  if (webhook.protocol !== 'https:' || webhook.hostname !== WECOM_WEBHOOK_HOST) {
+    throw new ChannelError('invalid_config', `Webhook 必须是 https://${WECOM_WEBHOOK_HOST}/cgi-bin/webhook/send?key=... 地址`);
+  }
+  if (webhook.username || webhook.password) throw new ChannelError('invalid_config', 'Webhook 地址不能包含用户名或密码');
+  const response = await fetch(webhook, {
+    method: 'POST',
+    redirect: 'error',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      msgtype: 'markdown',
+      markdown: { content: `**${copy.title}**\n> ${copy.summary}` },
+    }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  const body = await responseBody(response);
+  if (!response.ok || Number(body.errcode) !== 0) {
+    throw new ChannelError('provider_rejected', redactCredentialText(
+      `企业微信拒绝请求 (${body.errcode ?? response.status})：${concise(body.errmsg, '未提供原因')}`,
+      [webhook.href],
+    ), {
+      retryable: response.status === 429 || response.status >= 500,
+      retryAfterMs: retryAfterMs(response),
+    });
+  }
+  return { message: '企业微信机器人已确认' };
+}
+
+const senders = { resend: sendResend, feishu: sendFeishu, telegram: sendTelegram, wecom: sendWecom };
 
 async function runChannel(channel, account, settings, secrets, copy, force, options) {
   const startedAt = new Date().toISOString();
@@ -236,7 +298,7 @@ async function runChannel(channel, account, settings, secrets, copy, force, opti
 
 export async function notify(kind, account, incident, settings, secrets, options = {}) {
   const copy = notificationCopy(kind, account, incident);
-  const channels = options.channels || ['resend', 'feishu', 'telegram'];
+  const channels = options.channels || ['resend', 'feishu', 'telegram', 'wecom'];
   const entries = await Promise.all(channels.map(async (channel) => [
     channel,
     await runChannel(channel, account, settings, secrets, copy, Boolean(options.force), {

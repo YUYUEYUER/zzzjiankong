@@ -54,6 +54,7 @@ export const api = {
   simulateRecharge: (id) => request(`/api/accounts/${id}/simulate-recharge`, { method: 'POST' }),
   testFormula: (rawValue, formula) => request('/api/formulas/test', { method: 'POST', body: JSON.stringify({ rawValue, formula }) }),
   acknowledge: (id) => request(`/api/incidents/${id}/acknowledge`, { method: 'POST' }),
+  recordRecharge: (id, amount) => request(`/api/incidents/${id}/recharge`, { method: 'POST', body: JSON.stringify({ amount }) }),
   saveSettings: (payload) => request('/api/settings', { method: 'PUT', body: JSON.stringify(payload) }),
   testNotification: (channel, settings) => request('/api/settings/test-notification', { method: 'POST', body: JSON.stringify({ channel, settings }) }),
 };

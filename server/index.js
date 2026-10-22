@@ -9,7 +9,7 @@ import { z } from 'zod';
 import { config } from './config.js';
 import { JsonStore } from './store.js';
 import { Monitor } from './monitor.js';
-import { collectApiKeyDetails, collectBalance, mergeSecrets } from './collectors.js';
+import { collectApiKeyDetails, collectBalance, credentialExpiryMs, mergeSecrets, tokenTiming } from './collectors.js';
 import { takeCredentialCheckpoint } from './credential-checkpoint.js';
 import { evaluateFormula, normalizeFormula } from './converter.js';
 import {
@@ -243,7 +243,7 @@ const accountSchema = z.object({
   thresholdRecover: z.coerce.number().min(0).max(1e12),
   pollIntervalMinutes: z.coerce.number().int().min(1).max(1440).default(5),
   enabled: z.boolean().default(true),
-  notifications: z.object({ resend: z.boolean().default(true), feishu: z.boolean().default(true), telegram: z.boolean().default(true) }).default({ resend: true, feishu: true, telegram: true }),
+  notifications: z.object({ resend: z.boolean().default(true), feishu: z.boolean().default(true), telegram: z.boolean().default(true), wecom: z.boolean().default(true) }).default({ resend: true, feishu: true, telegram: true, wecom: true }),
   browserLoginId: z.string().uuid().optional(),
   credentials: accountCredentialsSchema.optional(),
 }).refine((value) => value.thresholdRecover >= value.thresholdLow, {
@@ -316,6 +316,9 @@ const settingsSchema = z.object({
   telegramEnabled: z.boolean(),
   telegramChatId: z.string().max(64),
   telegramBotToken: z.string().optional(),
+  wecomEnabled: z.boolean(),
+  wecomWebhook: z.string().optional(),
+  depletionAlertDays: z.coerce.number().int().min(0).max(90),
   recoveryConfirmations: z.coerce.number().int().min(1).max(100),
   reminderMinutes: z.coerce.number().int().min(1).max(10080).optional(),
   reminderHours: z.coerce.number().int().min(1).max(168).optional(),
@@ -327,7 +330,7 @@ const saveSettingsSchema = settingsSchema.refine(
 );
 
 const notificationTestSchema = z.object({
-  channel: z.enum(['resend', 'feishu', 'telegram']),
+  channel: z.enum(['resend', 'feishu', 'telegram', 'wecom']),
   settings: settingsSchema.partial().optional().default({}),
 });
 
@@ -363,8 +366,9 @@ function sanitizeAccount(account) {
   let apiTokenCount = 0;
   let hasCfAccess = false;
   let hasBrowserSession = false;
+  let secret = {};
   try {
-    const secret = decryptSecret(encryptedSecret);
+    secret = decryptSecret(encryptedSecret);
     hasAccessToken = Boolean(secret.accessToken);
     accessTokenCount = Math.max(Number(hasAccessToken), Array.isArray(secret.accessTokens) ? secret.accessTokens.filter(Boolean).length : 0);
     hasAccessToken = accessTokenCount > 0;
@@ -378,8 +382,20 @@ function sanitizeAccount(account) {
   } catch {
     // 密钥不匹配时仍返回账号，但不暴露凭据细节
   }
+  // 凭据到期透出：优先采用上游学习到的过期时间，其次取存储令牌中最早的 JWT exp。
+  // 上游返回的 expiresAt 可能是任意格式，统一解析成毫秒取最小值，避免字典序排序选错。
+  const expiryMs = [
+    account.metadata?.accessTokenExpiresAt,
+    account.metadata?.expiresAt,
+    ...[secret.accessToken, ...(Array.isArray(secret.accessTokens) ? secret.accessTokens : [])]
+      .map((token) => tokenTiming(token).expiresAt),
+  ].map(credentialExpiryMs).filter(Number.isFinite);
+  const credentialExpiresAt = expiryMs.length ? new Date(Math.min(...expiryMs)).toISOString() : null;
   return {
     ...safe,
+    credentialExpiresAt,
+    credentialExpired: credentialExpiresAt ? new Date(credentialExpiresAt).getTime() <= Date.now() : false,
+    credentialExpiringSoon: credentialExpiresAt ? new Date(credentialExpiresAt).getTime() <= Date.now() + 3 * 86400000 : false,
     hasCredentials: Boolean(encryptedSecret),
     hasAccessToken,
     hasRefreshToken,
@@ -393,15 +409,17 @@ function sanitizeAccount(account) {
 }
 
 function publicSettings(settings) {
-  const { resendApiKeyEncrypted, feishuWebhookEncrypted, telegramBotTokenEncrypted, ...safe } = settings;
+  const { resendApiKeyEncrypted, feishuWebhookEncrypted, telegramBotTokenEncrypted, wecomWebhookEncrypted, ...safe } = settings;
   return {
     ...safe,
     hasResendApiKey: Boolean(resendApiKeyEncrypted),
     hasFeishuWebhook: Boolean(feishuWebhookEncrypted),
     hasTelegramBotToken: Boolean(telegramBotTokenEncrypted),
+    hasWecomWebhook: Boolean(wecomWebhookEncrypted),
     resendConfigured: Boolean(resendApiKeyEncrypted && settings.resendFrom && settings.resendTo),
     feishuConfigured: Boolean(feishuWebhookEncrypted),
     telegramConfigured: Boolean(telegramBotTokenEncrypted && settings.telegramChatId),
+    wecomConfigured: Boolean(wecomWebhookEncrypted),
   };
 }
 
@@ -1237,7 +1255,14 @@ app.patch('/api/accounts/:id', asyncRoute(async (req, res) => {
     const targetUpstreamId = req.body.upstreamId || current.upstreamId;
     // 先按白名单 schema 剥离未知键，防止 sessionCookie/browserProfileId 等内部字段被直接写入密文。
     const submittedCredentials = req.body.credentials ? accountCredentialsSchema.parse(req.body.credentials) : undefined;
-    const merged = accountSchema.parse({ ...current, ...req.body, upstreamId: targetUpstreamId, credentials: submittedCredentials });
+    // 通知开关按渠道深合并：schema 默认值只能用于新建，PATCH 只提交部分渠道时不得把其余渠道重置为开启。
+    const merged = accountSchema.parse({
+      ...current,
+      ...req.body,
+      upstreamId: targetUpstreamId,
+      credentials: submittedCredentials,
+      notifications: { ...(current.notifications || {}), ...(req.body.notifications || {}) },
+    });
     await validateUpstreamDestination(merged.baseUrl);
     evaluateFormula(merged.formula, Number(current.rawBalance || 1));
     const originChanged = !sameOrigin(current.baseUrl, merged.baseUrl);
@@ -1414,10 +1439,35 @@ app.post('/api/accounts/:id/simulate-recharge', asyncRoute(async (req, res) => {
 app.post('/api/incidents/:id/acknowledge', asyncRoute(async (req, res) => {
   await store.mutate((data) => {
     const incident = data.incidents.find((item) => item.id === req.params.id);
-    if (!incident) throw new Error('事件不存在');
+    if (!incident) throw Object.assign(new Error('事件不存在'), { statusCode: 404 });
     incident.acknowledgedAt = new Date().toISOString();
   });
   res.json(dashboard());
+}));
+
+const rechargeSchema = z.object({ amount: z.coerce.number().gt(0).max(1_000_000) });
+
+app.post('/api/incidents/:id/recharge', asyncRoute(async (req, res) => {
+  const input = rechargeSchema.parse(req.body);
+  await store.mutate((data) => {
+    const incident = data.incidents.find((item) => item.id === req.params.id);
+    if (!incident || incident.state !== 'open') throw Object.assign(new Error('事件不存在或已结单'), { statusCode: 404 });
+    const account = data.accounts.find((item) => item.id === incident.accountId);
+    if (!account) throw Object.assign(new Error('事件关联账号不存在'), { statusCode: 404 });
+    incident.recharges ||= [];
+    if (incident.recharges.length >= 50) throw Object.assign(new Error('充值记录已达上限'), { statusCode: 400 });
+    const record = {
+      id: crypto.randomUUID(),
+      amount: input.amount,
+      at: new Date().toISOString(),
+      balanceAt: Number(account.convertedCny || 0),
+      verifiedAt: null,
+      verifiedBalance: null,
+    };
+    incident.recharges.push(record);
+    data.audit.unshift({ id: crypto.randomUUID(), type: 'incident.recharge_recorded', accountId: incident.accountId, upstreamId: incident.upstreamId, at: record.at, details: { incidentId: incident.id, amount: input.amount } });
+  });
+  res.status(201).json(dashboard());
 }));
 
 app.put('/api/settings', asyncRoute(async (req, res) => {
@@ -1431,11 +1481,14 @@ app.put('/api/settings', asyncRoute(async (req, res) => {
       feishuEnabled: input.feishuEnabled,
       telegramEnabled: input.telegramEnabled,
       telegramChatId: input.telegramChatId.trim(),
+      wecomEnabled: input.wecomEnabled,
+      depletionAlertDays: input.depletionAlertDays,
       recoveryConfirmations: input.recoveryConfirmations,
       reminderMinutes: input.reminderHours !== undefined ? input.reminderHours * 60 : input.reminderMinutes,
       resendApiKeyEncrypted: input.resendApiKey ? encryptSecret({ value: input.resendApiKey }) : data.settings.resendApiKeyEncrypted,
       feishuWebhookEncrypted: input.feishuWebhook ? encryptSecret({ value: input.feishuWebhook }) : data.settings.feishuWebhookEncrypted,
       telegramBotTokenEncrypted: input.telegramBotToken ? encryptSecret({ value: input.telegramBotToken }) : data.settings.telegramBotTokenEncrypted,
+      wecomWebhookEncrypted: input.wecomWebhook ? encryptSecret({ value: input.wecomWebhook }) : data.settings.wecomWebhookEncrypted,
     };
   });
   res.json({ settings: publicSettings(store.snapshot().settings) });
@@ -1454,13 +1507,14 @@ app.post('/api/settings/test-notification', asyncRoute(async (req, res) => {
   const account = {
     ...(realAccount || { name: '测试账号', thresholdLow: 50 }),
     upstreamName: upstream?.name || '',
-    notifications: { resend: true, feishu: true, telegram: true },
+    notifications: { resend: true, feishu: true, telegram: true, wecom: true },
   };
   const incident = { id: 'test-notification', currentBalance: account.convertedCny || 21.6 };
   const secrets = {
     resendApiKey: input.settings.resendApiKey || decryptSecret(data.settings.resendApiKeyEncrypted).value,
     feishuWebhook: input.settings.feishuWebhook || decryptSecret(data.settings.feishuWebhookEncrypted).value,
     telegramBotToken: input.settings.telegramBotToken || decryptSecret(data.settings.telegramBotTokenEncrypted).value,
+    wecomWebhook: input.settings.wecomWebhook || decryptSecret(data.settings.wecomWebhookEncrypted).value,
   };
   const results = await notify('opened', account, incident, draft, secrets, { channels: [input.channel], force: true });
   await store.mutate((state) => {

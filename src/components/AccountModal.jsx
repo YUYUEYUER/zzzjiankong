@@ -22,7 +22,7 @@ function defaults(type = 'newapi', upstreamId = '', upstreamName = '') {
     rawUnit: type === 'sub2api' ? sub2Defaults.rawUnit : type === 'newapi' ? 'quota' : 'CNY',
     turnstileSiteKey: '',
     thresholdLow: 3, thresholdRecover: 5, pollIntervalMinutes: 5, enabled: true,
-    notifications: { resend: true, feishu: true, telegram: true },
+    notifications: { resend: true, feishu: true, telegram: true, wecom: true },
     credentials: {
       apiToken: '', accessToken: '', refreshToken: '', password: '', turnstileToken: '',
       cfAccessClientId: '', cfAccessClientSecret: '',
@@ -517,6 +517,20 @@ export function AccountModal({ open, onboarding = false, editingAccount, initial
               </select>
             </label>
           </div>
+          <div className="channel-toggles">
+            <span className="field-label">通知渠道</span>
+            {[['resend', 'Resend'], ['feishu', '飞书'], ['telegram', 'Telegram'], ['wecom', '企业微信']].map(([channel, label]) => (
+              <label key={channel} className="channel-toggle">
+                <input
+                  type="checkbox"
+                  checked={form.notifications?.[channel] !== false}
+                  onChange={(event) => set('notifications', { ...(form.notifications || {}), [channel]: event.target.checked })}
+                />
+                <span>{label}</span>
+              </label>
+            ))}
+          </div>
+          <small className="field-note">关闭的渠道不会向该账号发送告警；仍需在系统设置中启用并配置。</small>
         </div>
 
         <button type="button" className="advanced-toggle" onClick={() => setAdvanced((value) => !value)}>{advanced ? '收起高级设置' : '展开高级设置'}</button>

@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { config } from './config.js';
+import { credentialExpiryMs } from './collectors.js';
 import { decryptSecret } from './security.js';
 import { notify } from './notifications.js';
 
@@ -34,18 +35,23 @@ function trimOutbox(events, current = Date.now()) {
 export function createNotificationOutboxEvent(kind, account, incident, current = Date.now()) {
   const createdAt = iso(current);
   const reminderWindow = kind === 'reminder' ? `:${Math.floor(current / 60000)}` : '';
+  // 无 incident 的通知（如耗尽预测）按账号+自然日去重，每天至多一条。
+  const dedupeKey = incident?.id
+    ? `incident:${incident.id}:${kind}${reminderWindow}`
+    : `account:${account.id}:${kind}:${createdAt.slice(0, 10)}`;
   return {
     id: crypto.randomUUID(),
-    dedupeKey: `incident:${incident.id}:${kind}${reminderWindow}`,
+    dedupeKey,
     kind,
     accountId: account.id,
     upstreamId: account.upstreamId,
-    incidentId: incident.id,
+    incidentId: incident?.id || '',
     status: 'pending',
     channels: {
       resend: { status: 'pending', attempts: 0 },
       feishu: { status: 'pending', attempts: 0 },
       telegram: { status: 'pending', attempts: 0 },
+      wecom: { status: 'pending', attempts: 0 },
     },
     createdAt,
     updatedAt: createdAt,
@@ -96,9 +102,9 @@ export class NotificationOutbox {
     if (!event) return null;
     const data = this.store.snapshot();
     const account = data.accounts.find((item) => item.id === event.accountId);
-    const incident = data.incidents.find((item) => item.id === event.incidentId);
+    const incident = event.incidentId ? data.incidents.find((item) => item.id === event.incidentId) : null;
     const upstream = data.upstreams.find((item) => item.id === event.upstreamId);
-    if (!account || !incident || account.deletedAt) {
+    if (!account || account.deletedAt || (event.incidentId && !incident)) {
       await this.store.mutate((state) => {
         const current = state.notificationOutbox.find((item) => item.id === event.id && item.leaseId === event.leaseId);
         if (!current) return;
@@ -118,11 +124,25 @@ export class NotificationOutbox {
       resendApiKey: decryptSecret(settings.resendApiKeyEncrypted).value,
       feishuWebhook: decryptSecret(settings.feishuWebhookEncrypted).value,
       telegramBotToken: decryptSecret(settings.telegramBotTokenEncrypted).value,
+      wecomWebhook: decryptSecret(settings.wecomWebhookEncrypted).value,
     };
+    const context = incident || {
+      id: '',
+      currentBalance: account.convertedCny,
+      depletionEtaDays: account.depletionEtaDays,
+      dailyBurnRate: account.dailyBurnRate,
+      credentialExpiresAt: account.metadata?.accessTokenExpiresAt || account.metadata?.expiresAt || null,
+      credentialExpired: false,
+    };
+    if (!incident) {
+      const expiresMs = credentialExpiryMs(context.credentialExpiresAt);
+      context.credentialExpiresAt = Number.isFinite(expiresMs) ? new Date(expiresMs).toISOString() : null;
+      context.credentialExpired = Number.isFinite(expiresMs) && expiresMs <= Date.now();
+    }
     const results = await this.notifier(
       event.kind,
       { ...account, upstreamName: upstream?.name || '' },
-      incident,
+      context,
       settings,
       secrets,
       { channels, idempotencyKey: event.dedupeKey },

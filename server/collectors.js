@@ -269,6 +269,24 @@ export function tokenTiming(token, skewMs = 5 * 60000, current = Date.now()) {
   }
 }
 
+/**
+ * 把上游返回的到期值归一化为毫秒时间戳。
+ * 支持 ISO 字符串、毫秒时间戳、unix 秒级时间戳；`-1`/`0`/无法解析一律视为"无到期信息"。
+ */
+export function credentialExpiryMs(value) {
+  if (value === null || value === undefined || value === '') return Number.NaN;
+  let ms;
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    ms = value < 1e12 ? value * 1000 : value; // 秒级时间戳升毫秒，10^12 是毫秒/秒的分水岭
+  } else if (typeof value === 'string' && /^-?\d{1,13}$/.test(value.trim())) {
+    const numeric = Number(value);
+    ms = numeric < 1e12 ? numeric * 1000 : numeric; // 纯数字字符串（含 -1 哨兵）走数值路径
+  } else {
+    ms = new Date(value).getTime();
+  }
+  return Number.isFinite(ms) && ms > 0 ? ms : Number.NaN;
+}
+
 /** Use a JWT exp claim when available, otherwise fall back to the stored expiry. */
 export function effectiveTokenTiming(token, storedExpiresAt = '', skewMs = 5 * 60000, current = Date.now()) {
   const jwtTiming = tokenTiming(token, skewMs, current);

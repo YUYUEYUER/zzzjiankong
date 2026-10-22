@@ -138,7 +138,7 @@ export function buildQuickAccountPayload(form) {
     thresholdRecover: 5,
     pollIntervalMinutes: 5,
     enabled: true,
-    notifications: { resend: true, feishu: true, telegram: true },
+    notifications: { resend: true, feishu: true, telegram: true, wecom: true },
     credentials,
   };
 }

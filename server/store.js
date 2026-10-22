@@ -39,6 +39,9 @@ function defaultSettings() {
     telegramEnabled: false,
     telegramChatId: "",
     telegramBotTokenEncrypted: "",
+    wecomEnabled: false,
+    wecomWebhookEncrypted: "",
+    depletionAlertDays: 0,
     recoveryConfirmations: 2,
     reminderMinutes: 360,
   };
@@ -100,7 +103,7 @@ function demoAccount(input) {
     thresholdLow: input.thresholdLow ?? 20,
     thresholdRecover: input.thresholdRecover ?? 50,
     pollIntervalMinutes: 5,
-    notifications: { resend: true, feishu: true, telegram: true },
+    notifications: { resend: true, feishu: true, telegram: true, wecom: true },
     enabled: input.enabled ?? true,
     demo: true,
     encryptedSecret: "",

@@ -207,6 +207,16 @@ export function App() {
     }
   };
 
+  const recordRecharge = async (id, amount) => {
+    try {
+      setDashboard(await api.recordRecharge(id, amount));
+      pushToast('充值已记录，系统会在余额回升后自动核对', 'success');
+    } catch (error) {
+      pushToast(error.message, 'error');
+      throw error;
+    }
+  };
+
   const openUpstreamModal = (upstream = null) => {
     setEditingUpstream(upstream);
     setUpstreamModal(true);
@@ -304,6 +314,7 @@ export function App() {
         onSettings={() => { setSetupContext(''); setSettingsInitialTab('notifications'); setSettingsOpen(true); }}
         onLogout={logout}
         onAcknowledge={acknowledge}
+        onRecordRecharge={recordRecharge}
         onLoadKeyDetails={api.accountKeyDetails}
         onRestoreAccount={restoreAccount}
       />

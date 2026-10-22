@@ -1,9 +1,10 @@
 import crypto from 'node:crypto';
 import { withAccountCredentialLock } from './account-lock.js';
 import { config } from './config.js';
-import { collectBalance, redactCredentialText } from './collectors.js';
+import { collectBalance, credentialExpiryMs, redactCredentialText } from './collectors.js';
 import { evaluateFormula } from './converter.js';
 import { attachCredentialCheckpoint, takeCredentialCheckpoint } from './credential-checkpoint.js';
+import { computeDailyBurnRate, depletionEtaDays } from './burn-rate.js';
 import { decryptSecret, encryptSecret } from './security.js';
 import { createNotificationOutboxEvent, NotificationOutbox } from './notification-outbox.js';
 
@@ -198,14 +199,46 @@ export class Monitor {
       data.snapshots.push({ id: crypto.randomUUID(), accountId, rawBalance: account.rawBalance, convertedCny, capturedAt: now() });
       data.snapshots = compactSnapshots(data.snapshots);
 
+      const dailyBurnRate = computeDailyBurnRate(data.snapshots.filter((item) => item.accountId === accountId));
+      account.dailyBurnRate = Math.round(dailyBurnRate * 100) / 100;
+      account.depletionEtaDays = depletionEtaDays(convertedCny, account.thresholdLow, dailyBurnRate);
+
       let incident = data.incidents.find((item) => item.accountId === accountId && item.state === 'open');
+      // 耗尽预测告警：未处于低余额事件且 ETA 进入预警天数时，每天最多入队一条。
+      let predictionEventId = null;
+      const alertDays = Number(data.settings.depletionAlertDays || 0);
+      if (
+        !incident
+        && !account.demo
+        && alertDays > 0
+        && account.depletionEtaDays != null
+        && account.depletionEtaDays <= alertDays
+        && convertedCny >= Number(account.thresholdLow || 0)
+      ) {
+        const preview = createNotificationOutboxEvent('prediction', account, null);
+        if (!data.notificationOutbox.some((item) => item.dedupeKey === preview.dedupeKey)) {
+          data.notificationOutbox.push(preview);
+          predictionEventId = preview.id;
+        }
+      }
+      // 凭据到期预警：上游给出的 AT/订阅到期时间进入 3 天窗口（或已过期）时每天提醒一次；
+      // 与事件状态机解耦，进行中的低余额事件期间同样生效，未及时派发的由 outbox 兜底。
+      const credentialExpiresAt = account.metadata?.accessTokenExpiresAt || account.metadata?.expiresAt || null;
+      const credentialExpiresMs = credentialExpiryMs(credentialExpiresAt);
+      if (!account.demo && Number.isFinite(credentialExpiresMs) && credentialExpiresMs <= Date.now() + 3 * 86400000) {
+        const preview = createNotificationOutboxEvent('credential_expiry', account, null);
+        if (!data.notificationOutbox.some((item) => item.dedupeKey === preview.dedupeKey)) {
+          data.notificationOutbox.push(preview);
+          predictionEventId ||= preview.id;
+        }
+      }
       if (convertedCny < account.thresholdLow) {
         account.recoveryChecks = 0;
         if (!incident) {
           incident = {
             id: crypto.randomUUID(), accountId, state: 'open', openedAt: now(), resolvedAt: null,
             acknowledgedAt: null, triggerBalance: convertedCny, currentBalance: convertedCny,
-            channelResults: {}, notifications: { reminders: [] }, recoveryChecks: 0,
+            channelResults: {}, notifications: { reminders: [] }, recoveryChecks: 0, recharges: [],
           };
           data.incidents.unshift(incident);
           const event = createNotificationOutboxEvent('opened', account, incident);
@@ -225,6 +258,13 @@ export class Monitor {
 
       if (incident) {
         incident.currentBalance = convertedCny;
+        // 核对充值记录：余额较记录时回升达到申报金额即标记已验证。
+        for (const recharge of incident.recharges || []) {
+          if (!recharge.verifiedAt && convertedCny >= Number(recharge.balanceAt || 0) + Number(recharge.amount || 0)) {
+            recharge.verifiedAt = now();
+            recharge.verifiedBalance = convertedCny;
+          }
+        }
         if (convertedCny >= account.thresholdRecover) {
           incident.recoveryChecks = Number(incident.recoveryChecks || 0) + 1;
           account.recoveryChecks = incident.recoveryChecks;
@@ -241,7 +281,7 @@ export class Monitor {
           account.recoveryChecks = 0;
         }
       }
-      return null;
+      return predictionEventId ? { eventId: predictionEventId } : null;
     });
   }
 

@@ -1068,3 +1068,23 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .proxy-action-group { grid-template-columns: 1fr; }
   .proxy-action-group button { min-height: 38px; }
 }
+
+/* �˺ż�֪ͨ�������أ�AccountModal �澯��ָ����� */
+.channel-toggles { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; margin-top: 14px; }
+.channel-toggles .field-label { width: 100%; font-size: 11px; color: var(--muted); }
+.channel-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
+.channel-toggle input { accent-color: var(--blue); }
+.field-note { display: block; margin-top: 6px; font-size: 11px; color: var(--muted); }
+
+/* 余额预测与凭据到期徽标 */
+.row-eta { display: inline-flex; align-items: center; gap: 2px; font-style: normal; font-size: 10px; color: #c67d17; white-space: nowrap; }
+.row-flag.expiring { color: #c67d17; }
+.row-flag.expired { color: var(--danger, #d84a42); }
+.eta-note { display: block; font-size: 10px; color: #c67d17; margin-top: 2px; }
+.burn-note { display: block; font-size: 10px; color: #c67d17; margin-top: 2px; }
+.recharge-form { display: inline-flex; gap: 6px; align-items: center; margin-top: 8px; }
+.recharge-form input { width: 110px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; font-size: 12px; }
+.recharge-list { margin: 8px 0 0; padding: 0; list-style: none; display: grid; gap: 4px; font-size: 11px; }
+.recharge-list li { display: flex; gap: 8px; align-items: center; }
+.recharge-list .verified { color: var(--success, #2da862); }
+.recharge-list .pending { color: var(--muted); }
