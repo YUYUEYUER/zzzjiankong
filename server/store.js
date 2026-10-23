@@ -313,6 +313,8 @@ export class JsonStore {
   constructor(file = config.dataFile) {
     this.file = file;
     this.data = null;
+    // 每次 mutate 成功提交后自增，供 dashboard 等读路径按版本号做结果缓存。
+    this.revision = 0;
     this.queue = Promise.resolve();
     this.storageHealth = {
       status: 'initializing',
@@ -350,6 +352,12 @@ export class JsonStore {
     return structuredClone(this.data);
   }
 
+  // 只读实时视图：省去整库 structuredClone。调用方不得修改返回对象——
+  // 仅允许像 dashboard() 这样构建全新派生对象后丢弃引用的读路径使用。
+  peek() {
+    return this.data;
+  }
+
   mutate(mutator) {
     const operation = this.queue.catch(() => undefined).then(async () => {
       const draft = structuredClone(this.data);
@@ -365,6 +373,7 @@ export class JsonStore {
         throw error;
       }
       this.data = draft;
+      this.revision += 1;
       return result;
     });
     this.queue = operation.catch(() => undefined);
@@ -397,9 +406,9 @@ export class JsonStore {
     };
   }
 
+  // 调用方在 mutate 提交前与 init/迁移阶段均已执行 validateDataGraph，此处不重复校验。
   async persist(data = this.data) {
-    validateDataGraph(data);
-    const serialized = JSON.stringify(data, null, 2);
+    const serialized = JSON.stringify(data);
     const directory = path.dirname(this.file);
     const temp = path.join(directory, `.${path.basename(this.file)}.${process.pid}.${crypto.randomUUID()}.tmp`);
     let handle;

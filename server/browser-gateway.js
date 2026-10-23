@@ -140,7 +140,7 @@ export function attachBrowserGateway(server, store) {
       reject(socket, 403);
       return;
     }
-    const auth = store.snapshot().auth;
+    const auth = store.peek().auth;
     const parsedCookies = cookies(request);
     if (parsedCookies.duplicateSession) {
       reject(socket, 400, 'Bad Request');

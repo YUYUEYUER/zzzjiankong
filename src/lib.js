@@ -1,14 +1,35 @@
+// Intl 构造开销不低，表格/图表每行都会调用，按参数缓存复用实例。
+const moneyFormatters = new Map();
+
 export function money(value, digits = 2) {
-  return new Intl.NumberFormat('zh-CN', {
-    style: 'currency',
-    currency: 'CNY',
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
-  }).format(Number(value || 0));
+  let formatter = moneyFormatters.get(digits);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat('zh-CN', {
+      style: 'currency',
+      currency: 'CNY',
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    });
+    moneyFormatters.set(digits, formatter);
+  }
+  return formatter.format(Number(value || 0));
 }
 
+const compactFormatter = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 4 });
+
 export function compactNumber(value) {
-  return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 4 }).format(Number(value || 0));
+  return compactFormatter.format(Number(value || 0));
+}
+
+const dayLabelFormatter = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit' });
+const dateTimeFormatter = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+
+export function formatDayLabel(value) {
+  return dayLabelFormatter.format(new Date(value));
+}
+
+export function formatDateTime(value) {
+  return dateTimeFormatter.format(new Date(value));
 }
 
 export function relativeTime(value) {

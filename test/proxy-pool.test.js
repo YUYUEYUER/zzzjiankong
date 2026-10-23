@@ -44,6 +44,8 @@ class MemoryStore {
 
   snapshot() { return structuredClone(this.data); }
 
+  peek() { return this.data; }
+
   async mutate(mutator) { return mutator(this.data); }
 }
 

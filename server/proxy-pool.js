@@ -663,7 +663,7 @@ export class ProxyPoolManager {
 
   runtimeConfig({ providerFile = PROVIDER_FILE, includeProvider = true } = {}) {
     const normalizedProviderFile = safeProviderFile(providerFile);
-    const data = this.store.snapshot();
+    const data = this.store.peek();
     const enabled = includeProvider
       ? data.upstreams.filter((upstream) => upstream.proxyMode === 'auto_sticky' && Number.isInteger(upstream.proxyPort))
       : [];
@@ -778,7 +778,7 @@ export class ProxyPoolManager {
     if (!candidates.length) throw errorWithStatus('代理订阅中没有可用节点', 502, 'NO_HEALTHY_PROXY');
     const selected = [];
     let cursor = 0;
-    for (const upstream of this.store.snapshot().upstreams.filter((item) => item.proxyMode === 'auto_sticky')) {
+    for (const upstream of this.store.peek().upstreams.filter((item) => item.proxyMode === 'auto_sticky')) {
       const existing = candidates.find((node) => node.name === upstream.proxyNodeName);
       let choices = candidates;
       if (upstream.id === forceUpstreamId && candidates.length > 1) {
@@ -856,7 +856,7 @@ export class ProxyPoolManager {
   async selectAssignments(nodes, forceUpstreamId = '', options = {}) {
     const selected = this.planAssignments(nodes, forceUpstreamId);
     await this.applyAssignments(selected, options);
-    if (options.persist !== false) configureProxyRoutes(this.store.snapshot().upstreams, { ready: true });
+    if (options.persist !== false) configureProxyRoutes(this.store.peek().upstreams, { ready: true });
     return selected;
   }
 
@@ -879,7 +879,7 @@ export class ProxyPoolManager {
 
   async checkUnlocked({ forceUpstreamId = '' } = {}) {
     const checkedAt = new Date().toISOString();
-    const before = captureProxyState(this.store.snapshot());
+    const before = captureProxyState(this.store.peek());
     let selected = [];
     try {
       const nodes = await this.probeNodes(checkedAt);
@@ -890,7 +890,7 @@ export class ProxyPoolManager {
         data.proxyPool.lastError = '';
         this.assignmentsToData(data, selected);
       });
-      configureProxyRoutes(this.store.snapshot().upstreams, { ready: true });
+      configureProxyRoutes(this.store.peek().upstreams, { ready: true });
       return this.publicState();
     } catch (error) {
       await this.rollbackAssignments(selected);
@@ -905,7 +905,7 @@ export class ProxyPoolManager {
 
   async importSubscription(url) {
     return this.withConfigurationChange(async () => {
-      const before = captureProxyState(this.store.snapshot());
+      const before = captureProxyState(this.store.peek());
       const oldProvider = await readOptionalFile(this.providerPath());
       const oldRuntime = await readOptionalFile(this.runtimePath);
       const candidateFile = path.join('providers', `subscription.${crypto.randomUUID()}.candidate`);
@@ -939,7 +939,7 @@ export class ProxyPoolManager {
           data.proxyPool.nodes = nodes;
           this.assignmentsToData(data, selected, updatedAt);
         });
-        configureProxyRoutes(this.store.snapshot().upstreams, { ready: true });
+        configureProxyRoutes(this.store.peek().upstreams, { ready: true });
         this.stopSyncRetry();
         return this.publicState();
       } catch (error) {
@@ -964,7 +964,7 @@ export class ProxyPoolManager {
           }
           await this.reload();
           if (before.proxyPool.subscriptionUrlEncrypted && oldProvider != null) {
-            const previousAssignments = this.store.snapshot().upstreams
+            const previousAssignments = this.store.peek().upstreams
               .filter((upstream) => upstream.proxyMode === 'auto_sticky' && upstream.proxyNodeName)
               .map((upstream) => ({
                 upstreamId: upstream.id,
@@ -978,7 +978,7 @@ export class ProxyPoolManager {
         } catch {
           rollbackReady = false;
         }
-        configureProxyRoutes(this.store.snapshot().upstreams, { ready: rollbackReady });
+        configureProxyRoutes(this.store.peek().upstreams, { ready: rollbackReady });
         if (!rollbackReady && before.proxyPool.subscriptionUrlEncrypted) this.startSyncRetry();
         throw error;
       } finally {
@@ -988,9 +988,9 @@ export class ProxyPoolManager {
   }
 
   async syncUnlocked() {
-    configureProxyRoutes(this.store.snapshot().upstreams, { ready: false });
+    configureProxyRoutes(this.store.peek().upstreams, { ready: false });
     await this.ensurePorts();
-    const snapshot = this.store.snapshot();
+    const snapshot = this.store.peek();
     configureProxyRoutes(snapshot.upstreams, { ready: false });
     if (!snapshot.proxyPool.subscriptionUrlEncrypted) return this.publicState();
     try {
@@ -1001,7 +1001,7 @@ export class ProxyPoolManager {
       this.stopSyncRetry();
       return result;
     } catch (error) {
-      configureProxyRoutes(this.store.snapshot().upstreams, { ready: false });
+      configureProxyRoutes(this.store.peek().upstreams, { ready: false });
       await this.store.mutate((data) => { data.proxyPool.lastError = error.message; });
       throw error;
     }
@@ -1017,7 +1017,7 @@ export class ProxyPoolManager {
   }
 
   startSyncRetry() {
-    if (this.retryTimer || !this.store.snapshot().proxyPool.subscriptionUrlEncrypted) return;
+    if (this.retryTimer || !this.store.peek().proxyPool.subscriptionUrlEncrypted) return;
     const delay = this.retryDelayMs;
     this.retryTimer = setTimeout(async () => {
       this.retryTimer = null;
@@ -1040,7 +1040,7 @@ export class ProxyPoolManager {
   }
 
   async refreshSubscription() {
-    const encrypted = this.store.snapshot().proxyPool.subscriptionUrlEncrypted;
+    const encrypted = this.store.peek().proxyPool.subscriptionUrlEncrypted;
     if (!encrypted) throw errorWithStatus('尚未导入 Clash 订阅');
     let url;
     try {
@@ -1053,18 +1053,18 @@ export class ProxyPoolManager {
 
   async reassign(upstreamId) {
     return this.withConfigurationChange(async () => {
-      const upstream = this.store.snapshot().upstreams.find((item) => item.id === upstreamId);
+      const upstream = this.store.peek().upstreams.find((item) => item.id === upstreamId);
       if (!upstream) throw errorWithStatus('上游不存在', 404);
       if (upstream.proxyMode !== 'auto_sticky') throw errorWithStatus('该上游当前使用直连');
-      const nodes = this.store.snapshot().proxyPool.nodes;
+      const nodes = this.store.peek().proxyPool.nodes;
       if (!nodes.length) return this.checkUnlocked({ forceUpstreamId: upstreamId });
       await this.selectAssignments(nodes, upstreamId);
       return this.publicState();
     });
   }
 
-  publicState() {
-    const data = this.store.snapshot();
+  publicState(data = this.store.peek()) {
+
     const assignmentCounts = new Map();
     for (const upstream of data.upstreams) {
       if (!upstream.proxyNodeName) continue;

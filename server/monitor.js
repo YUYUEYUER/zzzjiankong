@@ -81,7 +81,7 @@ export class Monitor {
   }
 
   async tick() {
-    const data = this.store.snapshot();
+    const data = this.store.peek();
     const current = Date.now();
     const reminderTransitions = await this.queueDueReminders(data, current);
     const due = data.accounts.filter((account) => {
@@ -140,7 +140,7 @@ export class Monitor {
     let result;
     let secret = {};
     try {
-      const data = this.store.snapshot();
+      const data = this.store.peek();
       const account = data.accounts.find((item) => item.id === accountId);
       if (!account) throw new Error('账号不存在');
       secret = decryptSecret(account.encryptedSecret);
@@ -148,7 +148,7 @@ export class Monitor {
       const convertedCny = evaluateFormula(account.formula, result.rawBalance);
       const transition = await this.applySuccess(accountId, result, convertedCny);
       if (transition) await this.sendTransition(transition);
-      return this.store.snapshot().accounts.find((item) => item.id === accountId);
+      return this.store.peek().accounts.find((item) => item.id === accountId);
     } catch (error) {
       if (result?.updatedSecret) attachCredentialCheckpoint(error, result.updatedSecret);
       const credentialCheckpoint = takeCredentialCheckpoint(error);

@@ -1,5 +1,5 @@
 import { ArrowClockwise, CaretLeft, CaretRight, Check, EnvelopeSimple, Eye, PaperPlaneTilt, TelegramLogo, WechatLogo } from '@phosphor-icons/react';
-import { duration, money } from '../lib.js';
+import { duration, formatDateTime, money } from '../lib.js';
 import { notificationResult, notificationStatus, notificationText } from '../notification-state.js';
 
 export function IncidentQueue({ incidents, filter, setFilter, onAcknowledge, onSelectAccount, onRefresh }) {
@@ -30,7 +30,7 @@ export function IncidentQueue({ incidents, filter, setFilter, onAcknowledge, onS
                 <td>{incident.account?.type === 'newapi' ? 'New API' : incident.account?.type === 'sub2api' ? 'Sub2API' : '自定义'}</td>
                 <td>{incident.account?.region || '-'}</td>
                 <td className={incident.state === 'open' ? 'money-warning' : 'money-success'}>{money(incident.currentBalance)}</td>
-                <td>{new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(incident.openedAt))}</td>
+                <td>{formatDateTime(incident.openedAt)}</td>
                 <td className={incident.state === 'open' ? 'duration-open' : ''}>{duration(incident.openedAt, incident.resolvedAt)}</td>
                 <td><span className="channel-icons">{[['resend', EnvelopeSimple], ['feishu', PaperPlaneTilt], ['telegram', TelegramLogo], ['wecom', WechatLogo]].map(([channel, Icon]) => { const result = notificationResult(incident, 'opened', channel); const status = notificationStatus(result); return <Icon key={channel} className={status} title={notificationText(result, channel)} size={16} weight={status === 'sent' ? 'fill' : 'regular'} />; })}</span></td>
                 <td>{incident.state === 'resolved' ? `已恢复 (${incident.recoveryChecks}/2)` : `未恢复 (${incident.recoveryChecks || 0}/2)`}</td>

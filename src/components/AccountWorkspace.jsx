@@ -23,7 +23,7 @@ import {
 import annotationPlugin from 'chartjs-plugin-annotation';
 import { Line } from 'react-chartjs-2';
 import { api } from '../api.js';
-import { compactNumber, money, platformLabel, relativeTime } from '../lib.js';
+import { compactNumber, formatDayLabel, money, platformLabel, relativeTime } from '../lib.js';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Filler, Tooltip, Legend, annotationPlugin);
 
@@ -43,13 +43,13 @@ export function AccountWorkspace({ account, upstream, snapshots, onRefresh, onEd
   const chartData = useMemo(() => {
     if (!account) return [];
     const cutoff = Date.now() - range * 86400000;
+    // 每条快照只解析一次时间戳：先挂 ms 再过滤/排序，避免比较器里 O(n log n) 次 Date 构造。
     return snapshots
-      .filter((item) => item.accountId === account.id && new Date(item.capturedAt).getTime() >= cutoff)
-      .sort((a, b) => new Date(a.capturedAt) - new Date(b.capturedAt))
-      .map((item) => ({
-        value: Number(item.convertedCny),
-        label: new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit' }).format(new Date(item.capturedAt)),
-      }));
+      .filter((item) => item.accountId === account.id)
+      .map((item) => ({ ms: new Date(item.capturedAt).getTime(), value: Number(item.convertedCny) }))
+      .filter((item) => item.ms >= cutoff)
+      .sort((left, right) => left.ms - right.ms)
+      .map((item) => ({ value: item.value, label: formatDayLabel(item.ms) }));
   }, [account, snapshots, range]);
 
   const lineData = useMemo(() => ({

@@ -87,7 +87,7 @@ const store = await new JsonStore().init();
 if (
   config.production
   && !config.authDisabled
-  && !store.snapshot().auth.passwordHash
+  && !store.peek().auth.passwordHash
   && !config.adminPassword
   && config.bootstrapToken.length < 32
 ) {
@@ -108,7 +108,7 @@ if (!isLoopbackHost(config.host)) {
   if (
     !config.production
     && !config.authDisabled
-    && !store.snapshot().auth.passwordHash
+    && !store.peek().auth.passwordHash
     && !config.adminPassword
     && config.bootstrapToken.length < 32
   ) {
@@ -125,7 +125,7 @@ if (!isLoopbackHost(config.host)) {
     console.warn('[security] AUTH_DISABLED=true 且监听非回环地址；请确认应用位于带认证的反向代理之后。');
   }
 }
-if (!store.snapshot().auth.passwordHash && config.adminPassword) {
+if (!store.peek().auth.passwordHash && config.adminPassword) {
   const issues = passwordIssues(config.adminPassword);
   if (issues.length) {
     console.warn(`[security] ADMIN_PASSWORD 未达到新强度要求，将进入首次设置：${issues.join('、')}`);
@@ -273,7 +273,7 @@ function findUpstreamByName(data, name) {
   return data.upstreams.find((upstream) => canonicalUpstreamName(upstream.name) === canonical);
 }
 
-function requireUpstream(upstreamId, data = store.snapshot()) {
+function requireUpstream(upstreamId, data = store.peek()) {
   const upstream = data.upstreams.find((item) => item.id === upstreamId);
   if (!upstream) throw Object.assign(new Error('所选上游不存在'), { statusCode: 400 });
   return upstream;
@@ -356,6 +356,20 @@ const securityProfileSchema = z.object({
 const twoFactorCodeSchema = z.object({ code: z.string().min(6).max(32) });
 const disableTwoFactorSchema = z.object({ currentPassword: z.string().max(128), code: z.string().min(6).max(32) });
 
+// 密文 → 解密结果缓存：密文本身即 key，凭据轮换后自动失效；账号数有限，封顶兜底。
+const decryptedSecretCache = new Map();
+
+function decryptSecretCached(payload) {
+  if (!payload) return {};
+  let secret = decryptedSecretCache.get(payload);
+  if (secret === undefined) {
+    secret = decryptSecret(payload);
+    if (decryptedSecretCache.size >= 256) decryptedSecretCache.clear();
+    decryptedSecretCache.set(payload, secret);
+  }
+  return secret;
+}
+
 function sanitizeAccount(account) {
   const { encryptedSecret, ...safe } = account;
   let hasAccessToken = false;
@@ -368,7 +382,7 @@ function sanitizeAccount(account) {
   let hasBrowserSession = false;
   let secret = {};
   try {
-    secret = decryptSecret(encryptedSecret);
+    secret = decryptSecretCached(encryptedSecret);
     hasAccessToken = Boolean(secret.accessToken);
     accessTokenCount = Math.max(Number(hasAccessToken), Array.isArray(secret.accessTokens) ? secret.accessTokens.filter(Boolean).length : 0);
     hasAccessToken = accessTokenCount > 0;
@@ -446,10 +460,17 @@ function dashboardSnapshots(snapshots, accountIds, maxPerAccount = 600) {
   return result;
 }
 
-function dashboard() {
-  const data = store.snapshot();
-  const accounts = data.accounts.filter((account) => !account.deletedAt).map(sanitizeAccount);
-  const deletedAccounts = data.accounts.filter((account) => account.deletedAt).map(sanitizeAccount);
+// dashboard 结果按 store.revision 缓存：前端每 30s 轮询，但 store 仅在
+// mutate 提交时变更；revision 一致时直接复用上一次的派生结果。
+// turnstileSolver 是内存态（siteKey 缓存/令牌用量），每次实时计算。
+const dashboardCache = { revision: -1, value: null };
+
+function buildDashboard(data) {
+  const accounts = [];
+  const deletedAccounts = [];
+  for (const account of data.accounts) {
+    (account.deletedAt ? deletedAccounts : accounts).push(sanitizeAccount(account));
+  }
   const byId = new Map(accounts.map((account) => [account.id, account]));
   const upstreams = aggregateUpstreams(data.upstreams, accounts, data.incidents);
   const upstreamById = new Map(upstreams.map((upstream) => [upstream.id, upstream]));
@@ -457,6 +478,14 @@ function dashboard() {
     const account = byId.get(incident.accountId);
     return { ...incident, account, upstream: upstreamById.get(account?.upstreamId) };
   });
+  let totalCny = 0;
+  let healthy = 0;
+  let warning = 0;
+  for (const account of accounts) {
+    totalCny += Number(account.convertedCny || 0);
+    if (account.status === 'healthy') healthy += 1;
+    else if (account.status === 'warning' || account.status === 'critical') warning += 1;
+  }
   return {
     upstreams,
     accounts,
@@ -465,19 +494,29 @@ function dashboard() {
     incidents,
     audit: data.audit.slice(0, 200),
     settings: publicSettings(data.settings),
-    proxyPool: proxyPool.publicState(),
-    turnstileSolver: getTurnstileSolverStatus(config),
+    proxyPool: proxyPool.publicState(data),
     browserWorkspaceUrl: config.browserWorkspaceUrl,
     summary: {
-      totalCny: accounts.reduce((sum, account) => sum + Number(account.convertedCny || 0), 0),
-      healthy: accounts.filter((account) => account.status === 'healthy').length,
-      warning: accounts.filter((account) => ['warning', 'critical'].includes(account.status)).length,
+      totalCny,
+      healthy,
+      warning,
       openIncidents: incidents.filter((incident) => incident.state === 'open').length,
       upstreamCount: upstreams.length,
       realUpstreamCount: upstreams.filter((upstream) => upstream.realAccountCount > 0).length,
       lastSyncAt: accounts.map((account) => account.lastSyncAt).filter(Boolean).sort().at(-1) || null,
     },
   };
+}
+
+function dashboard() {
+  // peek() 返回只读实时数据；buildDashboard 只构建全新对象，不写回。
+  if (dashboardCache.revision === store.revision && dashboardCache.value) {
+    return { ...dashboardCache.value, turnstileSolver: getTurnstileSolverStatus(config) };
+  }
+  const value = buildDashboard(store.peek());
+  dashboardCache.revision = store.revision;
+  dashboardCache.value = value;
+  return { ...value, turnstileSolver: getTurnstileSolverStatus(config) };
 }
 
 const loginAttempts = new Map();
@@ -570,7 +609,7 @@ function setSessionCookie(res, auth) {
 }
 
 function publicSession(req) {
-  const auth = store.snapshot().auth;
+  const auth = store.peek().auth;
   const setupRequired = !auth.passwordHash;
   const authenticated = config.authDisabled || (!setupRequired && verifySessionToken(req.cookies.frosted_session, auth));
   return {
@@ -589,7 +628,7 @@ function publicSession(req) {
 }
 
 async function consumeSecondFactor(code) {
-  const auth = store.snapshot().auth;
+  const auth = store.peek().auth;
   const secret = decryptSecret(auth.totpSecretEncrypted).value;
   if (secret && /^\d{6}$/.test(String(code || '').trim())) {
     const result = await verifyTotpCodeResult(secret, code, auth.lastAcceptedTotpCounter);
@@ -615,7 +654,7 @@ async function consumeSecondFactor(code) {
 }
 
 function authRequired(req, res, next) {
-  const auth = store.snapshot().auth;
+  const auth = store.peek().auth;
   if (config.authDisabled || verifySessionToken(req.cookies.frosted_session, auth)) return next();
   return res.status(401).json({ error: 'AUTH_REQUIRED', message: '请先登录霜镜控制台' });
 }
@@ -634,7 +673,7 @@ app.get('/api/session', (req, res) => res.json(publicSession(req)));
 
 app.post('/api/session/setup', asyncRoute(async (req, res) => {
   if (config.authDisabled) return res.status(400).json({ message: '认证已被环境变量关闭' });
-  if (store.snapshot().auth.passwordHash) return res.status(410).json({ message: '管理员初始化入口已关闭' });
+  if (store.peek().auth.passwordHash) return res.status(410).json({ message: '管理员初始化入口已关闭' });
   const input = setupSchema.parse(req.body);
   const limitKeys = checkLoginLimit(req, input.username, 'setup');
   if (config.bootstrapToken && !verifyBootstrapToken(config.bootstrapToken, input.bootstrapToken)) {
@@ -658,7 +697,7 @@ app.post('/api/session/setup', asyncRoute(async (req, res) => {
     data.audit.unshift({ id: crypto.randomUUID(), type: 'security.account_initialized', at: timestamp, details: { username: input.username } });
   });
   clearLoginFailures(limitKeys.scope);
-  const auth = store.snapshot().auth;
+  const auth = store.peek().auth;
   setSessionCookie(res, auth);
   res.status(201).json({ success: true, session: publicSession({ ...req, cookies: { ...req.cookies, frosted_session: createSessionToken(auth) } }) });
 }));
@@ -666,7 +705,7 @@ app.post('/api/session/setup', asyncRoute(async (req, res) => {
 app.post('/api/session/login', asyncRoute(async (req, res) => {
   if (config.authDisabled) return res.json({ success: true });
   const input = loginSchema.parse(req.body);
-  const auth = store.snapshot().auth;
+  const auth = store.peek().auth;
   if (!auth.passwordHash) return res.status(409).json({ message: '请先完成管理员账户初始化', setupRequired: true });
   const limitKeys = checkLoginLimit(req, input.username);
   await verifyTurnstileToken(input.turnstileToken, req.ip, 'login');
@@ -690,7 +729,7 @@ app.post('/api/session/login', asyncRoute(async (req, res) => {
 
 app.post('/api/session/verify-2fa', asyncRoute(async (req, res) => {
   const input = twoFactorLoginSchema.parse(req.body);
-  const auth = store.snapshot().auth;
+  const auth = store.peek().auth;
   if (!verifyTwoFactorChallenge(input.challengeToken, auth)) return res.status(401).json({ message: '二次验证已过期，请重新登录' });
   const limitKeys = checkLoginLimit(req, auth.username, 'two_factor');
   const verified = await consumeSecondFactor(input.code);
@@ -707,7 +746,7 @@ app.post('/api/session/verify-2fa', asyncRoute(async (req, res) => {
   if (verified.recovery) await store.mutate((data) => {
     data.audit.unshift({ id: crypto.randomUUID(), type: 'security.recovery_code_used', at: new Date().toISOString() });
   });
-  const currentAuth = store.snapshot().auth;
+  const currentAuth = store.peek().auth;
   setSessionCookie(res, currentAuth);
   await store.mutate((data) => {
     data.auth.lastLoginAt = new Date().toISOString();
@@ -719,7 +758,7 @@ app.post('/api/session/verify-2fa', asyncRoute(async (req, res) => {
 app.post('/api/session/logout', asyncRoute(async (req, res) => {
   const token = req.cookies.frosted_session;
   let revoked = config.authDisabled;
-  if (!config.authDisabled && token && verifySessionToken(token, store.snapshot().auth)) {
+  if (!config.authDisabled && token && verifySessionToken(token, store.peek().auth)) {
     revoked = await store.mutate((data) => {
       if (!verifySessionToken(token, data.auth)) return false;
       data.auth.sessionVersion = Number(data.auth.sessionVersion || 1) + 1;
@@ -737,7 +776,7 @@ app.use('/api', authRequired);
 
 app.post('/api/browser-ticket', (req, res) => {
   if (!config.browserWorkspaceUrl) return res.status(404).json({ message: '远程浏览器工作区未启用' });
-  const auth = store.snapshot().auth;
+  const auth = store.peek().auth;
   const ticket = issueBrowserTicket(auth, config.appOrigin);
   res.json({ url: browserWorkspaceTicketUrl(ticket), expiresIn: 60 });
 });
@@ -770,7 +809,7 @@ app.delete('/api/upstream-logins/:id', asyncRoute(async (req, res) => {
 }));
 
 app.post('/api/accounts/:id/open-upstream', asyncRoute(async (req, res) => {
-  const account = store.snapshot().accounts.find((item) => item.id === req.params.id);
+  const account = store.peek().accounts.find((item) => item.id === req.params.id);
   if (!account) return res.status(404).json({ message: '账号不存在' });
   if (account.demo) return res.status(400).json({ message: '演示账号没有可进入的上游会话' });
   if (account.type !== 'sub2api') return res.status(400).json({ message: '当前仅支持进入 Sub2API 浏览器会话' });
@@ -816,7 +855,7 @@ app.post('/api/accounts/:id/open-upstream', asyncRoute(async (req, res) => {
 }));
 
 app.get('/api/security', (req, res) => {
-  const auth = store.snapshot().auth;
+  const auth = store.peek().auth;
   res.json({
     username: auth.username,
     twoFactorEnabled: Boolean(auth.twoFactorEnabled),
@@ -828,7 +867,7 @@ app.get('/api/security', (req, res) => {
 
 app.patch('/api/security/profile', asyncRoute(async (req, res) => {
   const input = securityProfileSchema.parse(req.body);
-  const auth = store.snapshot().auth;
+  const auth = store.peek().auth;
   if (!await verifyPassword(input.currentPassword, auth.passwordHash)) return res.status(401).json({ message: '当前密码不正确' });
   const nextPasswordHash = input.newPassword ? await hashPassword(input.newPassword) : auth.passwordHash;
   const timestamp = new Date().toISOString();
@@ -847,13 +886,13 @@ app.patch('/api/security/profile', asyncRoute(async (req, res) => {
     });
   });
   closeBrowserConnections();
-  const updated = store.snapshot().auth;
+  const updated = store.peek().auth;
   setSessionCookie(res, updated);
   res.json({ username: updated.username, twoFactorEnabled: Boolean(updated.twoFactorEnabled) });
 }));
 
 app.post('/api/security/2fa/setup', asyncRoute(async (req, res) => {
-  const auth = store.snapshot().auth;
+  const auth = store.peek().auth;
   if (auth.twoFactorEnabled) return res.status(409).json({ message: '两步验证已经启用' });
   // Generating a pending secret is itself a state-changing operation.  Bound
   // it to the authenticated administrator/IP so it cannot be used to force
@@ -875,7 +914,7 @@ app.post('/api/security/2fa/setup', asyncRoute(async (req, res) => {
 
 app.post('/api/security/2fa/enable', asyncRoute(async (req, res) => {
   const input = twoFactorCodeSchema.parse(req.body);
-  const auth = store.snapshot().auth;
+  const auth = store.peek().auth;
   const limitKeys = checkLoginLimit(req, auth.username, 'two_factor_setup');
   if (!auth.pendingTotpEncrypted || Date.now() - new Date(auth.pendingTotpCreatedAt || 0).getTime() > 10 * 60 * 1000) {
     return res.status(400).json({ message: '绑定信息已过期，请重新生成二维码' });
@@ -900,14 +939,14 @@ app.post('/api/security/2fa/enable', asyncRoute(async (req, res) => {
   });
   clearLoginFailures(limitKeys.scope);
   closeBrowserConnections();
-  const updated = store.snapshot().auth;
+  const updated = store.peek().auth;
   setSessionCookie(res, updated);
   res.json({ success: true, recoveryCodes });
 }));
 
 app.post('/api/security/2fa/recovery-codes', asyncRoute(async (req, res) => {
   const input = disableTwoFactorSchema.parse(req.body);
-  const auth = store.snapshot().auth;
+  const auth = store.peek().auth;
   if (!auth.twoFactorEnabled) return res.status(400).json({ message: '两步验证尚未启用' });
   const limitKeys = checkLoginLimit(req, auth.username, 'two_factor_sensitive');
   if (!await verifyPassword(input.currentPassword, auth.passwordHash)) {
@@ -930,7 +969,7 @@ app.post('/api/security/2fa/recovery-codes', asyncRoute(async (req, res) => {
 
 app.delete('/api/security/2fa', asyncRoute(async (req, res) => {
   const input = disableTwoFactorSchema.parse(req.body);
-  const auth = store.snapshot().auth;
+  const auth = store.peek().auth;
   if (!auth.twoFactorEnabled) return res.status(400).json({ message: '两步验证尚未启用' });
   const limitKeys = checkLoginLimit(req, auth.username, 'two_factor_sensitive');
   if (!await verifyPassword(input.currentPassword, auth.passwordHash)) {
@@ -956,7 +995,7 @@ app.delete('/api/security/2fa', asyncRoute(async (req, res) => {
     data.audit.unshift({ id: crypto.randomUUID(), type: 'security.2fa_disabled', at: timestamp });
   });
   closeBrowserConnections();
-  const updated = store.snapshot().auth;
+  const updated = store.peek().auth;
   setSessionCookie(res, updated);
   res.json({ success: true });
 }));
@@ -976,7 +1015,7 @@ app.post('/api/upstreams', asyncRoute(async (req, res) => {
     createdAt: timestamp,
     updatedAt: timestamp,
   };
-  if (upstream.proxyMode === 'auto_sticky' && !store.snapshot().proxyPool.subscriptionUrlEncrypted) {
+  if (upstream.proxyMode === 'auto_sticky' && !store.peek().proxyPool.subscriptionUrlEncrypted) {
     return res.status(409).json({ message: '请先在系统设置中导入 Clash 订阅' });
   }
   const auditId = crypto.randomUUID();
@@ -1004,15 +1043,15 @@ app.post('/api/upstreams', asyncRoute(async (req, res) => {
   } else {
     await create();
   }
-  res.status(201).json({ upstream: aggregateUpstreams(store.snapshot().upstreams, store.snapshot().accounts.map(sanitizeAccount), store.snapshot().incidents).find((item) => item.id === upstream.id) });
+  res.status(201).json({ upstream: aggregateUpstreams(store.peek().upstreams, store.peek().accounts.map(sanitizeAccount), store.peek().incidents).find((item) => item.id === upstream.id) });
 }));
 
 app.patch('/api/upstreams/:id', asyncRoute(async (req, res) => {
   const input = upstreamSchema.parse(req.body);
   const timestamp = new Date().toISOString();
-  const previous = store.snapshot().upstreams.find((item) => item.id === req.params.id);
+  const previous = store.peek().upstreams.find((item) => item.id === req.params.id);
   if (!previous) return res.status(404).json({ message: '上游不存在' });
-  if (input.proxyMode === 'auto_sticky' && !store.snapshot().proxyPool.subscriptionUrlEncrypted) {
+  if (input.proxyMode === 'auto_sticky' && !store.peek().proxyPool.subscriptionUrlEncrypted) {
     return res.status(409).json({ message: '请先在系统设置中导入 Clash 订阅' });
   }
   const auditId = crypto.randomUUID();
@@ -1060,7 +1099,7 @@ app.patch('/api/upstreams/:id', asyncRoute(async (req, res) => {
 }));
 
 app.delete('/api/upstreams/:id', asyncRoute(async (req, res) => {
-  const data = store.snapshot();
+  const data = store.peek();
   const previousIndex = data.upstreams.findIndex((item) => item.id === req.params.id);
   if (previousIndex < 0) return res.status(404).json({ message: '上游不存在' });
   const previous = data.upstreams[previousIndex];
@@ -1139,7 +1178,7 @@ app.post('/api/accounts/test', asyncRoute(async (req, res) => {
     let mayPersistToExistingAccount = false;
     // 编辑已有账号时，在账号锁内读取最新密文，避免与后台续期互相覆盖。
     if (accountId) {
-      const existing = store.snapshot().accounts.find((item) => item.id === accountId);
+      const existing = store.peek().accounts.find((item) => item.id === accountId);
       mayPersistToExistingAccount = Boolean(existing && sameOrigin(existing.baseUrl, input.baseUrl));
       if (existing?.encryptedSecret && mayPersistToExistingAccount) {
         try {
@@ -1243,12 +1282,12 @@ app.post('/api/accounts', asyncRoute(async (req, res) => {
   } catch (error) {
     syncError = error.message;
   }
-  res.status(201).json({ account: sanitizeAccount(store.snapshot().accounts.find((item) => item.id === account.id)), syncError });
+  res.status(201).json({ account: sanitizeAccount(store.peek().accounts.find((item) => item.id === account.id)), syncError });
 }));
 
 app.patch('/api/accounts/:id', asyncRoute(async (req, res) => {
   const outcome = await withAccountCredentialLock(req.params.id, async () => {
-    const currentData = store.snapshot();
+    const currentData = store.peek();
     const current = currentData.accounts.find((item) => item.id === req.params.id);
     if (!current) return { status: 404, message: '账号不存在' };
     const timestamp = new Date().toISOString();
@@ -1291,7 +1330,7 @@ app.patch('/api/accounts/:id', asyncRoute(async (req, res) => {
       delete account.credentials;
       data.audit.unshift({ id: crypto.randomUUID(), type: 'account.updated', accountId: account.id, upstreamId: account.upstreamId, at: account.updatedAt, details: { changedFields, credentialsUpdated: Boolean(submittedCredentials) } });
     });
-    return { account: sanitizeAccount(store.snapshot().accounts.find((item) => item.id === req.params.id)) };
+    return { account: sanitizeAccount(store.peek().accounts.find((item) => item.id === req.params.id)) };
   });
   if (outcome.status) return res.status(outcome.status).json({ message: outcome.message });
   return res.json({ account: outcome.account });
@@ -1314,7 +1353,7 @@ app.patch('/api/accounts/:id/upstream', asyncRoute(async (req, res) => {
 
 app.get('/api/accounts/:id/api-keys', asyncRoute(async (req, res) => {
   const details = await withAccountCredentialLock(req.params.id, async () => {
-    const account = store.snapshot().accounts.find((item) => item.id === req.params.id);
+    const account = store.peek().accounts.find((item) => item.id === req.params.id);
     if (!account) throw Object.assign(new Error('账号不存在'), { statusCode: 404 });
     const supportsKeyDetails = account.authMode === 'api_token'
       || (account.type === 'newapi' && account.authMode === 'access_token')
@@ -1355,7 +1394,7 @@ app.get('/api/accounts/:id/snapshots', (req, res) => {
     cursor: z.string().datetime().optional(),
     limit: z.coerce.number().int().min(1).max(500).default(100),
   }).parse(req.query);
-  const data = store.snapshot();
+  const data = store.peek();
   const account = data.accounts.find((item) => item.id === req.params.id);
   if (!account) return res.status(404).json({ message: '账号不存在' });
   const snapshots = data.snapshots
@@ -1429,7 +1468,7 @@ app.post('/api/accounts/:id/refresh', asyncRoute(async (req, res) => {
 }));
 
 app.post('/api/accounts/:id/simulate-recharge', asyncRoute(async (req, res) => {
-  const account = store.snapshot().accounts.find((item) => item.id === req.params.id);
+  const account = store.peek().accounts.find((item) => item.id === req.params.id);
   if (!account?.demo) return res.status(400).json({ message: '仅演示账号支持模拟充值' });
   await monitor.poll(req.params.id, { recharge: true });
   await monitor.poll(req.params.id, { recharge: true });
@@ -1491,12 +1530,12 @@ app.put('/api/settings', asyncRoute(async (req, res) => {
       wecomWebhookEncrypted: input.wecomWebhook ? encryptSecret({ value: input.wecomWebhook }) : data.settings.wecomWebhookEncrypted,
     };
   });
-  res.json({ settings: publicSettings(store.snapshot().settings) });
+  res.json({ settings: publicSettings(store.peek().settings) });
 }));
 
 app.post('/api/settings/test-notification', asyncRoute(async (req, res) => {
   const input = notificationTestSchema.parse(req.body);
-  const data = store.snapshot();
+  const data = store.peek();
   // 仅覆盖显式提交的键：partial schema 会给带默认值的字段填入默认值，不能用普通展开。
   const draft = { ...data.settings };
   for (const [key, value] of Object.entries(input.settings)) {

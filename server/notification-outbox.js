@@ -100,7 +100,8 @@ export class NotificationOutbox {
   async dispatchEvent(eventId) {
     const event = await this.claim(eventId);
     if (!event) return null;
-    const data = this.store.snapshot();
+    // 派发上下文只读：账号/事件/上游/设置仅用于组装通知参数，用 peek 免整库克隆。
+    const data = this.store.peek();
     const account = data.accounts.find((item) => item.id === event.accountId);
     const incident = event.incidentId ? data.incidents.find((item) => item.id === event.incidentId) : null;
     const upstream = data.upstreams.find((item) => item.id === event.upstreamId);
@@ -223,7 +224,7 @@ export class NotificationOutbox {
     if (this.draining) return this.draining;
     this.draining = (async () => {
       const current = Date.now();
-      const due = this.store.snapshot().notificationOutbox
+      const due = this.store.peek().notificationOutbox
         .filter((event) => !['completed', 'dead', 'cancelled'].includes(event.status))
         .filter((event) => new Date(event.nextAttemptAt || 0).getTime() <= current)
         .slice(0, 20);
